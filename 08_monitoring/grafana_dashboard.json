@@ -1,0 +1,82 @@
+{
+  "dashboard": {
+    "title": "LLM Serving Dashboard",
+    "panels": [
+      {
+        "title": "Request Rate",
+        "targets": [
+          {
+            "expr": "rate(llm_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Request Latency (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(llm_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(llm_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Error Rate",
+        "targets": [
+          {
+            "expr": "rate(llm_requests_total{status=\"500\"}[5m]) / rate(llm_requests_total[5m])",
+            "legendFormat": "Error Rate"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Active Requests",
+        "targets": [
+          {
+            "expr": "llm_active_requests",
+            "legendFormat": "{{endpoint}}"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Tokens Generated",
+        "targets": [
+          {
+            "expr": "rate(llm_tokens_generated_total[5m])",
+            "legendFormat": "{{model_name}}"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "GPU Utilization",
+        "targets": [
+          {
+            "expr": "llm_gpu_utilization_percent",
+            "legendFormat": "GPU {{gpu_id}}"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "GPU Memory",
+        "targets": [
+          {
+            "expr": "llm_gpu_memory_used_bytes / llm_gpu_memory_total_bytes * 100",
+            "legendFormat": "GPU {{gpu_id}}"
+          }
+        ],
+        "type": "graph"
+      }
+    ]
+  }
+}
+

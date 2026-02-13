@@ -1,0 +1,101 @@
+# Canary Deployment Example
+# This shows a simple canary setup with two deployments
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-serving
+---
+# Stable deployment (90% of traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-serving-stable
+  namespace: llm-serving
+  labels:
+    app: llm-serving
+    version: stable
+spec:
+  replicas: 9  # 90% of traffic (9 out of 10 pods)
+  selector:
+    matchLabels:
+      app: llm-serving
+      version: stable
+  template:
+    metadata:
+      labels:
+        app: llm-serving
+        version: stable
+    spec:
+      containers:
+      - name: llm-serving
+        image: llm-serving:v1.0  # Stable version
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_VERSION
+          value: "v1.0"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+---
+# Canary deployment (10% of traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-serving-canary
+  namespace: llm-serving
+  labels:
+    app: llm-serving
+    version: canary
+spec:
+  replicas: 1  # 10% of traffic (1 out of 10 pods)
+  selector:
+    matchLabels:
+      app: llm-serving
+      version: canary
+  template:
+    metadata:
+      labels:
+        app: llm-serving
+        version: canary
+    spec:
+      containers:
+      - name: llm-serving
+        image: llm-serving:v2.0  # New version to test
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_VERSION
+          value: "v2.0"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+---
+# Service routes to both stable and canary
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-serving
+  namespace: llm-serving
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+  selector:
+    app: llm-serving  # Matches both stable and canary
+---
+# To gradually increase canary traffic, scale canary up and stable down:
+# kubectl scale deployment llm-serving-canary --replicas=3 -n llm-serving
+# kubectl scale deployment llm-serving-stable --replicas=7 -n llm-serving
+# This gives 30% traffic to canary
+

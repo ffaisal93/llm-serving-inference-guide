@@ -1,0 +1,15 @@
+# vLLM Serving Dependencies
+
+# Web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# vLLM (requires CUDA/GPU)
+# Install with: pip install vllm
+# Or: pip install vllm --extra-index-url https://download.pytorch.org/whl/cu118
+vllm>=0.2.0
+
+# Utilities
+python-multipart==0.0.6
+

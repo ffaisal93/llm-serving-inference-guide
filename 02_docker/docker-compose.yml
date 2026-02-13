@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  llm-serving:
+    build:
+      context: ..
+      dockerfile: 02_docker/Dockerfile.optimized
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=gpt2
+      - DEVICE=cpu
+    volumes:
+      # Mount models directory if you want to use pre-downloaded models
+      - ../models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # Optional: Add monitoring
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+

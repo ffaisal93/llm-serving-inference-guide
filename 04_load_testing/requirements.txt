@@ -1,0 +1,11 @@
+# Load Testing Dependencies
+
+# Load testing framework
+locust==2.17.0
+
+# HTTP requests
+requests==2.31.0
+
+# Utilities
+python-multipart==0.0.6
+

@@ -1,0 +1,41 @@
+# Prometheus Configuration
+
+global:
+  scrape_interval: 15s  # How often to scrape metrics
+  evaluation_interval: 15s  # How often to evaluate rules
+
+# Scrape configurations
+scrape_configs:
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Scrape LLM serving application
+  - job_name: 'llm-serving'
+    static_configs:
+      - targets: ['host.docker.internal:8000']  # Adjust for your setup
+    metrics_path: '/metrics'
+    scrape_interval: 5s  # More frequent for real-time monitoring
+
+  # Scrape vLLM serving (if running)
+  - job_name: 'vllm-serving'
+    static_configs:
+      - targets: ['host.docker.internal:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # System metrics (Node Exporter)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # GPU metrics (NVIDIA GPU Exporter)
+  - job_name: 'gpu'
+    static_configs:
+      - targets: ['nvidia-gpu-exporter:9400']
+
+# Alerting rules (optional)
+# rule_files:
+#   - "alerts.yml"
+

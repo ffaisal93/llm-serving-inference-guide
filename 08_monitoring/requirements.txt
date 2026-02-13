@@ -1,0 +1,11 @@
+# Monitoring Dependencies
+
+# Prometheus client
+prometheus-client==0.19.0
+
+# GPU monitoring (optional)
+pynvml==11.5.0
+
+# Web framework (if integrating with FastAPI)
+fastapi==0.104.1
+

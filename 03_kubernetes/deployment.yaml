@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-serving
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-config
+  namespace: llm-serving
+data:
+  model_name: "gpt2"
+  max_length: "100"
+  temperature: "0.7"
+  device: "cpu"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-serving
+  namespace: llm-serving
+  labels:
+    app: llm-serving
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llm-serving
+  template:
+    metadata:
+      labels:
+        app: llm-serving
+    spec:
+      containers:
+      - name: llm-serving
+        image: llm-serving:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: model_name
+        - name: MAX_LENGTH
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: max_length
+        - name: TEMPERATURE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: temperature
+        - name: DEVICE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-config
+              key: device
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+            # For GPU, uncomment:
+            # nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 30
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-serving
+  namespace: llm-serving
+  labels:
+    app: llm-serving
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: llm-serving
+---
+# Optional: Ingress for external access
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: llm-ingress
+#   namespace: llm-serving
+# spec:
+#   rules:
+#   - host: llm.local
+#     http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: llm-serving
+#             port:
+#               number: 80
+
