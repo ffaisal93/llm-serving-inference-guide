@@ -1,0 +1,4 @@
+/* Widen the mdBook content column from the default 750px to 1000px. */
+:root {
+    --content-max-width: 1000px;
+}

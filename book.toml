@@ -1,0 +1,33 @@
+[book]
+title = "LLM Serving & Inference — A Practical Guide"
+authors = ["Fahim Faisal"]
+description = "Serving, containerizing, scaling, deploying, and monitoring LLM inference in production: vLLM, Triton, Kubernetes, autoscaling, canaries, drift detection."
+language = "en"
+src = "."
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/ffaisal93/llm-serving-inference-guide"
+edit-url-template = "https://github.com/ffaisal93/llm-serving-inference-guide/edit/main/{path}"
+mathjax-support = true
+no-section-label = true
+additional-css = ["custom.css"]
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.print]
+enable = true
