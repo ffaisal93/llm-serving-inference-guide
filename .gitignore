@@ -90,3 +90,6 @@ test_results/
 
 # mdBook build output
 book/
+
+# archived duplicate folders
+_archive/
