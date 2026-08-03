@@ -93,3 +93,6 @@ book/
 
 # archived duplicate folders
 _archive/
+
+# scratch quarantine (bridge cannot delete)
+_trash/
