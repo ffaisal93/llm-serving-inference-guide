@@ -110,6 +110,8 @@ For a metric with sorted samples, the p-th percentile \( P_p \) is the smallest 
 
 Report **p50 (median), p95, p99** for TTFT, TPOT, and E2E. p99 matters more than it looks: if a page makes 10 backend calls, the chance all 10 beat p99 is \( 0.99^{10} \approx 0.90 \) — so ~10% of *page loads* hit a p99 tail. Tail latency compounds.
 
+A practical note on computing these from a live stream of samples rather than a saved-then-sorted list: naive percentile computation needs the full sorted sample set in memory, which is fine for a single sweep level (thousands of samples) but awkward for a long-running soak test. If you need percentiles over an unbounded stream, use a streaming quantile sketch (e.g. t-digest or HDRHistogram) instead of re-sorting on every report — both are available as Python/Go/JS libraries and are what k6 and Gatling use internally to report percentiles without buffering every sample.
+
 ---
 
 ## Open-Loop vs Closed-Loop Load Generation
@@ -393,8 +395,69 @@ Locust's own percentile table then gives you p50/p95/p99 for both the full reque
 | **NVIDIA GenAI-Perf** (Triton Perf Analyzer) | Both: `--concurrency` (closed) or `--request-rate` (open) | TTFT, inter-token latency, output token throughput, request throughput, seq lengths, all with avg/p90/p99 | OpenAI-compatible, Triton (TRT-LLM, vLLM), gRPC/HTTP | Deep NVIDIA/Triton stacks; synthetic + custom datasets; rich exports | Heavier setup; Triton-centric defaults |
 | **Locust** | Closed-loop by default; `constant_throughput` ≈ open | Whatever you instrument; built-in RPS + percentile table + web UI | Any HTTP (write Python tasks) | Custom flows, quick dashboards, mixed traffic | Python workers can be the bottleneck; streaming/TTFT needs custom code |
 | **k6** | **Open-loop** (`constant/ramping-arrival-rate`) or closed (`*-vus`) | RPS, latency percentiles, custom Trends | Any HTTP/gRPC (JS scripts) | Honest open-loop SLA tests, CI gating | Go runtime doesn't tokenize; TTFT needs manual SSE parsing/custom metrics |
+| **NVIDIA AIPerf** (successor to GenAI-Perf, 2026) | Both, plus native **session/conversation** replay (`--conversation-num`, `--session-concurrency`) | Everything GenAI-Perf reports, plus per-session turn/context growth stats | OpenAI-compatible, Triton (TRT-LLM, vLLM) | Multi-turn/agentic benchmarking on an NVIDIA-centric stack | Newer tool; flags and docs are still migrating off the GenAI-Perf names, check the migration guide |
 
-Rule of thumb: **`benchmark_serving.py`/GenAI-Perf** when you want LLM-native metrics and datasets out of the box; **k6** when you want a rigorous open-loop SLA test; **LLMPerf** for cross-provider comparisons; **Locust** for bespoke multi-step traffic with a dashboard.
+Rule of thumb: **`benchmark_serving.py`/GenAI-Perf** when you want LLM-native metrics and datasets out of the box; **k6** when you want a rigorous open-loop SLA test; **LLMPerf** for cross-provider comparisons; **Locust** for bespoke multi-step traffic with a dashboard; **AIPerf** when the workload itself is multi-turn or agentic rather than independent requests.
+
+None of these five rows model output length as anything other than a knob you set — a fixed number, a random range. That was a reasonable simplification when most production traffic really was short-and-bounded. It stopped being reasonable once reasoning models and agent frameworks became common, which is exactly the gap the next section covers.
+
+The table above is the 2023–2024 baseline. Tooling has moved fast since — see [The 2025–2026 Landscape](#the-20252026-landscape) below for how multi-turn/agentic replay and reasoning-model output-length variability changed what "a good load test" even means.
+
+---
+
+## The 2025–2026 Landscape
+
+Everything above is timeless methodology. The tooling that implements it has moved fast, and — more importantly — the *workloads* people benchmark have changed shape: fewer isolated single-turn chat completions, more multi-turn agent sessions and long, unpredictable reasoning traces. A benchmark built for 2023's "one prompt in, one answer out" chatbot systematically misleads you about 2026's agent that calls tools across 40 turns while thinking for 3,000 tokens before answering. This section covers what changed and why it matters for the numbers you report.
+
+### vLLM: from a script to a CLI, plus native multi-turn replay
+
+`benchmark_serving.py` has grown into a first-class subcommand, `vllm bench serve` (the standalone script still exists and both are maintained). Its dataset support has broadened well past `sharegpt`/`random`/`sonnet`: as of the current `vllm/benchmarks/serve.py`, `--dataset-name` accepts `random`, `random-mm` (multi-modal), `random-rerank`, `prefix_repetition` (purpose-built to stress prefix-cache reuse), `sharegpt`, `custom`, `sonnet`, `hf` (any HuggingFace dataset), `spec_bench`, and `timed_trace` (replay requests at recorded timestamps — the building block for realistic session replay). Traffic shaping is also richer than a flat Poisson process: `--burstiness` scales a gamma-distributed arrival process (1.0 = pure Poisson, <1 = burstier, >1 = smoother), and `--ramp-up-strategy {linear,exponential}` with `--ramp-up-start-rps`/`--ramp-up-end-rps` lets a single run sweep from idle to saturation instead of requiring one process per rate — directly automating the sweep this chapter has been doing by hand. (Source: <https://github.com/vllm-project/vllm/blob/main/vllm/benchmarks/serve.py>; docs: <https://docs.vllm.ai/en/latest/cli/bench/serve/>.)
+
+More significant: vLLM has merged a **dedicated multi-turn benchmark**, `benchmarks/multi_turn/benchmark_serving_multi_turn.py`, tracked under RFC #20265 and shipped via a PR from Pliops (`pliops-daniels`), originally built to benchmark **KV-cache offloading under realistic multi-turn conversation replay** — i.e., does the engine actually reuse a session's prior-turn KV cache instead of recomputing it, and what does that do to TTFT as conversations get longer. (PR: <https://github.com/vllm-project/vllm/pull/20267>; write-up: Pliops, "Setting the Standard: Multi-Turn Benchmarking in vLLM," <https://pliops.com/setting-the-standard-multi-turn-benchmarking-in-vllm/>.) The practical shift: a session is now a first-class unit of load, not an afterthought bolted onto a single-turn tool.
+
+### NVIDIA GenAI-Perf → AIPerf: sessions and turns as native concepts
+
+NVIDIA's GenAI-Perf (built on the Triton Perf Analyzer) added explicit **multi-turn session modeling**: `--num-sessions` and `--session-concurrency` control how many independent conversations run and how many run in parallel; `--session-turns-mean`/`--session-turns-stddev` control how long each conversation is; `--session-turn-delay-mean`/`--session-turn-delay-stddev` (plus `--session-delay-ratio` to rescale an imported trace) model human "think time" between turns instead of firing the next turn the instant the last one finishes. (Docs: <https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/docs/multi_turn.html>.)
+
+NVIDIA has since folded this into a successor tool, **AIPerf** (documented at v0.8.0 as of 2026), which the docs describe as superseding GenAI-Perf, with a migration guide and a "GenAI-Perf vs AIPerf CLI feature comparison matrix" for teams porting scripts. AIPerf's multi-turn flags are renamed but conceptually identical — `--conversation-num`, `--conversation-turn-mean`/`--conversation-turn-stddev`, `--conversation-turn-delay-mean`/`--conversation-turn-delay-stddev` — with the docs explicit that `--request-count` is for single-turn benchmarking and `--conversation-num` is for multi-turn. (Docs: <https://docs.nvidia.com/aiperf/tutorials/datasets-inputs/multi-turn-conversations> and <https://docs.nvidia.com/aiperf/getting-started/ai-perf-comprehensive-llm-benchmarking>.) If you last touched this tool as "GenAI-Perf," expect the name (and some flags) to have moved.
+
+### LLMPerf: still the cross-provider workhorse, still concurrency-based
+
+LLMPerf (Ray) hasn't fundamentally changed its load model — it remains a **closed-loop, `--num-concurrent-requests`** tool, which is exactly why it's still the default for cross-provider leaderboard-style comparisons (OpenAI vs Anthropic vs a self-hosted vLLM endpoint, apples-to-apples). Its output-length handling is still fixed-`max_tokens`-per-request rather than a distribution sampled from data, which is the main reason it under-represents reasoning-model workloads well: a reasoning model's *actual* output length depends on problem difficulty in a way a flat `max_tokens` target doesn't capture (see below). Treat LLMPerf numbers as "throughput ceiling at concurrency C for this fixed output length," not as an SLA-representative measurement. (<https://github.com/ray-project/llmperf>)
+
+### Reasoning models broke the "fixed output length" assumption
+
+Chain-of-thought reasoning models (the o-series-style and DeepSeek-R1-style models that think before answering) don't just produce longer outputs — they produce **output lengths that vary with problem difficulty in a way you cannot know in advance**. Li et al.'s 2025 empirical study of reasoning-LLM serving found KV-cache utilization swinging from **3% to 70%** within the same batch (versus a steady sub-3% for standard LLMs), and identified a **straggler-request problem**: a batch containing one hard problem that reasons for thousands of tokens has its entire completion time set by that one request, dragging down every easy request batched alongside it. Their evaluation deliberately moves off idealized fixed-batch benchmarking to a **Gamma-distributed open-arrival workload**, precisely because batch-shaped synthetic tests hide this behavior. (Li et al., "Reasoning Language Model Inference Serving: An Empirical Study," arXiv:2510.18672, 2025: <https://arxiv.org/abs/2510.18672>.)
+
+NVIDIA's 2026 infrastructure-economics analysis of long chain-of-thought models makes the cost implication concrete: because a reasoning model can burn hundreds to thousands of intermediate tokens before its final answer, **cost per token becomes the dominant economic variable**, and disaggregated prefill/decode serving (NVIDIA Dynamo) plus speculative decoding (reported tripling throughput to ~30,000 tok/s on some models) are presented as the mitigations. (NVIDIA Perspectives, "Infrastructure Economics: Reasoning Models & Chain-of-Thought," updated Apr 13, 2026: <https://perspectives.nvidia.com/infrastructure-economics-reasoning-models-chain-of-thought>.)
+
+**What this means for your load test:** stop assuming a single `max_tokens`/mean-output-length number describes your workload. Sample output length from a distribution correlated with a proxy for difficulty (or, at minimum, a heavy-tailed/bimodal distribution — short direct answers mixed with long reasoning traces), track **KV-cache occupancy as a time series** rather than a single steady-state number, and watch batch-level p99 for straggler contamination, not just per-request percentiles. Section B below gives runnable code for this.
+
+### Agentic and multi-turn workloads: replay sessions, not requests
+
+Two 2026 data points quantify just how different agentic traffic is from single-turn chat. First, a characterization of ReAct-style agents across ADE-Bench, DABStep, GAIA, SWE-bench Pro, and Terminal-Bench 2.0 found execution is **long-tailed in two separate dimensions** — some tasks run to hundreds of turns (up to 786 observed), others accumulate huge context (up to 171K tokens) in relatively few turns — yet despite those huge contexts, time is **decode-dominated (91–98.6% of LLM time)**, because **84.6–99.5% of input tokens are reused across turns** via prefix caching rather than freshly attended-to. Tool calls (file ops, Bash, web search, etc.) consume 2–29% of wall-clock time depending on domain, and failed tool calls trigger retry loops that inflate both turn count and context length. (Yuan, Nayak, Kundu, Talati, "Agentic AI Workload Characteristics," arXiv:2605.26297, May 2026: <https://arxiv.org/abs/2605.26297>.)
+
+Second, vLLM's own May 2026 write-up on integrating Mooncake Store as a distributed KV cache quantifies what happens when you *don't* engineer for this: analyzing 610 real Codex/SWE-bench Pro traces, contexts reach roughly **80K tokens by turn 30** with a **131:1 input-to-output token ratio** (i.e., overwhelmingly prefix-dominated), and when load-balanced round-robin across replicas without a shared cache, the achievable cache-hit rate **collapses to 1.7%** — every re-routed turn recomputes its ~80K-token prefix from scratch. With a distributed cache (Mooncake Store), hit rate recovers to **92.2%**, delivering measured **3.8× higher throughput, 46× lower p50 TTFT, and 8.6× lower end-to-end latency** on a 12-GPU test bed, scaling near-linearly to 60 GPUs while holding >95% hit rate. (vLLM Blog, "Serving Agentic Workloads at Scale with vLLM x Mooncake," May 6, 2026: <https://vllm.ai/blog/2026-05-06-mooncake-store>.)
+
+**What this means for your load test:** a single-turn `benchmark_serving` run against an agentic-serving deployment will systematically **overstate TTFT and understate achievable concurrency**, because it never creates the prefix-reuse conditions real session traffic does — every synthetic request is a cold, independent prefix. If your product is agentic, your load test must (1) replay session-shaped traffic (fixed or sampled turn counts, realistic think-time between turns, growing per-session context) using vLLM's multi-turn benchmark, GenAI-Perf/AIPerf's `--num-sessions`/`--conversation-num` modes, or a `timed_trace` replay of real logs; (2) report **prefix/KV-cache hit rate** as a first-class metric alongside TTFT/TPOT/throughput; and (3) explicitly test cross-instance routing and cache-eviction behavior under concurrent multi-session load, not just single-replica throughput.
+
+### What actually changed, in one paragraph
+
+If you take away one thing from this section: the unit of load has shifted from **the request** to **the session**. Tooling caught up (multi-turn flags in vLLM's benchmark, GenAI-Perf/AIPerf's `--session-*`/`--conversation-*` families), and the workloads driving that shift — reasoning models with difficulty-correlated output length, agents with long-tailed turn counts and heavy prefix reuse — mean that a benchmark reporting a single fixed-length, single-turn number is answering a question production traffic no longer asks. Everything else below is about picking the right tool for the shape of session your product actually generates.
+
+### Choosing a tool in 2026 — decision matrix
+
+| If you need... | Reach for | Because |
+|---|---|---|
+| LLM-native metrics + realistic single-turn datasets, fast | `vllm bench serve` | Built-in TTFT/TPOT/ITL, `sharegpt`/`hf`/`prefix_repetition` datasets, ramp-up sweeps |
+| Multi-turn / KV-cache-offload benchmarking on vLLM specifically | `benchmarks/multi_turn/benchmark_serving_multi_turn.py` | Purpose-built for session replay against vLLM's own KV-cache paths |
+| Cross-provider apples-to-apples (OpenAI vs Anthropic vs self-hosted) | LLMPerf | Same client, many backends; treat as throughput-ceiling only |
+| NVIDIA/Triton-centric stack, deep session control | AIPerf (formerly GenAI-Perf) | `--conversation-num`/`--session-*` flags, rich exports, active development |
+| Rigorous open-loop SLA gate in CI | k6 | True arrival-rate executors, scriptable assertions, no coordinated omission |
+| Reasoning-model workload with variable output length | Any of the above, fed a *sampled* (not fixed) output-length distribution | Fixed `max_tokens` hides the straggler-request problem entirely |
+| Agentic / tool-calling workload | Session/trace replay (vLLM multi-turn, AIPerf conversations, or your own `timed_trace`) + KV-cache hit-rate metric | Independent-request benchmarks never exercise prefix reuse, so they mismeasure both latency and achievable concurrency |
+
+One caveat applies to every row of that table: this space is moving fast enough that flag names change under you (GenAI-Perf's own docs point at a CLI migration guide for exactly this reason). Whatever tool you pick, pin its version alongside the model, dataset, and length distribution in your CI gate (Production Checklist, item 8) — a benchmark that silently picks up a new default when the tool auto-updates is just as unreproducible as one that was never pinned at all.
 
 ---
 
@@ -416,6 +479,339 @@ Rule of thumb: **`benchmark_serving.py`/GenAI-Perf** when you want LLM-native me
 
 ---
 
+## Build It in Practice — Extended
+
+The async client earlier in this chapter is a correct open-loop tool for *one* rate. Three things turn it into a practice you can actually run before a launch: (1) a length sampler that replays a realistic input/output distribution instead of a handful of fixed prompts, (2) a sweep driver that finds the saturation knee automatically instead of you eyeballing a table, and (3) a plotting step that turns the sweep into a chart you can put in a review deck.
+
+### B1. A realistic input/output length sampler
+
+Fixed-length benchmarks hide exactly the dynamics that matter (see Pitfalls, above): requests that finish together, no straggler effects, no realistic KV-cache pressure. The right fix is to sample lengths from real data rather than invent a mean and stddev. The cheapest way to get "real data" without a bespoke dataset is to reuse the ShareGPT-style conversation data that `vllm bench serve --dataset-name sharegpt` already knows how to load, extract the **empirical (input_len, output_len) pairs after tokenization**, cache them once, and bootstrap-sample from that empirical pool for every request — this preserves the real joint distribution (including its correlation and heavy tail) instead of fitting a parametric approximation that smooths it away.
+
+```python
+#!/usr/bin/env python3
+"""length_sampler.py — build and sample from an empirical length distribution.
+
+Run once to build the pool (needs a tokenizer and a ShareGPT-format JSON,
+e.g. the file vLLM's own benchmarks download):
+
+    python length_sampler.py build \
+        --dataset ShareGPT_V3_unfiltered_cleaned_split.json \
+        --tokenizer meta-llama/Llama-3.1-8B-Instruct \
+        --out lengths.json
+
+Then import build_pool()/sample() from a load-test script to draw
+(input_len, output_len) pairs that match a real production-like shape.
+"""
+import argparse, json, random
+
+def build_pool(dataset_path: str, tokenizer_name: str, limit: int = 20000):
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+    with open(dataset_path) as f:
+        convos = json.load(f)
+    pool = []
+    for c in convos:
+        turns = c.get("conversations", [])
+        # Pair each human turn with the assistant turn that follows it.
+        for i in range(len(turns) - 1):
+            if turns[i]["from"] == "human" and turns[i + 1]["from"] == "gpt":
+                in_len = len(tok(turns[i]["value"]).input_ids)
+                out_len = len(tok(turns[i + 1]["value"]).input_ids)
+                if 1 <= in_len <= 8192 and 1 <= out_len <= 4096:
+                    pool.append((in_len, out_len))
+        if len(pool) >= limit:
+            break
+    return pool
+
+def sample(pool, reasoning_mix: float = 0.0, rng: random.Random | None = None):
+    """Draw one (input_len, output_len) pair.
+
+    reasoning_mix in [0, 1]: fraction of requests that get a synthetic
+    'hard reasoning' output-length multiplier instead of the empirical
+    output length, reflecting the finding that reasoning models produce
+    output length correlated with problem difficulty rather than a fixed
+    ceiling (Li et al., arXiv:2510.18672). 0.0 reproduces the raw empirical
+    distribution; try 0.15-0.3 to approximate a mixed reasoning workload.
+    """
+    rng = rng or random
+    in_len, out_len = rng.choice(pool)
+    if reasoning_mix > 0 and rng.random() < reasoning_mix:
+        # Hard problem: reasoning chain multiplies output length heavily,
+        # with its own long tail (occasionally 10-20x).
+        out_len = int(out_len * rng.lognormvariate(1.6, 0.7))
+        out_len = min(out_len, 8192)
+    return in_len, out_len
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build")
+    b.add_argument("--dataset", required=True)
+    b.add_argument("--tokenizer", required=True)
+    b.add_argument("--out", required=True)
+    b.add_argument("--limit", type=int, default=20000)
+    args = ap.parse_args()
+    if args.cmd == "build":
+        pool = build_pool(args.dataset, args.tokenizer, args.limit)
+        with open(args.out, "w") as f:
+            json.dump(pool, f)
+        lens_in = sorted(p[0] for p in pool)
+        lens_out = sorted(p[1] for p in pool)
+        n = len(pool)
+        print(f"built pool of {n} pairs")
+        print(f"input_len  p50={lens_in[n//2]}  p95={lens_in[int(n*0.95)]}")
+        print(f"output_len p50={lens_out[n//2]}  p95={lens_out[int(n*0.95)]}")
+```
+
+To wire this into the earlier `load_test.py`, replace the fixed `PROMPTS` list and `--max-tokens` flag with a call to `sample(pool, reasoning_mix=args.reasoning_mix)` per request: pad/truncate a filler prompt to `in_len` tokens (or, better, reuse the ShareGPT prompt text itself alongside its measured length) and set that request's `max_tokens` to the sampled `out_len` instead of a global constant. The rest of `one_request` — scheduling from `sched_t`, measuring from the intended send time — is unchanged; only the per-request length now varies realistically instead of being global.
+
+Why bootstrap from an empirical pool instead of fitting a parametric distribution (lognormal, gamma) to the same data? A fitted distribution smooths over exactly the structure that matters here — the correlation between a conversation's input and output length, and the heavy tail of occasional very long turns. Sampling `(in_len, out_len)` pairs together, verbatim, from real conversations preserves both; fitting marginal distributions separately and sampling them independently would silently discard the correlation and could understate how often a long input and a long output co-occur, which is exactly the combination that stresses KV-cache capacity hardest.
+
+### B2. A concurrency sweep that finds the knee automatically
+
+Manually reading a table (as in the sample-results section above) works for a chapter; it doesn't scale to "rerun this before every release." The sweep below is deliberately **closed-loop** — fixed worker pools per level — because finding the *ceiling* is precisely the closed-loop use case this chapter argues for: a bounded, known concurrency is the independent variable, and you read off achieved throughput and p95 latency at each level. It doubles concurrency until throughput growth falls below a threshold, then binary-searches between the last two doublings to pinpoint the knee more tightly.
+
+```python
+#!/usr/bin/env python3
+"""sweep.py — closed-loop concurrency sweep with automatic knee detection.
+
+Usage:
+  python sweep.py --url http://localhost:8000/v1/chat/completions \
+      --model my-model --pool lengths.json --out sweep_results.csv
+"""
+import argparse, asyncio, csv, json, statistics, time
+import aiohttp
+from length_sampler import sample
+
+async def worker_loop(session, url, model, pool, stop_event, out_tokens_box, latencies):
+    """Closed-loop worker: send, await full response, immediately send next."""
+    while not stop_event.is_set():
+        in_len, out_len = sample(pool)
+        payload = {
+            "model": model,
+            "messages": [{"role": "user",
+                          "content": "Explain this topic in detail. " * max(1, in_len // 8)}],
+            "max_tokens": out_len, "stream": True, "temperature": 0.0,
+        }
+        t_send = time.perf_counter()
+        n = 0
+        try:
+            async with session.post(url, json=payload) as resp:
+                async for raw in resp.content:
+                    line = raw.decode("utf-8").strip()
+                    if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                        n += 1
+        except Exception:
+            continue
+        if stop_event.is_set():
+            break                     # don't count a request that straddles the boundary
+        latencies.append((time.perf_counter() - t_send) * 1000)
+        out_tokens_box[0] += n
+
+async def run_level(url, model, pool, concurrency, measure_s, warmup_s):
+    stop = asyncio.Event()
+    out_tokens_box, latencies = [0], []
+    conn = aiohttp.TCPConnector(limit=0)
+    async with aiohttp.ClientSession(connector=conn,
+                                      timeout=aiohttp.ClientTimeout(total=None)) as session:
+        tasks = [asyncio.create_task(worker_loop(session, url, model, pool, stop,
+                                                  out_tokens_box, latencies))
+                 for _ in range(concurrency)]
+        await asyncio.sleep(warmup_s)
+        latencies.clear(); out_tokens_box[0] = 0     # discard warmup
+        t0 = time.perf_counter()
+        await asyncio.sleep(measure_s)
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        wall = time.perf_counter() - t0
+    n = len(latencies)
+    p95 = sorted(latencies)[int(0.95 * (n - 1))] if n else float("nan")
+    return {
+        "concurrency": concurrency,
+        "req_per_s": n / wall if wall else 0.0,
+        "out_tok_per_s": out_tokens_box[0] / wall if wall else 0.0,
+        "e2e_p95_ms": p95,
+        "n_requests": n,
+    }
+
+def efficiency(level):
+    """Throughput per unit of concurrency — falls as you approach the knee."""
+    return level["out_tok_per_s"] / level["concurrency"]
+
+async def sweep(url, model, pool, measure_s, warmup_s, max_concurrency=256):
+    levels = []
+    c = 1
+    while c <= max_concurrency:
+        lvl = await run_level(url, model, pool, c, measure_s, warmup_s)
+        levels.append(lvl)
+        print(f"concurrency={c:4d}  req/s={lvl['req_per_s']:7.2f}  "
+              f"tok/s={lvl['out_tok_per_s']:8.1f}  p95={lvl['e2e_p95_ms']:8.1f}ms")
+        if len(levels) >= 2:
+            growth = lvl["out_tok_per_s"] / max(levels[-2]["out_tok_per_s"], 1e-9) - 1
+            latency_blowup = lvl["e2e_p95_ms"] / max(levels[-2]["e2e_p95_ms"], 1e-9)
+            # Stop doubling once a doubling of concurrency buys <10% more
+            # throughput, or p95 latency has more than tripled since the
+            # last level -- either is the overload signature from the
+            # Core Intuition section above.
+            if growth < 0.10 or latency_blowup > 3.0:
+                break
+        c *= 2
+    if len(levels) < 2:
+        return levels, levels[-1]["concurrency"] if levels else 1
+    # Binary-search refine between the last two doubling points for a
+    # tighter knee estimate than "somewhere between C and 2C".
+    lo, hi = levels[-2]["concurrency"], levels[-1]["concurrency"]
+    lo_lvl = levels[-2]
+    while hi - lo > max(1, lo // 8):          # stop refining once step is <~12% of lo
+        mid = (lo + hi) // 2
+        mid_lvl = await run_level(url, model, pool, mid, measure_s, warmup_s)
+        levels.append(mid_lvl)
+        print(f"  refine concurrency={mid:4d}  tok/s={mid_lvl['out_tok_per_s']:8.1f}  "
+              f"p95={mid_lvl['e2e_p95_ms']:8.1f}ms")
+        growth = mid_lvl["out_tok_per_s"] / max(lo_lvl["out_tok_per_s"], 1e-9) - 1
+        if growth < 0.10:
+            hi = mid
+        else:
+            lo, lo_lvl = mid, mid_lvl
+    knee = lo
+    return sorted(levels, key=lambda l: l["concurrency"]), knee
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--pool", required=True, help="lengths.json from length_sampler.py build")
+    ap.add_argument("--out", default="sweep_results.csv")
+    ap.add_argument("--measure-seconds", type=float, default=30.0)
+    ap.add_argument("--warmup-seconds", type=float, default=10.0)
+    ap.add_argument("--max-concurrency", type=int, default=256)
+    args = ap.parse_args()
+    with open(args.pool) as f:
+        pool = json.load(f)
+    levels, knee = await sweep(args.url, args.model, pool, args.measure_seconds,
+                                args.warmup_seconds, args.max_concurrency)
+    with open(args.out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(levels[0].keys()))
+        w.writeheader()
+        for lvl in levels:
+            w.writerow(lvl)
+    print(f"\ndetected knee at concurrency ~= {knee}  (wrote {args.out})")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+The knee rule implements exactly the "throughput stops rising while latency starts rising superlinearly" signature from the Core Intuition section: growth-per-doubling `< 10%` catches the throughput flattening, `latency_blowup > 3.0` catches the queueing explosion, and either one alone is enough to trigger — some engines saturate on compute (throughput flattens first) while others saturate on scheduler/KV-cache pressure (latency explodes while throughput is still creeping up). The binary-search phase afterward turns "somewhere between 32 and 64" into a specific number worth writing on a slide.
+
+### B3. Plotting the sweep
+
+```python
+#!/usr/bin/env python3
+"""plot_results.py — render sweep_results.csv as a throughput/latency chart.
+
+Usage: python plot_results.py sweep_results.csv --knee 40 --out sweep.png
+"""
+import argparse, csv
+
+def load(path):
+    with open(path) as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
+    rows = [r for r in rows if r["n_requests"] and int(r["n_requests"]) > 0]
+    rows.sort(key=lambda r: int(r["concurrency"]))
+    return rows
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv_path")
+    ap.add_argument("--knee", type=float, default=None)
+    ap.add_argument("--out", default="sweep.png")
+    args = ap.parse_args()
+    rows = load(args.csv_path)
+    xs = [int(r["concurrency"]) for r in rows]
+    tok_s = [float(r["out_tok_per_s"]) for r in rows]
+    p95 = [float(r["e2e_p95_ms"]) for r in rows]
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        # No plotting deps available -- fall back to an ASCII sparkline so
+        # the pipeline still produces *something* reviewable over SSH.
+        def spark(vals):
+            bars = " .:-=+*#%@"
+            lo, hi = min(vals), max(vals)
+            span = (hi - lo) or 1.0
+            return "".join(bars[min(9, int((v - lo) / span * 9))] for v in vals)
+        print("matplotlib not installed; ASCII fallback:")
+        print("concurrency:", xs)
+        print("tok/s      :", spark(tok_s), f"  (min={min(tok_s):.0f}, max={max(tok_s):.0f})")
+        print("p95 ms     :", spark(p95), f"  (min={min(p95):.0f}, max={max(p95):.0f})")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    ax1.plot(xs, tok_s, marker="o")
+    ax1.set_xlabel("concurrency"); ax1.set_ylabel("output tok/s")
+    ax1.set_title("Throughput vs concurrency")
+    ax2.plot(xs, p95, marker="o", color="firebrick")
+    ax2.set_xlabel("concurrency"); ax2.set_ylabel("E2E p95 (ms)")
+    ax2.set_title("Tail latency vs concurrency")
+    if args.knee is not None:
+        for ax in (ax1, ax2):
+            ax.axvline(args.knee, linestyle="--", color="gray")
+            ax.text(args.knee, ax.get_ylim()[1] * 0.95, f" knee~{args.knee:g}",
+                    va="top", fontsize=8, color="gray")
+    fig.tight_layout()
+    fig.savefig(args.out, dpi=150)
+    print(f"wrote {args.out}")
+
+if __name__ == "__main__":
+    main()
+```
+
+The `matplotlib`-missing fallback matters more than it looks: this pipeline is meant to run unattended (a pre-release CI job, a bastion box with no X11 and a minimal Python image), and a plotting script that hard-crashes when a dependency is missing means nobody ever sees the sweep at all. Chained together (`length_sampler.py build` → `sweep.py` → `plot_results.py`), these three scripts are the difference between "we eyeballed some numbers" and "here is the knee, here is the chart, here is the exact concurrency we're launching at" in a launch-readiness review.
+
+---
+
+## Production Case Studies & War Stories
+
+### War story 1 — the load test that lied
+
+**Setup.** A team preparing to launch a chat feature ran a pre-launch load test with 200 fixed virtual users hammering a vLLM endpoint in a tight closed loop: send, wait for the full response, send again. The report looked clean — median E2E 1.2 s, p99 2.1 s — and the launch was signed off as "validated at 500 req/s equivalent load."
+
+**What actually happened.** On launch day, real open-loop traffic arrived on its own schedule, indifferent to server health. An autoscaler scale-up lagged behind a traffic ramp by about ninety seconds, during which the existing pods queued hard. In production, p99 spiked past 40 seconds and client timeouts triggered retries, which added *more* load on top of an already-saturated system — a classic retry storm. Nothing about this was visible in the pre-launch numbers.
+
+**Root cause.** The pre-launch test was closed-loop. When the (simulated, in staging) system slowed down, each of the 200 virtual users simply stalled waiting for its in-flight response and stopped sending new requests — the offered load quietly dropped exactly when the system was struggling, and no sample ever recorded the 90-second queueing debt building up behind the stall. This is coordinated omission exactly as described earlier in this chapter, and it is not a hypothetical: it is the single most common reason a "green" load test is followed by a "red" launch.
+
+**Diagnosis and fix.** Post-incident, the team reran the same nominal load using k6's `ramping-arrival-rate` executor (open-loop) and reproduced the p99 spike in staging by chaos-injecting an artificial 90-second slow window on one backend pod. The open-loop test showed the queueing debt immediately — p99 blew out precisely as it had in production, while a control run of the *old* closed-loop VU-based script, replayed against the same chaos-injected staging environment, again failed to show it. That side-by-side rerun is what convinced the team the tooling, not the server, had been the blind spot.
+
+**Lesson.** Any load test used as a launch gate for latency SLAs must be open-loop with a realistic arrival distribution, and it must include at least one injected-failure scenario (a slow pod, a delayed autoscale event), not just steady-state load. A closed-loop VU test is still useful — as a throughput-ceiling probe — but it must never be the artifact that says "go."
+
+### War story 2 — the GPU that wasn't the bottleneck
+
+**Setup.** An engineer benchmarking a new vLLM engine configuration (a scheduler flag change intended to improve throughput) measured a plateau at roughly 1,800 output tok/s at 32 concurrent requests on an A100 running an 8B model — well under the several-thousand tok/s the same card had hit in a vendor reference benchmark for a comparable model. The natural conclusion: the new configuration regressed something, and the engineer began reverting flags one at a time, burning the better part of a day.
+
+**What was actually happening.** `nvidia-smi` showed GPU utilization at roughly 40% throughout the test — not a saturated GPU at all. The load generator was a single Python process using `aiohttp` with its **default connection-pool limit of 100** and synchronous JSON parsing of each SSE chunk on the event loop; at 32 concurrent streaming connections doing that parsing, one CPU core was pegged at 100%. The client, not the server, had run out of capacity.
+
+**How it was confirmed.** Cross-checking with Little's Law settled it without more guessing: the achieved request rate and measured mean E2E latency implied an average in-flight concurrency \( L = \lambda W \) far below the server's configured `--max-num-seqs`. If the server had genuinely been the bottleneck at 32 concurrent requests, \( L \) should have tracked close to 32; instead it sat well under that, meaning the server had spare scheduling slots the client simply wasn't filling.
+
+**Fix.** Removing the `aiohttp` connector limit (`TCPConnector(limit=0)`) and splitting the load across four client processes (one per CPU core) with `k6`'s distributed workers eliminated the client bottleneck. Rerun under the *same* engine configuration reached roughly 6,100 output tok/s — in line with the vendor reference, and confirming the scheduler-flag change the engineer had been about to revert was fine all along.
+
+**Lesson.** Before attributing a throughput plateau to the server, check client CPU and connection-pool limits, and cross-validate the achieved in-flight concurrency against Little's Law and the server's own `max-num-seqs`/`max-num-batched-tokens` settings. The load generator is part of the system under test, and it is very easy for it to quietly become the ceiling.
+
+### Telling these apart quickly, without waiting for a postmortem
+
+Both stories above are diagnosable in minutes if you check the right signal early, rather than staring at a latency graph and guessing:
+
+| Symptom you observe | Likely cause | Quick check |
+|---|---|---|
+| Achieved rate tracks target rate, but production still times out under real traffic | Coordinated omission — the test was closed-loop | Rerun the same nominal load open-loop (arrival-rate executor); if the tail latency only appears there, that's the confirmation |
+| Throughput plateaus well below expectation, server GPU utilization is low (well under ~80%) | Client-side bottleneck | Check client CPU, connector/pool limits, and Little's-Law-implied concurrency against `max-num-seqs` |
+| Throughput plateaus, server GPU utilization is high (~90%+), latency climbing superlinearly | Genuine server-side saturation — you've found the real knee | This is the good outcome: sweep further to confirm the plateau holds, then pick an operating point below it |
+| Achieved rate silently falls below target rate as you push higher | Either genuine overload (expected past the knee) or a client that can't keep up with its own schedule | Compare against a known-good baseline concurrency/rate; if the shortfall appears *before* the expected knee, suspect the client first |
+
+The unifying habit in both incidents: never trust a single graph in isolation. Cross-check achieved-vs-target rate, server-side utilization, and the Little's-Law-implied concurrency against each other before deciding which side of the client/server boundary the bottleneck is on.
+
+---
+
 ## Production Checklist — What an Interviewer Probes
 
 1. **"What do you measure, and why not just average latency?"** — Name TTFT, TPOT/ITL, E2E, request- and output-token throughput; report **p50/p95/p99**, not means, because latency is heavy-tailed and the tail is what users feel. Mean is only for throughput accounting.
@@ -429,10 +825,101 @@ Rule of thumb: **`benchmark_serving.py`/GenAI-Perf** when you want LLM-native me
 
 ---
 
+## Interview Mastery
+
+The checklist above covers the essentials. This section drills deeper: a tight verbal answer to the question interviewers open with, a system-design prompt with a worked sketch, a red-flags/green-flags table for spotting bad methodology fast, and an expanded Q&A bank.
+
+### "Explain open-loop vs closed-loop load testing in 60 seconds"
+
+> A load test's *load model* is either closed-loop or open-loop. Closed-loop means a fixed pool of virtual users, each looping: send, wait for the response, send again — concurrency is capped at the pool size by construction. Open-loop means requests arrive on a schedule — say, Poisson at a target rate — independent of whether earlier requests have finished; concurrency is whatever emerges from that arrival rate hitting server capacity. The difference matters because of coordinated omission: when a closed-loop system slows down, each virtual user stalls waiting for its response and simply stops sending — the offered load backs off exactly when the server is struggling, so the tail latency you'd see in a real, indifferent arrival process never gets sampled. That's why closed-loop is fine for finding a throughput *ceiling* — a fixed, known concurrency is exactly the variable you want for that — but open-loop, with latency measured from the *intended* send time, is the only honest way to validate a latency SLA against realistic traffic.
+
+### System design prompt: "Design a load-testing plan before a product launch"
+
+A plausible interview prompt: *"We're launching a customer-facing chat feature backed by a self-hosted 70B model on 8 GPUs in three weeks. Design the load-testing plan."* A strong answer moves through phases, each with a concrete deliverable:
+
+```
+Phase 0 — Sanity check (day 1)
+  single request, cold and warm -> confirm TTFT/TPOT look reasonable,
+  no obvious misconfiguration (wrong dtype, tiny max-num-seqs, etc.)
+
+Phase 1 — Concurrency sweep (days 2-4)
+  closed-loop sweep (Section B2 above) with a *realistic* length sampler
+  (Section B1), doubling until the knee triggers, then bisecting
+  -> deliverable: throughput-vs-concurrency and p95-vs-concurrency chart,
+     a single number ("knee ~= 45 concurrent requests, ~9,000 tok/s")
+
+Phase 2 — Open-loop SLA validation (days 5-8)
+  k6 (or the async client above) at the *target* production arrival rate
+  and traffic mix, run long enough for >=1000 post-warmup samples per
+  metric, with prompts/lengths sampled from real or representative data
+  -> deliverable: pass/fail against the stated SLA (e.g. "p95 TTFT < 500ms
+     at 25 req/s"), with margin to the Phase 1 knee stated explicitly
+
+Phase 3 — Failure-mode / chaos injection (days 9-11)
+  re-run Phase 2 while injecting: a slow/unhealthy pod, an autoscaler
+  delay, a burst 3x above target rate for 60s, a cold-start (freshly
+  scaled pod with no warmup)
+  -> deliverable: a short runbook of "what breaks and how it degrades"
+     (graceful backpressure vs cascading timeout/retry storm)
+
+Phase 4 — Soak test (days 12-13)
+  hold the Phase 2 rate for several hours -> catch slow memory/KV-cache
+  fragmentation leaks that a 10-minute test can't show
+
+Phase 5 — CI regression gate (ongoing, from day 14)
+  pin tool/model/dataset/lengths; run the Phase 1 sweep (or a cheap
+  single-concurrency proxy of it) on every config change; assert on
+  p95 TTFT and output tok/s thresholds so a scheduler-flag regression
+  fails the build before it reaches production
+```
+
+The parts an interviewer is listening for: naming the knee-finding phase as *closed-loop by design*, explicitly separating it from the *open-loop* SLA-validation phase, including a chaos/failure phase (most candidates forget this and only test steady state), and ending with something that survives past launch day — a CI gate, not a one-time report.
+
+### Red flags vs green flags
+
+| Signal | Red flag | Green flag |
+|---|---|---|
+| Latency reporting | Only a mean latency number | p50/p95/p99 (and max) per metric, reported separately for TTFT/TPOT/E2E |
+| Load model for an SLA gate | Fixed-VU closed-loop test used to certify a latency SLA | Open-loop, arrival-rate test used for the SLA; closed-loop reserved for finding the throughput ceiling |
+| Operating point | A single concurrency number presented as "the" benchmark | A concurrency/rate sweep with the knee explicitly identified and an operating point chosen with headroom below it |
+| Workload shape | Same short prompt repeated, fixed `max_tokens` | Lengths sampled from a real/representative distribution; reasoning/agentic mix modeled if relevant |
+| Warmup | Cold-start requests included in the reported percentiles | Warmup window explicitly discarded; client itself warmed up (DNS/TLS/pool) |
+| Client health | Client CPU/connection limits never checked | Client CPU monitored, connector caps removed, achieved concurrency cross-checked against Little's Law |
+| Reproducibility | "We ran it once and it looked fine" | Tool/model/dataset/lengths pinned and rerun in CI with pass/fail thresholds |
+| Reasoning-model workloads | Fixed `max_tokens` per request | Output length sampled from a distribution correlated with difficulty; KV-cache occupancy tracked over time, not just at steady state |
+| Agentic/multi-turn workloads | Independent single-turn requests only | Session/multi-turn replay with realistic think-time between turns; prefix/KV-cache hit rate reported as a first-class metric |
+| Failure handling | Only steady-state load tested | At least one chaos/failure-injection scenario (slow pod, autoscale delay, burst) included before launch |
+
+### Expanded Q&A
+
+1. **What is TTFT dominated by, and why is it the most load-sensitive metric?** Prefill cost plus queueing wait for a scheduler slot; queueing wait is paid entirely before the first token, so TTFT reacts to load faster and harder than TPOT does.
+2. **Why report output-token throughput separately from request throughput?** They answer different questions — req/s is the right top-line number when the unit of work is "a request" (e.g. classification); output tok/s is the money metric for generative workloads and is what improves when batching gets better, even if req/s stays flat because outputs got longer.
+3. **State Little's Law and use it to sanity-check a benchmark.** \( L = \lambda W \). If a test offers 20 req/s and measures 4 s mean E2E, in-flight concurrency is 80; if `max-num-seqs` is 64, the system is oversubscribed and not in steady state, which the latency graph alone won't tell you until it's already climbing.
+4. **What, concretely, is coordinated omission, and name one tool feature that fixes it.** A closed-loop load generator stops sending when the server slows down, because each virtual user is blocked waiting on its own response, so the tail latency a real, indifferent arrival stream would have produced never gets sampled. Fix: an open-loop arrival-rate executor (k6's `constant-arrival-rate`) that measures latency from the *scheduled* send time rather than the actual send time.
+5. **Walk through how you'd automatically find the concurrency knee without eyeballing a chart.** Double concurrency each step; stop when a doubling buys less than ~10% more output tok/s *or* p95 latency more than triples versus the previous level (either condition alone is the overload signature); then binary-search between the last two doubling points to tighten the estimate.
+6. **Your pre-launch load test showed a healthy p99, but production had multi-second stalls. What's your hypothesis, and how do you confirm it?** Hypothesis: the pre-launch test was closed-loop and coordinated omission hid a queueing-debt scenario (e.g. an autoscaler lag). Confirm by rerunning the same nominal load open-loop while chaos-injecting the suspected failure (a delayed/slow pod) in staging, and showing the closed-loop tool fails to reproduce the same spike side-by-side.
+7. **You suspect your load generator, not the server, is the bottleneck. What do you check, in order?** Client CPU utilization; connection-pool/connector limits (e.g. aiohttp's default 100); whether the client is single-threaded/GIL-bound doing synchronous parsing on the event loop; then cross-check achieved in-flight concurrency via Little's Law against the server's configured capacity (`max-num-seqs`) — if the implied \( L \) is well under server capacity, the client is starving it.
+8. **How do you make a synthetic benchmark's workload realistic?** Sample input/output lengths from real data (production logs, or a public conversational dataset like ShareGPT) rather than a fixed pair; vary prompt content so prefix caching doesn't flatter TTFT unless you're deliberately testing the cached case; and match the arrival process (Poisson vs bursty vs session-shaped) to how traffic actually behaves.
+9. **How does a reasoning model change what and how you benchmark?** Output length becomes correlated with problem difficulty rather than a fixed ceiling, KV-cache utilization swings far more than in standard LLM serving (documented ranges of roughly 3-70% within a batch), and a single hard request in a batch can become a straggler that drags down every other request's completion time. Practical fix: sample output length from a distribution (ideally bimodal/heavy-tailed) instead of a flat `max_tokens`, and track KV-cache occupancy as a time series rather than a single number.
+10. **How would you load-test an agentic, multi-turn system differently from a single-turn chatbot?** Replay session-shaped traffic — realistic turn counts, think-time between turns, growing per-session context — rather than independent single-turn requests, using a tool with native multi-turn support (vLLM's multi-turn benchmark, GenAI-Perf/AIPerf's session/conversation modes, or a timestamped trace replay); and report prefix/KV-cache hit rate as a first-class metric, because agentic sessions are typically decode-dominated with very high input-token reuse across turns, and an independent-request benchmark never creates that reuse condition.
+11. **Compare vLLM's `benchmark_serving`/`vllm bench serve`, NVIDIA GenAI-Perf/AIPerf, and LLMPerf — when do you reach for each?** `vllm bench serve` for fast, LLM-native metrics and datasets against a vLLM-family or OpenAI-compatible endpoint, including built-in ramp-up sweeps; AIPerf (formerly GenAI-Perf) when you're deep in the NVIDIA/Triton stack and want first-class session/conversation modeling; LLMPerf when you need the same client hitting multiple *different* providers for an apples-to-apples comparison, remembering its concurrency mode measures a ceiling, not an SLA, and its fixed-`max_tokens` model under-represents reasoning workloads.
+12. **Why does a "regression" in mean E2E latency sometimes not be a regression at all?** E2E scales with output length (\( \text{E2E} = \text{TTFT} + (N-1)\cdot\text{TPOT} \)); if the new run's requests happened to generate longer outputs (different random seed, different sampled dataset order, a longer reasoning trace), E2E goes up with no change in per-token cost. Always compare either matched length distributions or normalized (per-token) latency.
+13. **What's the minimum sample size you'd want before trusting a reported p99?** On the order of 1,000+ post-warmup samples per metric per level; fewer than that and a single unlucky/lucky request can move the reported p99 by a large margin, and the run may not have reached queueing steady-state for Little's Law to hold.
+14. **How do you turn a one-off load test into something that gates CI?** Pin the tool version, model, dataset, and length distribution so the run is reproducible; run it (or a cheaper proxy of the full sweep) automatically on every serving-config change; assert on concrete thresholds (e.g. p95 TTFT and output tok/s) so a regression fails the build rather than waiting to be noticed in production.
+15. **What is prefix/KV-cache hit rate, and why does it belong in an agentic load-testing report?** The fraction of a request's prompt tokens served from a cached prior computation instead of recomputed; agentic sessions can be 80-99%+ prefix-reuse, so a benchmark that never creates that reuse (independent single-turn requests instead of session replay) will report a TTFT far worse than production actually sees, and a concurrency ceiling far lower than what's actually achievable once caching is engineered for.
+16. **Why might load-balancing strategy alone cause a large throughput/latency regression in a multi-replica agentic deployment?** Naive round-robin routing sends a session's later turns to a different replica than its earlier turns, forcing that replica to recompute the whole accumulated prefix from scratch; the fix is either session-affinity routing or a distributed KV cache shared across replicas, and the difference between the two shows up as an order-of-magnitude swing in achievable cache-hit rate, not a subtle one.
+17. **A batch of requests to a reasoning model has wildly inconsistent completion times even though every request entered the batch together. What's going on?** A straggler effect: one or two requests in the batch happen to need a much longer reasoning chain (harder problem), and because they share the batch, their completion time sets a floor for how long the whole batch's compute is tied up, dragging down the easier requests' effective throughput even though nothing is wrong with the server.
+18. **If you can only run one load test before a launch, which one do you run?** The open-loop SLA validation at the target production arrival rate and realistic traffic mix (Phase 2 of the system-design sketch above) — it's the one that most directly answers "will this hold under real traffic," and it implicitly exercises most of what a concurrency sweep would show, even though a dedicated sweep gives you a cleaner knee estimate and more margin to reason about.
+
+---
+
 ## Further Reading
+
+**Core methodology**
 
 - vLLM — Benchmark CLI (`vllm bench serve`): <https://docs.vllm.ai/en/latest/cli/bench/serve/>
 - vLLM — Benchmarking overview & datasets: <https://docs.vllm.ai/en/latest/benchmarking/cli/>
+- vLLM — `benchmarks/serve.py` source (dataset names, `--burstiness`, `--ramp-up-strategy`): <https://github.com/vllm-project/vllm/blob/main/vllm/benchmarks/serve.py>
 - LLMPerf (Ray) — benchmarking library and `token_benchmark_ray.py`: <https://github.com/ray-project/llmperf>
 - LLMPerf Leaderboard: <https://github.com/ray-project/llmperf-leaderboard>
 - NVIDIA GenAI-Perf (Triton Perf Analyzer): <https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/README.html>
@@ -444,3 +931,15 @@ Rule of thumb: **`benchmark_serving.py`/GenAI-Perf** when you want LLM-native me
 - Marc Brooker — Open, Closed, Omission and Collapse: <https://brooker.co.za/blog/2023/05/10/open-closed.html>
 - Little's Law (overview): <https://en.wikipedia.org/wiki/Little%27s_law>
 - Red Hat AI Inference Server — validating with key metrics (TTFT/TPOT/throughput): <https://docs.redhat.com/en/documentation/red_hat_ai_inference_server/3.1/html/getting_started/validating-benefits-with-key-metrics_getting-started>
+
+**Multi-turn, agentic, and reasoning-model benchmarking (2025-2026)**
+
+- vLLM — multi-turn conversation benchmark PR (RFC #20265, KV-cache-offload replay): <https://github.com/vllm-project/vllm/pull/20267>
+- Pliops — "Setting the Standard: Multi-Turn Benchmarking in vLLM": <https://pliops.com/setting-the-standard-multi-turn-benchmarking-in-vllm/>
+- NVIDIA GenAI-Perf — Multi-Turn Chat benchmarking docs: <https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/docs/multi_turn.html>
+- NVIDIA AIPerf — Multi-Turn Conversations docs: <https://docs.nvidia.com/aiperf/tutorials/datasets-inputs/multi-turn-conversations>
+- NVIDIA AIPerf — Comprehensive LLM Benchmarking (successor to GenAI-Perf): <https://docs.nvidia.com/aiperf/getting-started/ai-perf-comprehensive-llm-benchmarking>
+- Li et al. — "Reasoning Language Model Inference Serving: An Empirical Study" (arXiv:2510.18672, 2025): <https://arxiv.org/abs/2510.18672>
+- NVIDIA Perspectives — "Infrastructure Economics: Reasoning Models & Chain-of-Thought" (2026): <https://perspectives.nvidia.com/infrastructure-economics-reasoning-models-chain-of-thought>
+- Yuan, Nayak, Kundu, Talati — "Agentic AI Workload Characteristics" (arXiv:2605.26297, May 2026): <https://arxiv.org/abs/2605.26297>
+- vLLM Blog — "Serving Agentic Workloads at Scale with vLLM x Mooncake" (May 6, 2026): <https://vllm.ai/blog/2026-05-06-mooncake-store>

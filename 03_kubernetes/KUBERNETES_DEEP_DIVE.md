@@ -199,6 +199,46 @@ GPU nodes are the dominant cost, so many teams run inference on **spot/preemptib
 - Cold-start time is your enemy here: a reclaimed spot pod must re-download weights and reload the model before serving. Node-local weight caches and pre-pulled images shrink the recovery gap.
 - Right-size the GPU: an 8B model on an 80 GB H100 wastes the card — MIG-slice it or pick a smaller SKU (L4/L40S) and let the *comparison table* of frameworks + autoscaling do the packing.
 
+---
+
+## The 2025–2026 landscape
+
+The mechanisms above are stable, but the tooling around them moved fast between 2025 and 2026. Five developments matter most if you're standing up a new GPU-serving platform today.
+
+### GPU sharing has matured: MIG, time-slicing, MPS — and DRA is coming for all of them
+
+Through 2025 the **NVIDIA GPU Operator** (on the 24.9.x/25.x release line) remained the standard way to install the device plugin, driver, container toolkit, DCGM exporter, Node Feature Discovery, and MIG manager as one Helm-installed stack rather than hand-provisioning each piece. Its `ClusterPolicy` CRD is the single control surface: flip `mig.strategy` between `single` and `mixed`, and the operator relabels nodes and reconfigures the device plugin automatically. Time-slicing configuration is a plain `ConfigMap` the device plugin reads at startup (shown in the extended example below) — still oversubscription with no memory isolation, exactly as described above.
+
+The structurally bigger change is **Dynamic Resource Allocation (DRA)**, which graduated to General Availability in **Kubernetes v1.34** (released September 1, 2025). DRA replaces the device plugin's "advertise an integer count" model with **claim-based allocation**: a `ResourceClaim` lets a pod ask for a *class* of device with structured parameters (a specific MIG profile, a specific interconnect topology, a set of GPUs that share an NVLink domain) instead of just a count of `nvidia.com/gpu`. NVIDIA and the major cloud Kubernetes offerings shipped early DRA driver support in 2025–2026 specifically to express MIG profiles and multi-GPU topology (e.g. "give me 2 GPUs on the same NVLink island") in ways the old device-plugin integer model could never express. DRA does not replace the device plugin overnight — most production clusters in 2026 still run the classic `nvidia.com/gpu` device plugin — but it is the direction the scheduler is heading, and it is the answer if an interviewer asks "how would Kubernetes GPU scheduling need to evolve to express topology?"
+
+### KServe grew LLM-native primitives
+
+**KServe v0.15** (released June 18, 2025) added serving-specific features that a raw Deployment has to hand-roll:
+
+- **KEDA-based autoscaling on vLLM metrics** — instead of scaling on CPU%, KEDA can scale an `InferenceService` on `vllm:num_requests_running` or queue depth scraped straight from the vLLM Prometheus endpoint, which tracks actual serving pressure far better than CPU ever could.
+- **Multi-node inference** — native `pipelineParallelSize` / `tensorParallelSize` fields on the `ServingRuntime` so a model too big for one node (e.g. Llama 3.1 405B) can be declared, not hand-orchestrated with StatefulSets and headless Services.
+- **Distributed KV cache via LMCache** — KV-cache offload and cross-replica cache sharing, cutting time-to-first-token on multi-turn traffic.
+- **Envoy AI Gateway integration** — token-aware rate limiting and model-routing policy at the gateway layer.
+- The release also bumped the bundled vLLM backend to 0.8.5, adding support for newer model families and an OpenAI-compatible embeddings API.
+
+### A standard traffic layer arrived: the Gateway API Inference Extension
+
+Before mid-2025, every team invented its own "route to the replica holding the right prefix cache" logic. The **Gateway API Inference Extension** (introduced June 5, 2025, `sigs.k8s.io/gateway-api-inference-extension`) standardizes this with two new resources sitting on top of the Gateway API: **`InferencePool`** groups model-server pods sharing hardware/model config, and **`InferenceModel`/`InferenceObjective`** declares model identity and request priority (interactive chat vs. batch) for the router to act on. Implementations shipped fast: **Istio** added support in 2025, as did **NGINX Gateway Fabric**, and Google's **GKE Inference Gateway** is built directly on it — using signals like KV-cache utilization (via `GCPBackendPolicy`) to route model-aware rather than round-robin. This is the closest thing the ecosystem has to a standard answer for "how do you route LLM traffic on Kubernetes" as of 2026.
+
+### Kueue: batch/queue scheduling for GPU jobs
+
+**Kueue** (`kueue.sigs.k8s.io`, a Kubernetes SIG project, on the v0.18/v0.19 release line as of early 2026) fills a gap raw Kubernetes scheduling never solved: **fair, quota-aware admission of batch and GPU jobs across teams**. Where the default scheduler will happily let one team's fine-tuning job or eval sweep grab every GPU in the cluster, Kueue adds `ClusterQueue`/`LocalQueue` objects with quotas, borrowing/lending between cohorts, priority-based FIFO admission, and **gang scheduling** (all-or-nothing pod admission — no more a distributed training job launching 7 of 8 needed pods and deadlocking). It integrates with the cluster-autoscaler via *provisioning requests*, so a queued job can trigger new GPU nodes only once it's actually about to be admitted. **MultiKueue** extends this across clusters, dispatching an admitted job's pods to whichever connected cluster has capacity — relevant for fine-tuning/eval batch workloads more than steady-state serving, but increasingly used to arbitrate GPU access between a serving fleet and a training/eval fleet sharing the same pool.
+
+### Multi-cluster and multi-region serving
+
+Two 2025–2026 developments matter here. First, **llm-d** — a distributed inference stack founded by Red Hat, Google Cloud, IBM Research, CoreWeave, and NVIDIA, which joined the CNCF as a sandbox project in March 2026. It sits above vLLM/SGLang and adds **disaggregated prefill/decode** (splitting the compute-bound prefill phase from the memory-bandwidth-bound decode phase across different hardware), **prefix-cache-aware and predicted-latency routing**, and **tiered KV-cache offload** to CPU/disk — reporting up to 70% higher tokens/sec in disaggregated configurations and roughly 50k output tokens/sec on large clusters as of its v0.5 release (February 2026).
+
+Second, **multi-cluster GKE Inference Gateway** (announced March 2026) extends the Gateway API Inference Extension across cluster and region boundaries: a dedicated **config cluster** holds the routing policy while multiple **target clusters** run the actual model pods, giving you cross-region failover, GPU/TPU capacity pooling (burst into whichever region has free accelerators), and model-aware routing globally instead of per-cluster. The pattern generalizes beyond GKE: the shared idea is *separate the routing control plane from the serving data plane* so a regional outage or a capacity crunch in one cluster doesn't take down the whole service — the multi-region equivalent of the PodDisruptionBudget mindset from single-cluster serving.
+
+**What this means for the chapter's core intuitions:** GPUs are still exclusive, integer-scheduled units — DRA makes the *claims* richer, not the underlying scarcity softer. Health is still time-aware — KServe's KEDA integration scales on real serving pressure instead of guessing from CPU. The weights are still the workload — llm-d's disaggregation and KV-cache tiering are just more sophisticated answers to "where do the weights/cache live." And disruption is still bounded on purpose — multi-cluster routing is the PDB idea applied at the scale of a whole region.
+
+---
+
 ## Fully worked example: raw Deployment + Service
 
 A complete, correct manifest for a vLLM server on a single A100, with GPU request, startup/readiness/liveness probes tuned for a slow load, weights fetched from object storage by an `initContainer` into a shared cache, a PDB, and graceful shutdown.
@@ -349,6 +389,104 @@ KServe pulls the weights from `storageUri` (S3/GCS/PVC/HTTP), applies a `Serving
 
 ---
 
+## Build it in practice — extended: MIG, time-slicing & NetworkPolicy
+
+The example above requests one whole GPU. In practice you'll often want a *mix*: a small model MIG-sliced for isolation, and a dev/low-QPS pool that's time-sliced for density. Both are configured at the GPU Operator / device-plugin layer, not in the pod spec — the pod spec just requests whatever resource name the plugin ends up advertising.
+
+**1. Enable MIG via the GPU Operator's `ClusterPolicy`.** The operator's MIG manager reads a named profile from a `ConfigMap` and applies it to nodes carrying a matching label:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mig-parted-config
+  namespace: gpu-operator
+data:
+  config.yaml: |
+    version: v1
+    mig-configs:
+      all-1g.10gb:
+        - devices: all
+          mig-enabled: true
+          mig-devices:
+            "1g.10gb": 7   # slice each A100-80GB into 7 isolated instances
+```
+
+```
+# Label the target node(s) to request that profile; the MIG manager
+# cordons/drains GPU workloads on the node, repartitions, then relabels.
+kubectl label node gpu-node-1 nvidia.com/mig.config=all-1g.10gb --overwrite
+```
+
+Once applied, the device plugin advertises `nvidia.com/mig-1g.10gb` on that node instead of (or alongside) `nvidia.com/gpu`, and a pod requests it exactly like any extended resource:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/mig-1g.10gb: 1   # one hardware-isolated 10GB slice
+```
+
+**2. Enable time-slicing for a separate, lower-trust dev pool.** This is a plain `ConfigMap` the device plugin consumes, referenced from the node via a device-plugin config label — deliberately *not* the same nodes running MIG, since the two are different tradeoffs for different tenancy levels:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+data:
+  a100-40gb: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4     # advertise 4x the physical GPU count on this node
+```
+
+```
+kubectl label node gpu-node-dev nvidia.com/device-plugin.config=a100-40gb --overwrite
+```
+
+Pods on `gpu-node-dev` still request `nvidia.com/gpu: 1` — the plugin is simply advertising 4 units per physical card, so 4 pods can land on one GPU with no memory isolation between them. This is the tradeoff called out earlier: fine for a bursty internal eval tool, wrong for a multi-tenant production pool.
+
+**3. Lock down the network around the inference pods.** A `NetworkPolicy` limits which namespaces can reach the model server and what the pod itself can reach outbound — worth doing once you have more than one team on the cluster:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-inference-netpol
+  namespace: inference
+spec:
+  podSelector:
+    matchLabels: { app: llm-inference }
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: ingress-system }   # gateway/ingress controller
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: monitoring }       # Prometheus scraping /metrics
+    ports:
+    - { protocol: TCP, port: 8000 }
+  egress:
+  - to: []                            # DNS to any endpoint, restricted by port
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }
+  - to:                                # object storage for weights, via cloud NAT
+    - ipBlock: { cidr: 0.0.0.0/0 }
+    ports:
+    - { protocol: TCP, port: 443 }
+```
+
+In a real cluster you'd usually scope that last egress rule to your cloud provider's object-storage IP ranges rather than `0.0.0.0/0`; it's left broad here because most teams reach weights through a NAT gateway whose egress IP isn't something the pod's `NetworkPolicy` can pin down more tightly without also breaking other HTTPS egress (registry pulls, telemetry). The important part is the *shape*: ingress restricted to the gateway/ingress and monitoring namespaces only, egress restricted to DNS and HTTPS — nothing else in or out.
+
+---
+
 ## Debugging playbook: Pending and crash-looping GPU pods
 
 Two symptoms cover most incidents. Work them like this:
@@ -377,6 +515,62 @@ kubectl get events --field-selector involvedObject.name=<pod>
 - `OOMKilled` in the container's `lastState` → raise the **memory limit** (host RAM to stage weights).
 - initContainer errors (S3 auth, disk full on `emptyDir` `sizeLimit`) → weights fetch is failing; the main container never starts.
 - CUDA/driver errors in logs → driver/toolkit mismatch (a job for the **GPU Operator**), or the GPU was already claimed.
+
+### Walkthrough: a pod stuck `Pending` after a MIG config change
+
+A concrete sequence, the way it actually unfolds on-call — this is the "20 free GPUs but nothing schedules" flavor, root-caused end to end:
+
+1. **Notice.** A new replica from a rollout has sat in `Pending` for ten minutes.
+
+   ```
+   $ kubectl get pods -n inference
+   NAME                             READY   STATUS    RESTARTS   AGE
+   llm-inference-7d9c9b9f5c-4kxqp   0/1     Pending   0          10m
+   ```
+
+2. **Read the scheduler's reasoning** — always the first move, it usually names the exact constraint:
+
+   ```
+   $ kubectl describe pod llm-inference-7d9c9b9f5c-4kxqp -n inference | sed -n '/Events/,$p'
+   Events:
+     Type     Reason            Age    From               Message
+     ----     ------            ----   ----               -------
+     Warning  FailedScheduling  9m52s  default-scheduler   0/6 nodes are available: 4 Insufficient nvidia.com/gpu,
+                                                             2 node(s) had untolerated taint {nvidia.com/gpu: present}.
+   ```
+
+3. **Cross-check node capacity vs. allocatable.** A MIG config change earlier that day relabeled two nodes, and the device plugin briefly advertised zero GPUs while it reconciled:
+
+   ```
+   $ kubectl get nodes -l nvidia.com/gpu.present=true \
+       -o custom-columns=NAME:.metadata.name,ALLOC:.status.allocatable."nvidia\.com/gpu",CAP:.status.capacity."nvidia\.com/gpu"
+   NAME        ALLOC   CAP
+   gpu-node-1  0       8
+   gpu-node-2  0       8
+   gpu-node-3  8       8
+   gpu-node-4  8       8
+   ```
+
+   `gpu-node-1`/`2` show `ALLOC=0` against `CAP=8` — the device plugin pod restarted mid-MIG-reconfiguration and hasn't re-registered the resource with the kubelet yet.
+
+4. **Check the device plugin DaemonSet**, since it — not the kubelet — owns the extended resource:
+
+   ```
+   $ kubectl get pods -n gpu-operator -l app=nvidia-device-plugin-daemonset -o wide
+   NAME                                READY   STATUS             RESTARTS   NODE
+   nvidia-device-plugin-daemonset-a1   0/1     CrashLoopBackOff   6          gpu-node-1
+   nvidia-device-plugin-daemonset-b2   0/1     CrashLoopBackOff   6          gpu-node-2
+   nvidia-device-plugin-daemonset-c3   1/1     Running            0          gpu-node-3
+
+   $ kubectl logs -n gpu-operator nvidia-device-plugin-daemonset-a1 --previous
+   ... error: no MIG devices found matching profile "1g.10gb": mig-parted config "all-1g.10gb" not yet applied
+   ```
+
+5. **Root cause.** The `mig-parted-config` ConfigMap was updated to a new profile, the label `nvidia.com/mig.config` on `gpu-node-1`/`2` was flipped by the MIG manager, but the physical repartition (which requires the GPU to have no running processes) hadn't completed before the device plugin restarted and tried to enumerate MIG devices — a race between the MIG manager's drain/repartition step and the device plugin's own restart.
+
+6. **Fix.** Let the MIG manager finish (it cordons and drains the node's GPU workloads before repartitioning — that's expected and is *why* nodes go through a `Pending`-inducing dip), or if it's stuck, restart the MIG manager pod on that node and re-check `kubectl get nodes ... ALLOC`. Once `ALLOC` matches `CAP` again the pending pod schedules within seconds — no change to the pod spec was ever needed.
+
+**Lesson generalized:** `Insufficient nvidia.com/gpu` in the scheduler event is necessary but not sufficient diagnosis — always compare `allocatable` against `capacity` per node before assuming "the cluster is full." A gap between them almost always means the device plugin (or MIG manager, or driver container) is unhealthy on that specific node, not that GPUs are actually unavailable cluster-wide.
 
 ### A note on cold-start math
 
@@ -413,10 +607,118 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 - **Rollouts assuming spare GPUs.** `maxSurge > 0` on a full GPU pool blocks the rollout waiting for GPUs that don't exist. Use `maxSurge: 0` or ensure headroom.
 - **Ephemeral `emptyDir` cache re-downloads every reschedule.** An `emptyDir` dies with the pod, so a rescheduled pod re-fetches the whole model. If cold-start matters, back the cache with a read-only RWX PVC or a node-local `hostPath`/CSI volume that survives pod churn.
 - **Graceful shutdown too short.** Default 30s `terminationGracePeriodSeconds` SIGKILLs pods mid-generation. Raise it above your longest generation and flip readiness first.
+- **Time-slicing treated as a free lunch.** Advertising 4x replicas of a GPU does not give 4x compute or any memory isolation — two co-scheduled pods can OOM each other. Reach for MIG when tenants don't fully trust each other.
+- **No quota between serving and batch/training on a shared cluster.** Without Kueue-style quotas, a large eval sweep or fine-tuning job can starve the serving fleet of GPUs with no admission control to stop it.
 
 ---
 
-## Production checklist — what an interviewer probes
+## Production case studies & war stories
+
+### Case 1: the 3-minute model load that looked like a hardware failure
+
+**Setup.** A team migrated a 34B model from a hand-run VM to a Kubernetes Deployment. They copied a probe config from an existing CPU microservice: `livenessProbe` with `initialDelaySeconds: 30`, `periodSeconds: 10`, `failureThreshold: 3` — no startup probe (this predates the startup-probe-first mindset now standard).
+
+**Symptom.** Every rollout, every pod restart, every node replacement produced the same pattern: pod `Running`, then `CrashLoopBackOff` a few minutes later, forever. Logs showed the model server killed mid-`torch.load`. The on-call's first hypothesis was bad GPU hardware — they cordoned two "suspect" nodes before someone actually read the timeline.
+
+**Root cause.** The model took roughly 3 minutes to load (weights from a network PVC plus CUDA graph capture). The liveness probe's math: `initialDelaySeconds(30) + periodSeconds(10) * failureThreshold(3) = 60s` grace window — 60 seconds against a 180-second load. The kubelet killed the container at roughly T+60s, every time, deterministically. It looked random only because different nodes had slightly different PVC read latency, shifting the exact restart timestamp.
+
+**Fix.** Added a `startupProbe` with `periodSeconds: 10, failureThreshold: 30` (a 300s budget), and left liveness to only take over after startup succeeded — the pattern in the fully worked example above. Rollouts went from "always crash-loops for the first 10 minutes, eventually succeeds by luck when a fast node happens to finish in time" to clean on the first attempt.
+
+**Lesson.** A crash loop with a *suspiciously consistent* time-to-first-crash is a probe timing bug, not hardware. Check the arithmetic (`initialDelaySeconds + periodSeconds * failureThreshold`) against your actual worst-case load time before blaming nodes. This is the single most common LLM-on-Kubernetes incident, and it is entirely self-inflicted — the fix is always a startup probe, never "replace the GPU."
+
+### Case 2: 20 free GPUs, one pod stuck Pending — fragmentation across nodes
+
+**Setup.** A cluster with five 8-GPU nodes ran a mix of single-GPU inference pods (many small models) alongside an occasional 4-GPU tensor-parallel deployment for a 70B model.
+
+**Symptom.** The 4-GPU pod sat `Pending` for over an hour. `kubectl describe` reported plain `Insufficient nvidia.com/gpu` — no taint mismatch, no selector typo. Cluster-wide GPU utilization dashboards showed only 60% of GPUs in use — 20 of 40 GPUs "free."
+
+**Root cause.** Single-GPU pods had been scheduled by bin-packing across all five nodes rather than filling nodes one at a time, leaving each node with 3–4 free GPUs but *no node* with 4 contiguous free GPUs together — because the default scheduler has no built-in notion of "keep this pod's GPUs on one node for NVLink locality" beyond the basic per-node integer count. The one 4-GPU tensor-parallel pod needed all 4 GPUs on a single node (for NVLink bandwidth between them) and there wasn't one.
+
+**Fix, in order of effort:**
+
+1. **Immediate:** manually cordon/drain single-GPU pods off one node to consolidate free capacity, unblocking the pending pod (a manual, one-time bin-pack).
+2. **Short-term:** add a `PriorityClass` + preemption so multi-GPU pods can evict lower-priority single-GPU pods to consolidate space, and set `podAntiAffinity`/topology spread on the *small* pods to bias the scheduler toward filling nodes rather than spreading them evenly.
+3. **Structural:** split the node pool — a pool of nodes reserved (via taint) for multi-GPU tensor-parallel workloads only, sized exactly to the parallelism degree, and a separate pool (optionally MIG- or time-sliced) for single-GPU/small-model traffic. This is the fix that actually scales: don't let the scheduler *discover* topology constraints at pending-time, encode them into pool shape up front.
+4. **Longer-term:** adopt **Kueue** with gang scheduling for the multi-GPU workload class, so the 4-GPU pod's pods are admitted all-or-nothing against a quota that reserves capacity, and/or evaluate **DRA** once available on the platform, which can express "4 GPUs on the same NVLink domain" as a first-class claim instead of hoping bin-packing works out.
+
+**Lesson.** "GPUs free cluster-wide" and "GPUs schedulable for this pod" are different numbers whenever a workload needs more than one GPU per node. Multi-GPU workloads need topology-aware placement designed in from the start (dedicated pools, gang scheduling, or DRA), not discovered as an incident.
+
+### Case 3: the thundering herd that looked like a network outage
+
+**Setup.** An autoscaling event scaled a 70B-model service from 2 to 10 replicas in response to a traffic spike. All 8 new pods had cold `emptyDir` caches and started `initContainer`s pulling the same 140GB from one S3 bucket simultaneously.
+
+**Symptom.** Network egress on the bucket's region saturated; all 8 pods' downloads slowed to a crawl, *and* the 2 already-healthy pods saw elevated latency as the shared NAT gateway's connection tracking maxed out. On-call initially chased it as a networking/NAT problem.
+
+**Fix and lesson.** Pre-populate a read-only RWX PVC (or a node-local cache warmed ahead of the spike) so scale-up pods mount already-present weights instead of re-downloading; if that's not feasible, stagger initContainer starts (e.g. a prefetch step with concurrency limits, or node-level caching so only the *first* pod on a given node downloads). The autoscaling chapter covers pre-warming pools for exactly this reason — cold-start stampedes are an autoscaling problem wearing a networking costume.
+
+---
+
+## Interview mastery
+
+### Explain GPU scheduling on Kubernetes in 60 seconds
+
+> "Kubernetes has no native GPU concept — the NVIDIA device plugin, a DaemonSet on every GPU node, discovers GPUs and advertises them to the kubelet as the extended resource `nvidia.com/gpu`. Extended resources are integer and exclusive: request must equal limit, and the scheduler will never double-book one GPU across two pods, because VRAM has no swap and no safe overcommit. To keep GPU nodes for GPU workloads you taint the nodes and tolerate the taint on your pods, and to pick a specific SKU you add a `nodeSelector` on a GPU-product label. If you want to pack more than one workload onto a card you do it explicitly — MIG for hardware-isolated partitions, time-slicing or MPS for software-multiplexed sharing with weaker isolation — the device plugin just advertises different resource names or counts depending on which you pick. The scheduler math never changes: whatever unit you're advertising, it's still handed out as an exclusive integer per pod."
+
+Practice saying that out loud in under a minute — it hits device plugin, extended resources, exclusivity/no-overcommit rationale, taints/tolerations, and the sharing mechanisms in the right order.
+
+### System design prompt: "run 5 different model sizes on a shared GPU cluster"
+
+**Prompt as typically asked:** *"You need to serve five models — say 1B, 8B, 34B, 70B, and 405B parameters — on one Kubernetes cluster, with mixed traffic (some interactive chat, some high-throughput batch). Sketch the architecture."*
+
+A strong answer separates concerns by **parallelism degree** and **latency class**, not just "throw everything in one Deployment":
+
+```
+                        +-------------------------------+
+                        |   Gateway API + Inference     |
+                        |   Extension (InferencePool    |
+                        |   per model, priority via      |
+                        |   InferenceObjective)           |
+                        +---------------+-----------------+
+                                        | model-aware / prefix-cache-aware routing
+        +---------------+--------------+--------------+---------------+
+        v               v              v              v               v
+  +-----------+   +-----------+  +-----------+  +-----------+  +----------------+
+  | 1B pool   |   | 8B pool   |  | 34B pool  |  | 70B pool  |  | 405B pool      |
+  | MIG-sliced|   | 1 GPU/pod |  | 1 GPU/pod |  | TP=4, one |  | TP=8/PP=2,     |
+  | (7x/GPU)  |   | L4/L40S   |  | A100 80GB |  | node, A100|  | multi-node,    |
+  | shared A100|  | node pool |  | node pool |  | node pool |  | dedicated pool |
+  | pool      |   |           |  |           |  | (gang     |  | (gang          |
+  |           |   |           |  |           |  | scheduled)|  | scheduled)     |
+  +-----------+   +-----------+  +-----------+  +-----------+  +----------------+
+        |               |              |              |               |
+        +--- KEDA/HPA on vLLM queue-depth metrics, per pool, independently ---+
+                                        |
+                     Kueue ClusterQueues arbitrate GPU quota
+                     between interactive (high priority, low
+                     latency SLO) and batch (best-effort FIFO)
+```
+
+Key decisions to narrate:
+
+1. **Pool by parallelism, not just by size.** The 1B and 8B models fit on fractional/single GPUs — MIG-slice the 1B model (it's small and latency-sensitive, so hardware isolation beats time-slicing) and give 8B a full GPU on a cheaper SKU. 70B and 405B need tensor/pipeline parallelism across multiple GPUs or nodes — give them dedicated, gang-scheduled pools sized exactly to their parallelism degree (this avoids the fragmentation war story above).
+2. **Route by model identity and priority**, using the Gateway API Inference Extension's `InferencePool`/`InferenceObjective` (or a KV-cache-aware router like llm-d) — interactive chat traffic gets latency-priority routing and reserved capacity; batch/eval traffic runs best-effort and is the first to be preempted or queued.
+3. **Autoscale on serving pressure, not CPU** — KEDA against each pool's vLLM `num_requests_running`/queue-depth metric, independently per model, so a spike in 8B traffic doesn't starve 405B capacity or vice versa.
+4. **Arbitrate GPU quota with Kueue** if teams share the cluster for both serving and batch fine-tuning/eval — quotas prevent one workload class from starving another, and gang scheduling stops a partially-admitted multi-GPU job from deadlocking capacity.
+5. **Bound blast radius per pool** — separate PDBs, separate node pools' taints, so a bad rollout or node drain on the 405B pool can't touch the 1B pool's availability.
+
+Interviewers are usually grading whether you *separate concerns by parallelism/latency class* rather than proposing one Deployment-per-model with no shared reasoning about GPU topology — that's the signal that differentiates a strong answer.
+
+### Red flags vs. green flags
+
+| Signal | Red flag (weak answer) | Green flag (strong answer) |
+|---|---|---|
+| GPU overcommit | "You can set a GPU limit higher than request to burst" | "Extended resources require request == limit; GPUs are never overcommitted because VRAM has no swap" |
+| Probe design | "Just increase `initialDelaySeconds` a lot" | "Use a startup probe sized to worst-case load; keep liveness fast and lenient once startup passes" |
+| GPU sharing | Treats MIG/time-slicing/MPS as interchangeable | Distinguishes hardware isolation (MIG) from software multiplexing (time-slicing/MPS) and picks based on tenancy trust |
+| Fragmentation | "Just add more nodes" | Explains topology-aware pooling, gang scheduling, or DRA as the structural fix |
+| Rollouts | Doesn't mention `maxSurge` GPU cost | Explains `maxSurge: 0`/`maxUnavailable: 1` tradeoff for GPU-scarce rollouts |
+| Disruption | Unaware of PDBs | Explains PDB + graceful shutdown + `terminationGracePeriodSeconds` together |
+| Routing | Proposes plain round-robin for LLM traffic | Mentions prefix/KV-cache-aware routing (session affinity, llm-d, Gateway API Inference Extension) |
+| Batch vs. serving | No answer for "how do you share GPUs between training and serving" | Mentions Kueue quotas/ClusterQueues and priority/preemption |
+| Multi-region | Treats multi-region as "just another Ingress" | Explains config-cluster/target-cluster split and capacity bursting (or the general pattern even without naming a specific vendor) |
+| Cold start | Doesn't account for weight fetch time in scaling decisions | Breaks cold start into provision + pull + weights + load + warmup and sizes probes/autoscaling around the sum |
+
+### Q&A bank (18 questions)
 
 1. **"A pod loads a 100 GB model in 5 minutes but keeps restarting. Why?"** — Missing/short **startup probe**; liveness kills it mid-load. Fix with a startup probe whose `periodSeconds * failureThreshold` exceeds worst-case load, and suppress liveness until then.
 2. **"Why can't you overcommit GPUs like memory?"** — VRAM has no swap and the scheduler can't reason about it; the device plugin advertises integer, exclusive units (request == limit). Sharing requires explicit time-slicing/MPS/MIG.
@@ -425,7 +727,262 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 5. **"How do you upgrade without an outage?"** — RollingUpdate with `maxSurge: 0`/`maxUnavailable: 1`, a **PDB** with `minAvailable`, graceful drain via `terminationGracePeriodSeconds` + `preStop` + readiness flip.
 6. **"Readiness vs liveness vs startup — when does each fire and what does failure do?"** — Startup gates the others and restarts on failure; readiness gates *traffic* (no kill); liveness restarts a wedged process. Traffic should ride on a readiness endpoint that only passes after warmup.
 7. **"When would you reach for KServe or Ray Serve over a raw Deployment?"** — KServe/KubeAI for many models + autoscaling/canary/scale-to-zero for free; Ray Serve for distributed multi-GPU/multi-node or model composition; raw Deployment for control/simplicity.
-8. **"You have 20 free GPUs but a 4-GPU pod won't schedule — explain."** — **Fragmentation**: allocation is per-node and integer. Needs topology-aware/gang scheduling or node pools sized to your parallelism.
+8. **"You have 20 free GPUs but a 4-GPU pod won't schedule — explain."** — **Fragmentation**: allocation is per-node and integer. Needs topology-aware/gang scheduling, dedicated pools sized to parallelism, or DRA.
+9. **"What's the difference between MIG, time-slicing, and MPS, and when do you pick each?"** — MIG: hardware-isolated partitions, safe for untrusted multi-tenant workloads, fixed partition sizes. Time-slicing: no isolation, oversubscribed compute, fine for trusted/bursty dev traffic. MPS: shared memory but concurrent kernel execution with some compute control — a middle ground, still not hard-isolated.
+10. **"How would you route requests so follow-up turns hit the replica with the warm KV cache?"** — Session affinity as a cheap first step; for real gains, a KV-cache-aware router (vLLM production stack router, llm-d, or the Gateway API Inference Extension's `InferencePool` with prefix-cache signals) rather than round-robin.
+11. **"How do you share a GPU cluster fairly between serving and batch fine-tuning/eval jobs?"** — Kueue `ClusterQueue`/`LocalQueue` with quotas, borrowing/lending between cohorts, priority-based admission, and gang scheduling so partially-admitted multi-GPU jobs don't deadlock capacity.
+12. **"What is Dynamic Resource Allocation and why does it matter for GPUs?"** — DRA (GA in Kubernetes 1.34, September 2025) replaces "advertise an integer count" with claim-based allocation, letting a pod request structured device properties (a MIG profile, GPUs on the same NVLink domain) that the old device-plugin model can't express.
+13. **"How do you serve a model that doesn't fit on one node?"** — Tensor/pipeline parallelism across nodes (KServe's `tensorParallelSize`/`pipelineParallelSize`, or Ray Serve/KubeRay's distributed actors), a headless Service + StatefulSet for stable pod-to-pod addressing, and a dedicated, gang-scheduled node pool sized to the parallelism degree.
+14. **"How do you avoid a regional outage taking down your inference service?"** — Multi-cluster/multi-region routing (e.g. the multi-cluster Inference Gateway pattern): a config cluster holds routing policy, multiple target clusters run pods across regions, giving automatic failover and cross-region capacity bursting.
+15. **"Your rollout is stuck because `maxSurge` wants a GPU that doesn't exist. What do you do?"** — Set `maxSurge: 0, maxUnavailable: 1` to roll within existing capacity, or ensure headroom (spare GPU quota) before rolling; explain the tradeoff of reduced capacity during rollout vs. blocking entirely.
+16. **"A 'ready' pod shows 0% GPU utilization but the request queue is growing. What's happening and how do you catch it?"** — The health endpoint is a shallow check that passed, but inference is wedged (deadlock, stuck CUDA context, dependency hang). Catch it with DCGM-exporter-based alerting on sustained 0% utilization on a ready pod, not just probe status — this is the "silent failure" that probes alone will never see.
+17. **"How would you design probes and autoscaling differently for a model that takes 30 seconds to load vs. one that takes 10 minutes?"** — Both need a startup probe sized to worst case, but the 10-minute model changes the *autoscaling* answer too: scale-up latency of 10 minutes means you want to keep warm standby replicas or pre-provisioned capacity rather than relying on reactive HPA/KEDA scale-up alone.
+18. **"What's the standard way to express LLM-aware traffic routing on Kubernetes as of 2026?"** — The Gateway API Inference Extension (`InferencePool` + `InferenceModel`/`InferenceObjective`), implemented by multiple gateway controllers and cloud-managed Inference Gateway offerings — model-aware, priority-aware routing standardized on top of the Gateway API instead of bespoke per-team logic.
+
+---
+
+## Appendix: DRA in concrete YAML, and a 2023-vs-2026 cheat sheet
+
+Dynamic Resource Allocation is discussed above at the concept level; here is the shape of it in YAML so it's recognizable rather than abstract. This is illustrative of the pattern shipping across DRA-enabled clusters as of 2025–2026 (the exact field names can vary slightly by Kubernetes version and vendor driver, so treat this as "what to expect," not a copy-paste guarantee for your cluster's exact version):
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+      - name: single-gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-pod
+spec:
+  containers:
+  - name: app
+    image: vllm/vllm-openai:v0.6.3
+    resources:
+      claims:
+      - name: single-gpu     # ties the container to the claim below
+  resourceClaims:
+  - name: single-gpu
+    resourceClaimTemplateName: gpu-claim-template
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+```
+
+Compare this to the device-plugin form used throughout this chapter (`resources.limits.nvidia.com/gpu: 1`). The device-plugin form asks for *a count*; the DRA form asks for *a claim against a device class*, and the claim's `spec.spec.devices.requests` block is where richer selection criteria (a specific MIG profile, GPUs sharing an NVLink domain, a minimum driver version) get expressed once your cluster's DRA driver supports them. Until then, the device-plugin model in the rest of this chapter remains the thing you'll actually operate day to day.
+
+A quick before/after for orientation:
+
+| Concern | Classic (device plugin, still dominant in 2026) | Emerging (DRA, GA since k8s 1.34) |
+|---|---|---|
+| How a pod asks for a GPU | `resources.limits: {nvidia.com/gpu: 1}` | `resourceClaims` referencing a `ResourceClaimTemplate`/`ResourceClaim` |
+| What's expressible | An integer count of one resource name | Structured device selection (profile, topology, driver constraints) |
+| Who advertises capacity | Device plugin DaemonSet per node | A DRA driver implementing the `resource.k8s.io` API |
+| MIG / topology awareness | Encoded indirectly via distinct resource names (`nvidia.com/mig-1g.10gb`) | Expressed natively in the claim's device request |
+| Maturity in production (2026) | Default, battle-tested | Early; vendor driver support still rolling out |
+
+### kubectl diagnostic cheat sheet
+
+The commands used throughout the debugging playbook and war stories above, gathered in one place:
+
+| Question | Command |
+|---|---|
+| Why is this pod `Pending`? | `kubectl describe pod <pod> \| sed -n '/Events/,$p'` |
+| Does the node actually have free GPUs right now? | `kubectl get nodes -o custom-columns=NAME:.metadata.name,ALLOC:.status.allocatable."nvidia\.com/gpu",CAP:.status.capacity."nvidia\.com/gpu"` |
+| Is the device plugin healthy on every GPU node? | `kubectl get pods -n gpu-operator -l app=nvidia-device-plugin-daemonset -o wide` |
+| What did a crashed container log before it died? | `kubectl logs <pod> -c <container> --previous` |
+| What exact labels does this node carry (for `nodeSelector` debugging)? | `kubectl get nodes --show-labels` |
+| Is a probe repeatedly failing, and when? | `kubectl get events --field-selector involvedObject.name=<pod>` |
+| Was the container OOMKilled? | `kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'` |
+| Is GPU utilization actually near zero on a "ready" pod? | DCGM exporter metric in Prometheus/Grafana, not kubectl — probes alone can't see this |
+| Did a node drain evict more replicas than the PDB should have allowed? | `kubectl get pdb -n <namespace>` (check `ALLOWED DISRUPTIONS`) then `kubectl get events -A --field-selector reason=Killing` |
+
+---
+
+## Build it in practice — the combined manifest
+
+Putting the MIG resource request, a `NetworkPolicy`, and the probe/PDB discipline from earlier together in one place, as you'd actually commit it for a small, latency-sensitive model running on a MIG-sliced, multi-tenant GPU pool:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: small-model-inference
+  namespace: inference
+  labels: { app: small-model-inference }
+spec:
+  replicas: 4
+  strategy:
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
+  selector:
+    matchLabels: { app: small-model-inference }
+  template:
+    metadata:
+      labels: { app: small-model-inference }
+    spec:
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        nvidia.com/mig.config: all-1g.10gb        # only the MIG-partitioned pool
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.6.3
+        args: [--model=/models/small-model, --port=8000]
+        ports: [{ containerPort: 8000 }]
+        resources:
+          limits:
+            nvidia.com/mig-1g.10gb: 1              # one hardware-isolated MIG slice
+            memory: 16Gi
+          requests:
+            cpu: "2"
+            memory: 16Gi
+            nvidia.com/mig-1g.10gb: 1
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 5
+          failureThreshold: 24                     # 120s — small model, fast load
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: small-model-inference
+  namespace: inference
+spec:
+  selector: { app: small-model-inference }
+  ports: [{ name: http, port: 80, targetPort: 8000 }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: small-model-inference
+  namespace: inference
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: small-model-inference }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: small-model-inference-netpol
+  namespace: inference
+spec:
+  podSelector:
+    matchLabels: { app: small-model-inference }
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: ingress-system }
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: monitoring }
+    ports: [{ protocol: TCP, port: 8000 }]
+  egress:
+  - to: []
+    ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+```
+
+Every piece here traces back to a mechanism explained earlier in the chapter: the MIG resource name (section 2b and the extended build example), `maxSurge: 0` for GPU-scarce rollouts (section 7), a startup probe sized in seconds appropriate to a *small* model's faster load (section 4 — contrast the 600s budget on the 70B example), a PDB (section 7), and the ingress/egress shape from the `NetworkPolicy` extended example above. Small models on shared MIG hardware still get the same disciplines as the 70B single-GPU deployment — just with numbers scaled down.
+
+---
+
+## Glossary — quick reference for interviews
+
+| Term | One-line definition |
+|---|---|
+| **Device plugin** | DaemonSet that discovers GPUs and advertises them to the kubelet as an extended resource (`nvidia.com/gpu`) |
+| **Extended resource** | A countable, non-CPU/memory resource type; must be integer, request must equal limit |
+| **MIG** | Hardware partitioning of a GPU into isolated instances with separate memory/compute |
+| **Time-slicing** | Software oversubscription of one GPU across N pods, no memory isolation |
+| **MPS** | Multi-Process Service — concurrent kernel execution with shared memory, soft compute control |
+| **DRA** | Dynamic Resource Allocation — claim-based device allocation (GA in k8s 1.34, Sept 2025), successor direction to the device-plugin model |
+| **Startup probe** | Probe that gates liveness/readiness until it first succeeds; failure restarts the container |
+| **Readiness probe** | Gates traffic (Service endpoints); failure does not kill the pod |
+| **Liveness probe** | Detects a wedged process; failure restarts the container |
+| **PDB** | PodDisruptionBudget — bounds voluntary disruption (drains, scale-down) via `minAvailable`/`maxUnavailable` |
+| **GPU fragmentation** | Free GPUs exist cluster-wide but not co-located on one node for a multi-GPU pod |
+| **Gang scheduling** | All-or-nothing pod admission so a multi-pod job never partially starts and deadlocks |
+| **Kueue** | Kubernetes SIG project for quota-aware, gang-scheduled batch/GPU job admission across teams |
+| **InferencePool / InferenceObjective** | Gateway API Inference Extension resources for model-aware, priority-aware LLM traffic routing |
+| **llm-d** | CNCF sandbox (Mar 2026) distributed inference stack: disaggregated prefill/decode, KV-cache-aware routing |
+| **Thundering herd (weights)** | Many pods cold-starting simultaneously saturate shared storage/network pulling the same weights |
+
+---
+
+## Bonus: Kueue quota for sharing GPUs between serving and batch
+
+The landscape section above introduces Kueue conceptually; here is the minimal shape of the objects that implement "arbitrate GPU quota between interactive serving and best-effort batch" from the system-design sketch:
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: gpu-a100
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: serving-cluster-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+    flavors:
+    - name: gpu-a100
+      resources:
+      - { name: cpu, nominalQuota: 64 }
+      - { name: memory, nominalQuota: 512Gi }
+      - { name: "nvidia.com/gpu", nominalQuota: 16 }   # reserved baseline for serving
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: batch-eval-cluster-queue
+spec:
+  namespaceSelector: {}
+  cohort: shared-gpu-cohort                            # can borrow idle quota from serving
+  resourceGroups:
+  - coveredResources: ["nvidia.com/gpu"]
+    flavors:
+    - name: gpu-a100
+      resources:
+      - { name: "nvidia.com/gpu", nominalQuota: 4, borrowingLimit: 12 }
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: eval-jobs
+  namespace: ml-eval
+spec:
+  clusterQueue: batch-eval-cluster-queue
+```
+
+The `serving-cluster-queue` guarantees the interactive fleet its 16-GPU baseline; the `batch-eval-cluster-queue` shares the same `cohort` and can *borrow* up to 12 more GPUs when serving isn't using its full quota, but never starves serving below its nominal reservation. This is the concrete mechanism behind bullet 4 of the system-design answer ("arbitrate GPU quota with Kueue") and the fix in war-story Case 2's "longer-term" remediation.
 
 ---
 
@@ -433,16 +990,32 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 
 - NVIDIA k8s device plugin (README, resource requests, time-slicing/MPS): <https://github.com/NVIDIA/k8s-device-plugin>
 - NVIDIA GPU Operator (drivers, toolkit, NFD, MIG): <https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html>
+- NVIDIA GPU Operator — time-slicing GPUs in Kubernetes: <https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html>
 - Kubernetes — Configure Liveness, Readiness and Startup Probes: <https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/>
 - Kubernetes — Probes concepts: <https://kubernetes.io/docs/concepts/workloads/pods/probes/>
 - Kubernetes — Pod Disruption Budgets: <https://kubernetes.io/docs/concepts/workloads/pods/disruptions/>
 - Kubernetes — Gateway API: <https://gateway-api.sigs.k8s.io/>
 - Kubernetes — Schedule GPUs: <https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/>
 - Kubernetes — Taints and Tolerations: <https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/>
+- Kubernetes — Access DRA Device Metadata (task guide): <https://kubernetes.io/docs/tasks/configure-pod-container/assign-resources/access-dra-device-metadata/>
+- Kubernetes blog — v1.34: Dynamic Resource Allocation graduates to GA (Sept 1, 2025): <https://kubernetes.io/blog/2025/09/01/kubernetes-v1-34-dra-updates/>
+- Kubernetes blog — Introducing Gateway API Inference Extension (Jun 5, 2025): <https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/>
+- Gateway API Inference Extension — docs: <https://gateway-api-inference-extension.sigs.k8s.io/>
+- Gateway API Inference Extension — GitHub: <https://github.com/kubernetes-sigs/gateway-api-inference-extension>
 - KServe documentation: <https://kserve.github.io/website/>
 - KServe GitHub: <https://github.com/kserve/kserve>
+- CNCF — Announcing KServe v0.15: Advancing Generative AI Model Serving (Jun 18, 2025): <https://www.cncf.io/blog/2025/06/18/announcing-kserve-v0-15-advancing-generative-ai-model-serving/>
+- Red Hat Developer — How to set up KServe autoscaling for vLLM with KEDA (Sep 23, 2025): <https://developers.redhat.com/articles/2025/09/23/how-set-kserve-autoscaling-vllm-keda>
+- Kueue — Kubernetes-native job queueing: <https://kueue.sigs.k8s.io/>
+- Kueue — features overview: <https://kueue.sigs.k8s.io/docs/overview/>
+- Kueue — ClusterQueue concept docs: <https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/>
+- GKE — Deploy a batch system using Kueue: <https://cloud.google.com/kubernetes-engine/docs/tutorials/kueue-intro>
+- GKE — Allocate existing devices to workloads with DRA: <https://docs.cloud.google.com/kubernetes-engine/docs/how-to/deploy-dra-workloads>
+- llm-d — distributed inference serving stack (CNCF sandbox, Mar 2026): <https://github.com/llm-d/llm-d>
+- Google Cloud blog — Multi-cluster GKE Inference Gateway helps scale AI workloads (Mar 2026): <https://cloud.google.com/blog/products/containers-kubernetes/multi-cluster-gke-inference-gateway-helps-scale-ai-workloads>
 - NVIDIA NIM — Kubernetes deployment & KServe: <https://docs.nvidia.com/nim/large-language-models/latest/deployment/kubernetes-deployment/kserve.html>
 - NVIDIA NIM Operator: <https://docs.nvidia.com/nim-operator/latest/index.html>
+- NVIDIA NIM Operator — Dynamic Resource Allocation support: <https://docs.nvidia.com/nim-operator/latest/dra.html>
 - Ray Serve LLM on Kubernetes (KubeRay): <https://docs.ray.io/en/latest/cluster/kubernetes/examples/rayserve-llm-example.html>
 - KubeAI (k8s-native LLM inference operator): <https://github.com/substratusai/kubeai>
 - EKS — Manage NVIDIA GPU devices: <https://docs.aws.amazon.com/eks/latest/userguide/device-management-nvidia.html>

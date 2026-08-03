@@ -83,6 +83,12 @@ Reproducibility checklist — a version is not reproducible unless you can answe
 > image referenced by digest**, and register that digest as the version's artifact. The
 > image digest content-addresses most of the bundle in one shot.
 
+> **Agentic serving note:** once an LLM is wrapped in an agent, the bundle grows again —
+> the *system prompt*, the *tool/function schemas*, and the *engine version* all shape
+> behavior as much as the weights do, and each now has its own release cadence. See
+> [The 2025–2026 Landscape](#the-20252026-landscape) below for how modern registries
+> version prompts and tool schemas alongside the model itself.
+
 ---
 
 ## Immutable, Content-Addressed Artifacts
@@ -140,7 +146,9 @@ choices are shaped by size:
   must stay stable regardless of *where* it is cached.
 - **Git LFS** underpins the Hugging Face Hub: each repo is a Git repo, large files go to
   LFS, and every commit is a content-addressed revision (this is why HF pinning works —
-  more below).
+  more below). Newer chunk-based, content-addressed backends (Hugging Face's Xet, OCI
+  artifact registries) push the same idea further — see
+  [The 2025–2026 Landscape](#the-20252026-landscape).
 
 ---
 
@@ -199,7 +207,9 @@ The critical properties:
 
 This is a real, correct MLflow (3.x) workflow: log + register a transformers model with
 its tokenizer, link eval metrics, use aliases as gates, promote to `@champion`, and load
-by alias in the server. It also shows how the server resolves "current prod version."
+by alias in the server. It also shows how the server resolves "current prod version,"
+walks through a **full dev→staging→prod pipeline gated by an eval threshold**, and ends
+with a **rollback drill** that simulates a bad promotion and recovers from it.
 
 ### 1. Log the full bundle and register a version
 
@@ -327,6 +337,161 @@ client.set_registered_model_alias(MODEL_NAME, "champion", "6")
 > `mlflow.transformers.load_model("models:/chatbot-llm/7")`. Use aliases for
 > operability; use explicit versions when you want the config file itself to be the pin.
 
+### 6. Build it in practice, extended — a full promotion pipeline
+
+The three-step gate above (`challenger` → check tags → `champion`) is correct but
+minimal. A real pipeline runs unattended in CI, evaluates *every* candidate the same
+way, keeps an explicit record of "what was champion before," and refuses to promote on
+missing or stale data. Here is a complete, runnable gate function that drives a
+candidate through `dev → staging → prod`, each hop guarded by a score threshold read
+from the version's own tags — never from a human's memory:
+
+```python
+from dataclasses import dataclass
+from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
+
+client = MlflowClient()
+MODEL_NAME = "chatbot-llm"
+
+@dataclass
+class Gate:
+    alias: str          # alias this stage promotes TO on success
+    min_em: float        # exact-match threshold
+    max_tox: float        # toxicity ceiling
+    require_approval: bool = False   # prod requires a human tag, staging doesn't
+
+PIPELINE = [
+    Gate(alias="staging",  min_em=0.60, max_tox=0.02, require_approval=False),
+    Gate(alias="champion", min_em=0.68, max_tox=0.01, require_approval=True),
+]
+
+def run_eval_harness(version: str) -> dict:
+    """Stub: run your real eval suite against THIS registered version's
+    artifact (never against a local checkpoint that might differ) and
+    return metrics. In production this loads models:/{name}/{version}."""
+    ...  # pretend this returns freshly computed numbers
+    return {"exact_match": 0.712, "toxicity": 0.004}
+
+def record_eval(name: str, version: str, metrics: dict) -> None:
+    for k, v in metrics.items():
+        client.set_model_version_tag(name, version, f"eval_{k}", str(v))
+    client.set_model_version_tag(name, version, "eval_ts", str(mlflow.utils.time.get_current_time_millis()))
+
+def gate_passes(name: str, version: str, gate: Gate) -> tuple[bool, str]:
+    mv = client.get_model_version(name, version)
+    tags = mv.tags
+    if "eval_exact_match" not in tags or "eval_toxicity" not in tags:
+        return False, "no eval recorded on this version — refusing to promote blind"
+    em = float(tags["eval_exact_match"])
+    tox = float(tags["eval_toxicity"])
+    if em < gate.min_em:
+        return False, f"exact_match {em:.3f} < required {gate.min_em}"
+    if tox > gate.max_tox:
+        return False, f"toxicity {tox:.3f} > allowed {gate.max_tox}"
+    if gate.require_approval and tags.get("approved_by") is None:
+        return False, "prod promotion requires a human 'approved_by' tag"
+    return True, "ok"
+
+def promote_through_pipeline(name: str, version: str) -> None:
+    """Runs a candidate through every gate in order. Before EACH promotion
+    to an alias, snapshot the alias's CURRENT target as 'last_known_good'
+    so a rollback never has to guess what was there before."""
+    for gate in PIPELINE:
+        ok, reason = gate_passes(name, version, gate)
+        if not ok:
+            raise RuntimeError(f"blocked at @{gate.alias}: {reason}")
+
+        # Snapshot the outgoing version for this alias, if one exists,
+        # so rollback is a single lookup instead of an archaeology dig.
+        try:
+            previous = client.get_model_version_by_alias(name, gate.alias)
+            client.set_model_version_tag(
+                name, version, f"previous_{gate.alias}", previous.version
+            )
+        except MlflowException:
+            pass  # first-ever promotion to this alias — nothing to snapshot
+
+        client.set_registered_model_alias(name, gate.alias, version)
+        print(f"{name} @{gate.alias} -> v{version}  ({reason})")
+
+# --- usage ---
+metrics = run_eval_harness(version)
+record_eval(MODEL_NAME, version, metrics)
+client.set_model_version_tag(MODEL_NAME, version, "approved_by", "ml-lead@company.com")
+promote_through_pipeline(MODEL_NAME, version)
+```
+
+Two details do the real work here:
+
+- **`gate_passes` refuses to promote a version with no eval tags at all**, rather than
+  treating "missing" as "pass." A pipeline that fails open on missing data will
+  eventually promote something nobody ever evaluated.
+- **`previous_<alias>` is written on the incoming version, at promotion time**, not
+  read from history after the fact. That single tag is what turns the rollback drill
+  below from "grep the audit log" into "read one tag."
+
+### 7. Rollback drill — simulate a bad promotion and recover by alias
+
+Run this as an actual drill (quarterly, or after onboarding a new on-call) so the first
+time your team executes a rollback is not during a real incident.
+
+```python
+# --- STEP 0: baseline. v6 is a known-good champion. ---
+client.set_registered_model_alias(MODEL_NAME, "champion", "6")
+
+# --- STEP 1: a bad promotion. v7 passed the automated gate (its eval
+#     harness ran on a stale eval set that didn't catch a regression) and
+#     got promoted. This is the failure mode gates alone don't fully close —
+#     which is why 'previous_champion' bookkeeping and monitoring both matter.
+promote_through_pipeline(MODEL_NAME, "7")     # @champion now -> v7
+assert client.get_model_version_by_alias(MODEL_NAME, "champion").version == "7"
+
+# --- STEP 2: detection. Online monitoring (thumbs-down rate, error rate,
+#     a canary eval re-run against live traffic) keyed by the version_id
+#     stamped on each request shows v7's quality is worse than v6's.
+#     This is the payoff of "stamp the version on every response" from
+#     Step 4 above: the alert can say "v7 regressed" instead of "prod is bad."
+
+# --- STEP 3: rollback. Read the snapshot this SAME promotion wrote,
+#     don't rely on memory of what was running an hour ago.
+def rollback(name: str, alias: str, bad_version: str) -> str:
+    mv = client.get_model_version(name, bad_version)
+    previous = mv.tags.get(f"previous_{alias}")
+    if previous is None:
+        raise RuntimeError(
+            f"no previous_{alias} tag on v{bad_version} — cannot auto-rollback; "
+            "fall back to the registry's version history for this model"
+        )
+    client.set_registered_model_alias(name, alias, previous)
+    client.set_model_version_tag(name, bad_version, "validation_status", "rolled_back")
+    return previous
+
+restored = rollback(MODEL_NAME, "champion", "7")
+assert restored == "6"
+assert client.get_model_version_by_alias(MODEL_NAME, "champion").version == "6"
+print(f"rolled back: @champion -> v{restored} (v7 kept registered for forensics)")
+
+# --- STEP 4: verify the resolved artifact, not just the pointer. ---
+mv = client.get_model_version_by_alias(MODEL_NAME, "champion")
+print(f"confirmed serving v{mv.version} from {mv.source}")
+# In a real drill, also re-hash the artifact at mv.source and compare it
+# against the content hash recorded when v6 was first registered — a
+# pointer move is only a real rollback if the bytes behind it are the
+# bytes you think they are.
+```
+
+What the drill is meant to prove, and what to time when you run it for real:
+
+- **Time-to-detect** — how long between the bad promotion and monitoring flagging
+  `v7` by version id (not "prod feels off").
+- **Time-to-rollback** — how long from "roll back" decided to `@champion` pointing at
+  `v6` again and servers actually serving it (this is the pointer move *plus* the
+  reload, not just the API call).
+- **No rebuild anywhere in the path.** If any step in your real rollback requires
+  re-running training, re-quantizing, or rebuilding an image, the drill has found a gap
+  — close it before you need it under pressure.
+
 ---
 
 ## Registry Comparison
@@ -356,6 +521,137 @@ Key nuances:
 - **Hugging Face Hub** is git-native: every push is a commit, and `revision=` on
   `from_pretrained` pins a **commit hash, branch, or tag**. The commit hash is a true
   content address; a bare `main` is a *mutable* pointer — never rely on it in prod.
+
+---
+
+## The 2025–2026 Landscape
+
+The mechanics above (content hash + alias + gate) are not just theory — they are
+exactly what production registries converged on through 2025 and into 2026. Four
+concrete developments are worth knowing cold, with real, checkable sources.
+
+### Hugging Face Hub: `revision` is the reproducibility contract
+
+Every Hugging Face Hub repo is a Git repo; every push is a commit, and every commit has
+a hash. `AutoModel.from_pretrained(repo_id, revision=...)` accepts that hash, a tag, or
+a branch name — but only the **commit hash** is a true content address. Passing `main`
+(the default when `revision` is omitted) resolves to *whatever `main` currently points
+at*, which is exactly the mutable-tag failure mode this chapter opened with. The
+Transformers maintainers spell this out directly on the forum thread discussing
+`commit_hash` in `from_pretrained`: the resolved commit hash is threaded through the
+loading code specifically so a cached load and a fresh load agree on *which* files they
+mean, even if `main` has since moved (Hugging Face Forums, "Purpose of commit_hash in
+PreTrainedModel.from_pretrained"). Baseten's engineering blog makes the operational case
+explicit: pin `revision` to an exact commit whenever you use `trust_remote_code` (which
+executes arbitrary code from the repo) or need reproducible eval numbers, because an
+upstream maintainer can push backwards-incompatible or malicious changes to `main`
+without you doing anything at all ("Pinning ML model revisions for compatibility and
+security," baseten.co, 2024–2025).
+
+Underneath this, Hugging Face has been replacing plain Git LFS with **Xet**, a
+content-defined-chunking (CDC) storage backend: files are split into ~64 KB
+variable-length chunks by a rolling hash (so an edit only invalidates the chunks that
+actually changed, unlike LFS's whole-file versioning), and chunks are stored in a
+content-addressed store (CAS) keyed by their own hash. The result is deduplication
+*across* repositories, not just across commits of one repo, and a stronger
+content-addressing guarantee at the chunk level, not just the file level (Hugging Face,
+"Xet Chunk-Level Deduplication Specification" and the "From Chunks to Blocks" engineering
+blog post). For versioning purposes the practical upshot is the same lesson, reinforced
+at finer grain: identity is a hash of bytes, and `main`/`latest` is not that.
+
+### MLflow's Prompt Registry: versioning the other half of an agent
+
+As of MLflow 3.x (the docs tree covers versions up to 3.15.0, released July 31, 2026),
+MLflow ships a dedicated **Prompt Registry** alongside the Model Registry, because in an
+agentic system the prompt is a first-class artifact that changes on its own schedule.
+It uses the *same* mental model this chapter has been building for models: prompt
+versions are immutable once created (Git-inspired, commit-message-per-version), and
+named **aliases** move between them for promotion and rollback:
+
+```python
+import mlflow
+
+# Register a new, immutable prompt version with a commit message.
+mlflow.genai.register_prompt(
+    name="agent-system-prompt",
+    template="You are a support agent for {{product}}. Be concise...",
+    commit_message="Tighten tone, add refund-policy clause",
+)
+
+# Promote it the same way you promote a model: repoint an alias.
+mlflow.genai.set_prompt_alias("agent-system-prompt", alias="production", version=5)
+
+# The server resolves the alias once, same discipline as @champion above.
+prompt = mlflow.genai.load_prompt("prompts:/agent-system-prompt@production")
+```
+
+A reserved `@latest` alias always resolves to the newest version for convenience in
+dev, but production code should pin `@production` (or an explicit version) for the same
+reason it should never load a model by `latest` (MLflow docs, "Prompt Registry" and
+"Manage Prompt Lifecycles with Aliases," mlflow.org/docs/latest/genai/prompt-registry/).
+MLflow additionally lets you log the *generation parameters* (model name, temperature,
+max_tokens) alongside the prompt version, so a prompt version and the sampling config it
+was tuned against travel together — closing exactly the "generation config" gap flagged
+in the versioning-together table earlier in this chapter.
+
+### Content-addressed, OCI-packaged models
+
+A second, independent trend treats a model bundle as **an OCI artifact** — the same
+content-addressed, layered, digest-referenced format container images use — rather than
+inventing a bespoke model format. The CNCF's **ModelPack** project
+(`github.com/modelpack/model-spec`) defines an open standard for packaging weights,
+tokenizer, and config as OCI layers so a model can be pulled, cached, and run with the
+same tooling (registries, signing, Kubernetes volume sources) already built for
+containers; **`modctl`** (`github.com/modelpack/modctl`) is its reference CLI for
+building and pushing these artifacts. The CNCF's own August 2025 write-up frames the
+motivation plainly: "Models can be versioned, distributed, and tracked like container
+images," gaining OCI's existing digest-based integrity guarantees and sigstore-based
+signing for free instead of re-deriving them per-vendor ("How OCI Artifacts will drive
+future AI use cases," cncf.io, August 27, 2025). VMware's Broadcom team has since
+documented running **Harbor** — an existing OCI-compliant container registry — as an AI
+model registry on top of this, i.e., production teams are already reusing container
+infrastructure for model versioning rather than standing up a separate system
+("Using Harbor as an AI Model Registry," blogs.vmware.com, March 2026).
+
+### Versioning the whole agentic bundle
+
+Put the three developments together and a pattern falls out for agentic serving: an
+agent's observable behavior is now a function of (at least) the model version, the
+prompt version, the tool/function-schema version, and the engine version — each
+independently versioned in 2025–2026 tooling, each capable of drifting on its own. The
+practical fix is the same content-hash-of-components idea from earlier in this chapter,
+applied one level up — an explicit **bundle manifest** that a promotion pipeline treats
+as a single unit to gate and roll back together:
+
+```yaml
+# agent_bundle_manifest.yaml — versions the WHOLE agent, not just the model.
+# Hash this file's canonical form and register THAT as the agent's version id.
+agent_bundle_version: "support-agent-2026.07.2"
+model:
+  registry: mlflow
+  name: chatbot-llm
+  version: 12
+  content_hash: "sha256:9f86d0..."
+prompt:
+  registry: mlflow-prompts
+  name: agent-system-prompt
+  version: 5
+  alias: production
+tools:
+  schema_hash: "sha256:1a2b3c..."   # hash over the tool/function-calling schema set
+  count: 7
+engine:
+  name: vllm
+  version: "0.11.2"
+runtime:
+  image_digest: "sha256:7c4a8d..."
+```
+
+Register this manifest itself as a version (an MLflow run's params/tags, or a
+dedicated "agent" entry in whatever registry you use), gate promotion on the manifest
+as a whole, and roll back by repointing the manifest's alias — not by repointing the
+model, prompt, and tool schema independently and hoping they land on compatible
+versions at the same time.
 
 ---
 
@@ -430,21 +726,89 @@ or where it came from, which is exactly the state the opening anecdote describes
 
 ---
 
+## Production Case Studies & War Stories
+
+The failure modes in this chapter are not hypothetical. Here are three, in increasing
+order of "the version number was technically correct the whole time."
+
+### War story 1 — a tokenizer auto-upgrade silently shifted a special token id
+
+In April 2026, users of Kimi K2.5's multimodal inference in vLLM hit a hard crash:
+`AssertionError: Failed to apply prompt replacement for mm_items['vision_chunk'][0]`
+(vLLM issue #39261). Nothing about the *registered model version* had changed. The root
+cause: the model's `config.json` had been written assuming a slow, TikToken-style
+tokenizer, with a hardcoded `media_placeholder_token_id = 163605`. When `transformers`
+v5 loaded the same repo, it auto-converted the tokenizer to its faster backend — and
+that backend compacts gaps in the special-token id space, which shifted the actual
+`<|media_pad|>` token from id 163605 to id 163602. Token 163605 now decoded to
+`[UNK]`. vLLM went looking for a token that, at runtime, no longer existed at that id.
+
+The model weights were unchanged. The registered version number was unchanged. What
+changed was a *loader-level auto-migration* one layer below the version the team
+thought they had pinned. The lesson generalizes directly from this chapter's bundle
+table: pinning "the tokenizer files" is not the same as pinning "tokenizer *behavior*."
+A startup self-check that encodes a fixed probe string (including every special token)
+and compares the resulting ids against a recorded golden fingerprint would have caught
+this in a health check, not in production traffic.
+
+### War story 2 — an unrelated dependency bump broke chat formatting
+
+In December 2025, a team deploying DeepSeek-V3.2 on vLLM 0.11.2 hit a `ValueError` at
+*request* time, not at startup: `"As of transformers v4.44, default chat template is no
+longer allowed, so you must provide a chat template if the tokenizer does not define
+one"` (vLLM issue #29849). The server had started cleanly; the model loaded; the crash
+only surfaced the moment a real chat-formatted request arrived, because the model had
+been relying on an *implicit default* chat template that a `transformers` version bump
+in the base image simply removed. Nothing in the registered model version changed —
+the break was purely in an unpinned runtime dependency, exactly the "Runtime deps" row
+this chapter's versioning-together table calls out. The practical guard this incident
+argues for: a deploy-time canary that sends one real, chat-formatted request through
+the new pod *before* it takes production traffic, so a broken template fails the
+rollout gate instead of a live user's request.
+
+### War story 3 — the mutable `latest` tag (a composite, illustrative pattern)
+
+This one is presented deliberately as a *pattern*, not a single sourced incident,
+because it is the single most commonly reported shape of this failure across teams and
+is worth naming precisely: a serving config points at `chatbot-llm:latest` (or an S3
+prefix like `s3://models/chatbot-llm/latest/`, or an HF `main` branch with no
+`revision=`). A teammate — in a different repo, a different team, a different
+timezone — pushes a retrain, a quick fix, or even just a `README.md` metadata update
+that happens to also touch the pointer. `latest` now resolves to different bytes. No
+deploy fired. No CI ran. The next pod restart (an autoscale event, a node drain, a
+routine rolling update — not even the same team's action) picks up the new bytes and
+starts serving different behavior under a config line that has not changed in months.
+The only way to notice is behavioral: a metric drifts, a user complains, or an eval
+canary re-run against a fixed prompt set produces a different fingerprint than
+yesterday. This is precisely why this chapter insists a served pointer be resolved
+**once, at load, to an immutable id that gets logged** — with that discipline, this
+class of incident becomes "check the resolved version id in the logs," not "trace
+through everyone's recent commits."
+
+**Common thread across all three:** in every case the thing a human would call "the
+model" — the name, the registered version, the config line — stayed put. The behavior
+changed because *something the bundle table lists as a separate row* moved
+underneath it. That is the whole argument for versioning the bundle, not the weights.
+
+---
+
 ## Failure Modes & Pitfalls
 
 - **Mutable `latest`/`main` in prod.** Serving `chatbot-llm:latest` or HF `main` means
   behavior can change under you with no deploy and no diff. Pin a digest, alias→version,
-  or commit hash. `latest` is for dev laptops, never production.
+  or commit hash. `latest` is for dev laptops, never production. (War story 3, above.)
 - **Weights not content-addressed.** If a bucket write can overwrite version 5's bytes
   and keep the id, your "immutable" version is a lie. Key by hash and enable object
   immutability/versioning.
 - **Tokenizer/engine drift.** Weights pinned, but the tokenizer or chat template comes
   from a different revision, or the base image bumped `transformers`/vLLM. Same weights,
   different tokens, different outputs. Version the *whole bundle* and record the engine
-  version; catch it with shadow.
+  version; catch it with shadow. This is not hypothetical — see War stories 1 and 2
+  above, both real, dated incidents where the registered version never changed at all.
 - **Prompt/serving-code drift.** The prompt template or post-processing lives in app
   code that deploys on its own cadence, decoupled from the model version. Pin the
-  serving-code SHA into the version.
+  serving-code SHA into the version — or, for agentic systems, version the prompt itself
+  in a prompt registry and gate it the same way you gate the model.
 - **No link between served version and eval results.** Metrics logged against a run but
   not the *version id*, or evals run on a different bundle than what ships. Promotion
   gates then guard nothing. Attach eval numbers to the version, run them on the exact
@@ -459,10 +823,17 @@ or where it came from, which is exactly the state the opening anecdote describes
 - **Config drift between registry and serving.** The registry says v7 but the pod
   mounted a stale cached artifact. Verify the loaded hash against the registry at
   startup and fail closed on mismatch.
+- **A gate that fails open on missing data.** An eval-gated promotion pipeline that
+  treats "no eval tags recorded yet" as "pass" will eventually promote something nobody
+  evaluated. Fail closed: no eval on the version means no promotion.
 
 ---
 
-## Production Checklist — What an Interviewer Probes
+## Interview Mastery
+
+This section is the one to over-prepare. Interviewers use model versioning as a proxy
+for "does this person actually understand production ML systems, or just training
+runs" — the questions below go from fundamentals to a full system-design prompt.
 
 1. **"What exactly is a model version to you?"** — Expect the full bundle: weights +
    config + tokenizer + generation config + serving code + engine version + runtime,
@@ -474,18 +845,135 @@ or where it came from, which is exactly the state the opening anecdote describes
    linked to the version, enforced gates, approval recorded, pointer move — never a
    rebuild.
 4. **"A regression is in prod. Roll it back."** — Repoint alias / redeploy prior ARN /
-   pin prior commit; drain + reload; previous version still registered and warm; target
-   minutes, no rebuild.
+   pin prior commit; drain + reload; previous version still registered and warm;
+   target minutes, no rebuild. Bonus points for mentioning a `previous_<alias>`-style
+   snapshot written *at promotion time*, so rollback is a lookup, not a memory test.
 5. **"How do you guarantee the model is byte-for-byte what you think?"** — Content hash /
    commit digest, re-verified on load; object-store immutability; fail closed on
    mismatch.
 6. **"Same weights but outputs changed — how did that happen and how do you prevent it?"**
    — Tokenizer/engine/config/prompt drift; version the whole bundle, record engine
-   version, catch with shadow.
+   version, catch with shadow. Cite a concrete mechanism if you can — e.g. a
+   tokenizer-backend auto-conversion silently remapping special-token ids (War story 1).
 7. **"How do you compare two versions safely in production?"** — Shadow for zero-risk
    diffing, A/B/canary for online metrics, with the version id stamped on every record.
 8. **"How would you audit which model answered a given request three weeks ago?"** —
    Immutable version id logged per request + model card + lineage back to run/data.
+9. **"Explain, in about 60 seconds, why 'the same model' can silently change in
+   production."** — A strong answer names *specific* mechanisms, fast, without
+   rambling: (a) a mutable pointer — `latest`, `main`, an S3 `latest/` prefix — gets
+   repointed by someone else's unrelated push; (b) a base-image/runtime-dependency bump
+   (`transformers`, vLLM, CUDA) changes tokenizer behavior, chat-template defaults, or
+   sampling kernels without anyone touching the model config; (c) a tokenizer loader
+   auto-migrates formats (slow→fast) and silently remaps special-token ids; (d) a
+   quantization or LoRA-merge step gets re-run with a different calibration set under
+   the same artifact name; (e) prompt template or post-processing code deploys on its
+   own cadence, decoupled from the model version. The unifying point to land on: *the
+   human-facing name is not the identity* — only a content hash of the full bundle is,
+   which is why every mechanism above is invisible until you check bytes, not names.
+10. **System design: "Design the model registry + promotion workflow for a company
+    running 5 models in prod."** A strong answer covers, roughly in this order:
+    - **Requirements first:** how many teams own models, what's the rollback SLO, is
+      there a compliance/audit requirement, do models share infra (GPUs, base images)?
+    - **One registry, namespaced per model** — not five bespoke systems. MLflow (or
+      SageMaker/Vertex if already on that cloud) with a Postgres metadata store and
+      S3/GCS artifact backend, content-addressed by hash.
+    - **Aliases per model, not global:** `chatbot-llm@champion`, `ranker@champion`,
+      etc. — each model gets its own `@champion`/`@challenger`/`@shadow`, so a
+      promotion on one model can't accidentally touch another.
+    - **Promotion pipeline as code, shared across all 5 models** — one CI job template
+      parameterized by model name, so gates (eval thresholds, approval requirement)
+      are consistent and reviewable, not five diverging tribal processes.
+    - **Serving layer:** each model's servers resolve their own alias once at startup,
+      log the resolved version id on every request, and expose a `/version` endpoint
+      for on-call sanity checks.
+    - **Rollback SLO:** keep N-1 warm per model (accept the GPU-hours cost for the 5
+      models that matter) so rollback is a pointer move + drain, not a cold rebuild.
+    - **Monitoring tied to version id:** per-model dashboards sliced by the version
+      stamped in logs, so a regression alert names a version, not just "the service."
+    - **Ownership:** one on-call rotation per model team, but a single shared registry
+      pattern and runbook, so a new hire only has to learn the pattern once.
+
+    Sketch:
+
+    ```
+        ┌─────────────────────────────────────────────────────────────┐
+        │                     Model Registry (MLflow)                  │
+        │   metadata: Postgres     artifacts: S3 (content-addressed)   │
+        │                                                                │
+        │   chatbot-llm   @champion→v12  @challenger→v13  @shadow→v14   │
+        │   ranker        @champion→v4   @challenger→v5                  │
+        │   summarizer    @champion→v9                                   │
+        │   classifier    @champion→v2   @challenger→v3                  │
+        │   embedder      @champion→v6                                   │
+        └───────────────┬────────────────────────────────────────────────┘
+                        │ resolve alias ONCE at load; log version_id/req
+            ┌───────────┼───────────┬───────────┬───────────┐
+            ▼           ▼           ▼           ▼           ▼
+        chatbot pods  ranker pods  summ. pods  class. pods  embed pods
+            │
+            └── shared CI promotion pipeline (eval gate → alias move),
+                one template, parameterized by model name
+    ```
+
+11. **"How would you version an agentic system where the prompt, tools, and engine all
+    change independently of the weights?"** — Version each independently (a prompt
+    registry with its own aliases, a hash over the tool/function schema set, the engine
+    version pinned per-image), then define an explicit **bundle manifest** that
+    references all of them and gate/promote/roll back *the manifest* as one unit — see
+    the agentic-bundle section above. The failure to avoid: repointing the model's
+    alias and the prompt's alias in two separate, uncoordinated steps.
+12. **"What's the difference between a semantic version and a content hash, and why do
+    you need both?"** — Semver/registry integer is human-ordered and communicates
+    intent ("newer than v2") but doesn't guarantee uniqueness of bytes; a content hash
+    guarantees identity but is unordered and meaningless to a human. Use an
+    auto-incrementing registry version for people, and record the content hash as
+    immutable metadata on it — never let a version number get reused for different
+    bytes.
+13. **"When would you choose OCI artifacts / a container registry over something like
+    MLflow for models?"** — When you want to reuse existing container infra (registry,
+    signing via sigstore, Kubernetes volume sources, multi-arch manifests) rather than
+    stand up a separate model-specific system — the CNCF ModelPack effort and
+    Harbor-as-model-registry deployments are exactly this bet. Trade-off: you give up
+    some ML-specific metadata (runs, eval linkage, lineage graphs) that a purpose-built
+    registry like MLflow gives you natively, unless you layer it back on with tags.
+14. **"How do you detect version drift automatically, before a human notices bad
+    outputs?"** — Startup self-check: re-hash the loaded artifact against the recorded
+    digest and fail closed on mismatch; a fixed probe-string tokenizer fingerprint
+    checked against a golden value (this would have caught War story 1 at boot, not in
+    live traffic); a deploy-time canary request through the full serving stack before
+    taking traffic (this would have caught War story 2 at rollout, not at the first
+    real user request); continuous shadow evaluation comparing `@shadow` against
+    `@champion` on identical inputs.
+15. **"What's the cost/latency tradeoff of keeping N-1 warm for instant rollback, and
+    how do you decide how many versions to keep warm?"** — Warm N-1 costs roughly
+    double the steady-state GPU footprint for that model during any promotion window;
+    justify it by rollback SLO (if "minutes" is the requirement, cold-start-from-object-
+    storage for a 70B model won't hit it) and by blast radius (a model with 5 dependent
+    downstream services justifies the spend more than an internal experiment). Most
+    teams keep exactly N-1 warm and rely on object storage + a fast loader for anything
+    older, since rollback more than one hop back is rare and can tolerate a slower path.
+16. **"Stages vs aliases — when, if ever, would you still want classic stages?"** —
+    Stages are simpler when you genuinely have one linear lifecycle and only ever need
+    one "current production" slot with no concurrent challenger/shadow traffic; they
+    get in the way the moment you want two things pointing at production-adjacent
+    versions simultaneously (canary + shadow + champion), which is the normal case for
+    LLM serving — hence MLflow's move to aliases.
+
+### Red flags vs. green flags
+
+| Signal | Red flag | Green flag |
+|---|---|---|
+| Naming a version | "the weights" only | Full bundle: weights + tokenizer + config + engine + serving code + runtime deps |
+| Pointer semantics in prod | `latest` / `main` / an S3 `latest/` prefix | A pinned alias or commit, resolved once at load and logged |
+| Promotion mechanism | Manual file copy, ad hoc rebuild | Pointer move over an already-registered, already-hashed version |
+| Rollback time | "We'd redeploy / retrain" | Alias repoint + rolling restart; N-1 kept warm; minutes, not hours |
+| Eval linkage | Metrics live in a spreadsheet or a run, untied to a version id | Eval results stored as tags/params on the exact served version |
+| Drift detection | "We'd notice from user complaints" | Hash re-verification at load + tokenizer fingerprint + shadow diffing pre-promotion |
+| Dependency pinning | "`requirements.txt`, roughly" | Lockfile or image digest pinned per version, engine version explicitly recorded |
+| Auditability | "Check the deploy Slack channel" | Immutable version id on every request log + model card + lineage graph |
+| Scaling to many models | Ad hoc process per team, reinvented each time | One registry pattern, namespaced aliases, one promotion pipeline as code |
+| Agentic bundles | Prompt/tools versioned informally in app code | Prompt registry + tool-schema hash + engine version, gated as one manifest |
 
 ---
 
@@ -494,11 +982,24 @@ or where it came from, which is exactly the state the opening anecdote describes
 - MLflow — Model Registry (aliases, tags, workflow): <https://mlflow.org/docs/latest/ml/model-registry/workflow/>
 - MLflow — Registry concepts (stages deprecated in favor of aliases): <https://mlflow.org/docs/latest/model-registry/>
 - MLflow — Load a registered model (`models:/name@alias`, `models:/name/version`): <https://mlflow.org/docs/latest/getting-started/registering-first-model/step3-load-model/>
+- MLflow — Prompt Registry overview: <https://mlflow.org/docs/latest/genai/prompt-registry/>
+- MLflow — Manage prompt lifecycles with aliases: <https://mlflow.org/docs/latest/genai/prompt-registry/manage-prompt-lifecycles-with-aliases/>
+- MLflow — release notes (3.15.0, July 31, 2026, and history): <https://mlflow.org/releases/>
 - Amazon SageMaker — Register a model & Model Package Groups: <https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry.html>
 - Amazon SageMaker — Update model approval status: <https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-approve.html>
 - Vertex AI — Model Registry introduction: <https://cloud.google.com/vertex-ai/docs/model-registry/introduction>
 - Vertex AI — Model version aliases: <https://docs.cloud.google.com/gemini-enterprise-agent-platform/machine-learning/model-registry/model-alias>
 - Hugging Face — Sharing & the `revision` argument (pin a commit): <https://huggingface.co/docs/transformers/model_sharing>
 - Hugging Face — Model Cards (format & metadata): <https://huggingface.co/docs/hub/en/model-cards>
+- Hugging Face Forums — Purpose of `commit_hash` in `PreTrainedModel.from_pretrained`: <https://discuss.huggingface.co/t/purpose-of-commit-hash-in-pretrainedmodel-from-pretrained/174304>
+- Hugging Face — Xet chunk-level deduplication specification: <https://huggingface.co/docs/hub/en/xet/deduplication>
+- Hugging Face — "From Chunks to Blocks" (Xet storage engineering): <https://huggingface.co/blog/from-chunks-to-blocks>
+- Baseten — Pinning ML model revisions for compatibility and security: <https://www.baseten.co/blog/pinning-ml-model-revisions-for-compatibility-and-security/>
+- CNCF — How OCI Artifacts will drive future AI use cases (Aug 27, 2025): <https://www.cncf.io/blog/2025/08/27/how-oci-artifacts-will-drive-future-ai-use-cases/>
+- CNCF ModelPack — open model packaging spec: <https://github.com/modelpack/model-spec>
+- CNCF ModelPack — `modctl` reference CLI: <https://github.com/modelpack/modctl>
+- VMware/Broadcom — Using Harbor as an AI Model Registry (Mar 2026): <https://blogs.vmware.com/cloud-foundation/2026/03/03/using-harbor-as-an-ai-model-registry/>
+- vLLM issue #39261 — Kimi K2.5 tokenizer-backend token-id mismatch (Apr 2026): <https://github.com/vllm-project/vllm/issues/39261>
+- vLLM issue #29849 — DeepSeek-V3.2 chat-template break from a `transformers` bump (Dec 2025): <https://github.com/vllm-project/vllm/issues/29849>
 - Mitchell et al., 2019 — *Model Cards for Model Reporting*: <https://arxiv.org/abs/1810.03993>
 - Docker — image digests vs tags (the mental model): <https://docs.docker.com/dhi/core-concepts/digests/>
