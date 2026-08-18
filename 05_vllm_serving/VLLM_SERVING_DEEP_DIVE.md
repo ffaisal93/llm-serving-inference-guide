@@ -10,6 +10,8 @@ This chapter goes deep on the mechanisms (PagedAttention, continuous batching, p
 
 **Chapter map**, since this is long: mechanisms and core tuning knobs come first (PagedAttention -> continuous batching -> chunked prefill -> prefix caching -> engine args -> parallelism -> quantization -> speculative decoding); section **(A)** is the 2025-2026 state-of-the-art landscape; section **(B)** is the extended multi-node build-and-tune walkthrough with observability and cost math; section **(C)** is three real production war stories plus an on-call runbook; section **(D)** is interview mastery (60-second explanation, a system-design prompt, 20 Q&A, red/green flags); a glossary and further reading close it out.
 
+> **Saying it out loud.** vLLM became the default open-source serving engine because it attacked the actual bottleneck, which is memory — specifically the KV cache — rather than compute. The insight is embarrassingly simple in hindsight: pre-vLLM systems were wasting 60 to 80% of KV-cache memory to fragmentation and over-reservation, because each sequence grabbed a contiguous block sized for the maximum possible length up front. vLLM borrowed paging from operating systems, applied it to the KV cache, and turned that wasted memory back into batch capacity. And more batch capacity means more requests share each expensive weight read from HBM, which is exactly what raises throughput. The headline number from the paper is 2 to 4x throughput at the same latency versus the prior state of the art.
+
 ---
 
 ## Core intuition: LLM inference is memory-bound, and the KV cache is the problem
@@ -21,6 +23,8 @@ Two facts drive everything:
 2. **What runs you out of memory is the KV cache.** For every token in every sequence, attention must remember the key and value vectors of all previous tokens. This "KV cache" grows linearly with sequence length *and* with the number of concurrent sequences. On a typical setup the weights are fixed, and whatever HBM is left is a fixed budget you spend on KV cache. **The more efficiently you pack the KV cache, the bigger your batch, the higher your throughput.**
 
 So the game is: *fit as many sequences' KV caches into the leftover HBM as possible, and keep the GPU busy on all of them at once.* PagedAttention wins the first half; continuous batching wins the second.
+
+> **Saying it out loud.** Two facts drive everything. First, autoregressive decoding is memory-bandwidth-bound, not compute-bound: generating one token reads the entire model weights but does very little arithmetic, so the GPU spends its time on the memory bus while the tensor cores idle. The fix is batching — process many sequences at once so one weight read serves many tokens. Second, the thing that stops you batching more is the KV cache, which grows linearly with sequence length *and* with concurrent sequences. So the game is: fit as many sequences' KV caches into the leftover HBM as possible, and keep the GPU busy on all of them every step. PagedAttention wins the first half, continuous batching wins the second. That's the whole chapter in two sentences.
 
 ### How big is the KV cache?
 
@@ -51,6 +55,8 @@ Always compute the real figure for *your* model from its config (layers × KV he
 
 At 800 KB/token, KV cache is enormous and *dynamic* — you don't know a request's final length in advance. That combination is exactly what classic allocators handle badly.
 
+> **Saying it out loud.** The formula is two — for keys and values — times layers, times *KV* heads, times head dimension, times bytes per element, per token. The word doing the work there is KV heads rather than query heads, because grouped-query attention shares KV heads across query heads and shrinks the cache dramatically. Concretely, in fp16: an OPT-13B-class model with full multi-head attention is about 800 kilobytes per token, so a single 2,048-token sequence needs 1.6 gigabytes. Llama-3-8B with GQA and 8 KV heads is 128 kilobytes per token — roughly six times cheaper. That's why every architecture since about 2023 has been under pressure to shrink this number. The habit worth building: derive the real figure from your model's config rather than trusting a rule of thumb, because every capacity decision downstream depends on it.
+
 ---
 
 ## PagedAttention in depth
@@ -65,6 +71,8 @@ Pre-vLLM systems (Orca, FasterTransformer) stored each sequence's KV cache in **
 
 Net effect: measured **effective KV utilization of only 20.4%–38.2%**. Four out of five bytes wasted.
 
+> **Saying it out loud.** Before vLLM, each sequence's KV cache lived in one contiguous chunk sized to the maximum possible length. So if your model supports 2,048 tokens, every request reserved room for 2,048 the moment it started — even if it generated thirty. That produces three kinds of waste: internal fragmentation from the reserved-but-never-filled slot, reservation waste from space held for a running sequence's future tokens, and external fragmentation from gaps between differently-sized chunks that nothing fits into. The paper measured the damage directly: effective KV utilization of only 20 to 38 percent. Four out of five bytes wasted — on the exact resource that caps your batch size, which caps your throughput.
+
 ### The idea: page the KV cache like virtual memory
 
 Operating systems solved this decades ago. A process sees a contiguous virtual address space, but physically it's scattered across fixed-size **pages** mapped by a **page table**. No process reserves all of physical RAM up front; pages are handed out on demand.
@@ -75,6 +83,8 @@ PagedAttention does the same for the KV cache:
 - Blocks live in a global pool of physical GPU memory and **need not be contiguous**.
 - Each sequence has a **block table** mapping its logical block index → physical block number, exactly like a page table.
 - The attention kernel is modified to gather K/V from these scattered blocks using the block table, so attention runs correctly over non-contiguous memory.
+
+> **Saying it out loud.** The fix is borrowed straight from operating systems. A process sees a contiguous virtual address space, but physically its memory is scattered across fixed-size pages tracked by a page table, and no process reserves all of RAM up front. PagedAttention does exactly that for the KV cache: a sequence's cache is split into fixed-size blocks — sixteen tokens by default — those blocks live in a global pool and don't need to be contiguous, and each sequence has a block table mapping logical block index to physical block number. The attention kernel is modified to gather K and V through that block table. The payoff: a block is allocated only when the current one fills, so you waste at most one partial block per sequence and zero reservation, taking effective utilization from about 20% up toward 96%.
 
 ### Diagram-in-words
 
@@ -101,6 +111,8 @@ Because blocks are indirected through a block table, **two sequences can point t
 
 This block-level sharing is the foundation that **automatic prefix caching** (below) builds on.
 
+> **Saying it out loud.** Because blocks are indirected through a table, two sequences can just point at the same physical block — and that's where paging pays a second dividend. In parallel sampling or beam search, n outputs share the same prompt, so instead of n copies of the prompt's KV cache you have n block tables pointing at one set of blocks; the paper reports up to 55% memory savings there. When one sharer needs to diverge, vLLM copies just that one block and updates only that sequence's table — literally the same copy-on-write trick `fork()` uses, with reference counts per block. This block-level sharing isn't a side feature; it's the machinery that automatic prefix caching is built on top of.
+
 ### Worked memory example
 
 Serve **Llama-3-8B in fp16 on one A100-80GB**.
@@ -113,6 +125,8 @@ Serve **Llama-3-8B in fp16 on one A100-80GB**.
 6. **Total blocks:** \(54\ \text{GB} / 2\ \text{MB} \approx 27{,}600\) blocks = **~442,000 tokens** of KV capacity.
 
 That single number, ~442k tokens, is your batch budget. It can be **54 sequences at the full 8192-context** (\(442000/8192\)), or **~880 concurrent chatbot turns** averaging 500 tokens each, or anything in between. vLLM logs this at startup as `# GPU blocks: 27600` and reports "Maximum concurrency for 8192 tokens per request." Watch that log line — it tells you exactly how much headroom you bought.
+
+> **Saying it out loud.** Walk the arithmetic for Llama-3-8B in fp16 on one 80-gigabyte A100. Weights are 16 gigabytes. At `--gpu-memory-utilization 0.9` vLLM may use 72. Subtract about two for CUDA context, activations, and graph capture, and you're left with 54 gigabytes of KV pool. At 128 kilobytes per token, a sixteen-token block is 2 megabytes, so 54 gigabytes is about 27,600 blocks, or roughly 442,000 tokens of KV capacity. That one number is your entire batch budget — it can be 54 sequences at full 8K context, or about 880 concurrent chat turns averaging 500 tokens, or anything between. vLLM prints it at startup as `# GPU blocks`, and watching that log line is the fastest way to know whether your config bought you the headroom you thought it did.
 
 ---
 
@@ -140,6 +154,8 @@ No sequence waits on a slower sibling. The batch is continuously topped up, so t
 
 **Why it raises throughput:** decoding is memory-bound, so throughput scales with how many sequences you can run per weight-load. Static batching leaves the effective batch shrinking toward 1 as siblings finish; continuous batching holds it near its memory-limited maximum every single step.
 
+> **Saying it out loud.** The key move is that vLLM schedules at the granularity of a single decode step rather than a whole request. Every forward pass, any sequence that just emitted its stop token is evicted immediately and its KV blocks freed, waiting requests are admitted mid-flight to fill the vacated slots, and the next pass runs over the new mix. So no sequence ever waits on a slower sibling — which is exactly the head-of-line blocking that kills static batching, where a request emitting twenty tokens sits idle for 480 steps while its batch-mate finishes. The measured win from Anyscale's widely cited benchmark is up to 23x throughput versus naive batching while *also* cutting p50 latency, which is rare — you get both because higher utilization means less queueing.
+
 ---
 
 ## Prefill vs decode, and chunked prefill
@@ -159,6 +175,8 @@ Mixing them is awkward. A giant prefill can **monopolize a forward pass and stal
 
 Tuning: **raise `max-num-batched-tokens` for throughput** (bigger chunks, more prefill work per step); **lower it to protect decode latency** (smaller chunks yield to decodes more often).
 
+> **Saying it out loud.** Prefill and decode have opposite profiles: prefill processes the whole prompt in one heavy compute-bound pass, decode generates one token at a time and is memory-bound with almost no arithmetic. Mixing them naively is awkward, because one giant prefill can monopolize a forward pass and freeze every sequence that's currently streaming — that's the classic prefill/decode interference, and it shows up as a spike in inter-token latency for users who did nothing wrong. Chunked prefill splits a big prompt into pieces and co-schedules a chunk alongside ongoing decodes in the same batch. It smooths inter-token latency and it also uses otherwise-idle FLOPs, since decode steps are compute-light. The tuning rule: raise `max-num-batched-tokens` for throughput, lower it to protect decode latency.
+
 ---
 
 ## Prefix caching (automatic KV reuse)
@@ -172,6 +190,8 @@ Many requests share a prefix: the same long system prompt, a shared few-shot pre
 - In current vLLM (V1) prefix caching is **enabled by default**, and the V1 rewrite specifically made it "near-zero performance degradation, even when the cache hit rate is 0%" — so leaving it on is close to a free option (see section A).
 
 The saving is real work avoided: a 2000-token shared system prompt cached across 1000 requests skips ~2,000,000 tokens of prefill compute.
+
+> **Saying it out loud.** Lots of requests share a prefix — the same long system prompt, a fixed few-shot preamble, a document everyone's asking about, or a multi-turn chat that resends the whole history each turn. Automatic prefix caching hashes KV blocks by content and, when a new request's prefix hashes to blocks already resident, just points the new sequence's block table at them and skips recomputing that prefill entirely. It's literally the copy-on-write block sharing from PagedAttention, applied across requests and across time. The scale of the saving is real work avoided: a 2,000-token shared system prompt cached across a thousand requests skips two million tokens of prefill compute. The cost is that cached blocks occupy memory the active batch could use, so it's a hit-rate bet — though in V1 it's engineered to be near-free even at a 0% hit rate.
 
 ---
 
@@ -199,11 +219,15 @@ These are the flags you actually turn in production. Names are the current `vllm
 
 Startup log lines to watch: `# GPU blocks:` (your KV capacity), `Maximum concurrency for N tokens`, and any `Sequence group ... is preempted` warnings (you're memory-starved). vLLM also exposes these as **live Prometheus metrics** (`vllm:gpu_cache_usage_perc`, `vllm:gpu_prefix_cache_hit_rate`, `vllm:num_requests_running`, `vllm:num_requests_waiting`) on `/metrics` — section (B) below shows how to read them while tuning.
 
+> **Saying it out loud.** There are really five flags that matter and the rest is detail. `--gpu-memory-utilization` sets what fraction of HBM vLLM may claim, which determines your KV pool — push it toward 0.94 if you have headroom, back off if you OOM. `--max-num-seqs` caps concurrency, but here's the thing people get wrong: KV memory usually binds *before* that number does, so raising it without memory headroom just causes preemption. `--max-num-batched-tokens` is your throughput-versus-inter-token-latency dial. `--max-model-len` directly bounds worst-case KV per sequence, so lowering it is often the cheapest way to fit more requests. And `--kv-cache-dtype fp8` roughly doubles KV capacity for a small accuracy cost. Watch the startup log for `# GPU blocks` and watch for `preempted` warnings — those two tell you whether your settings are honest.
+
 ---
 
 ## Parallelism for big models
 
 When a model (plus its KV cache) doesn't fit on one GPU, or single-GPU latency is too high, split it.
+
+> **Saying it out loud.** When a model plus its KV cache doesn't fit on one GPU, you split it, and there are two ways with very different communication profiles. Tensor parallelism shards every layer's weight matrices across N GPUs and does an all-reduce each layer to combine partial results — bandwidth-hungry, so it wants NVLink and belongs inside one node. Pipeline parallelism assigns contiguous stages of layers to different GPUs, so communication is just a small point-to-point handoff between stages, which tolerates slower links and lets you span nodes. The rule of thumb is: tensor parallel first, up to one node's worth of GPUs, then pipeline parallel to cross nodes. A very common shape is TP=8 within each node times PP=2 across two nodes for sixteen GPUs total.
 
 ### Tensor parallelism (TP) — `--tensor-parallel-size`
 
@@ -212,6 +236,8 @@ When a model (plus its KV cache) doesn't fit on one GPU, or single-GPU latency i
 **When:** the model is too big for one GPU, or you want lower latency on a single request (more GPUs working the same forward pass). Best **within one node over NVLink**, because the per-layer all-reduce is bandwidth-hungry.
 
 **Tradeoff:** communication overhead grows with N; going cross-node over slower interconnect (Ethernet/PCIe) tanks efficiency. Keep `-tp` ≤ GPUs-per-node. TP size must divide the number of attention heads.
+
+> **Saying it out loud.** Tensor parallelism shards each layer's weight matrices across GPUs — every GPU computes its slice and an all-reduce combines the partial results, once per layer. Two things worth knowing beyond the mechanism. It shards the KV cache too, by heads, so raising TP grows your KV budget as well as fitting bigger weights. And it lowers single-request latency, because more GPUs are working the same forward pass. The tradeoff is that all-reduce traffic grows with the degree, so going cross-node over Ethernet or PCIe rather than NVLink tanks efficiency — keep TP at or below your GPUs-per-node. One hard constraint people forget: the TP size has to divide the number of attention heads.
 
 ### Pipeline parallelism (PP) — `--pipeline-parallel-size`
 
@@ -222,6 +248,8 @@ When a model (plus its KV cache) doesn't fit on one GPU, or single-GPU latency i
 **Tradeoff:** introduces pipeline bubbles (stages idle waiting for the previous stage); throughput-friendly with enough in-flight requests, but adds latency per request. Combine TP (intra-node) + PP (inter-node) for the best of both.
 
 Rule of thumb: **TP first, up to one node; PP to cross nodes.** vLLM also supports data parallelism / multi-replica behind a router for pure scale-out.
+
+> **Saying it out loud.** Pipeline parallelism cuts the model by layers instead of by weight matrices — GPU zero holds the first block of layers, GPU one the next, and activations flow from stage to stage. The communication is a small point-to-point handoff rather than an all-reduce every layer, which is why it tolerates slower inter-node links and is the right tool for spanning nodes. The cost is pipeline bubbles: a stage sits idle waiting on the one before it, so per-request latency goes up even though throughput holds up fine once you have enough requests in flight to keep every stage fed. That's the honest framing — pipeline parallelism is throughput-friendly and latency-unfriendly, which is why you use it to cross nodes and tensor parallelism inside them.
 
 ---
 
@@ -238,6 +266,8 @@ Quantization shrinks weights (and optionally activations/KV) to fewer bits. Smal
 | **bitsandbytes** | 4/8-bit | Weights, on-the-fly | Quick experiments, no pre-quant step | Slower kernels; not the throughput champion |
 | **NVFP4 (via NVIDIA Model Optimizer)** | 4-bit float | Weights + activations, Blackwell tensor-core native | Newest Blackwell (B200/GB200)-class hardware | Newest path — check current vLLM docs for model/kernel coverage before depending on it in production |
 
+> **Saying it out loud.** Quantization shrinks weights to fewer bits, which frees HBM for KV cache and can speed up memory-bound decode — and it always costs some accuracy, the only question is how much. The practical guidance splits by hardware. On Ampere or Ada, AWQ 4-bit with the Marlin kernel is the workhorse: roughly 4x less weight memory, which is a lot of KV headroom. On Hopper, prefer FP8 — it's near-lossless and uses native tensor-core FP8 for a real speedup, and you can add `--kv-cache-dtype fp8` to roughly double KV capacity on top. The thing to say out loud that separates a good answer: quantization shrinks *weights*, not the KV cache, so for long-context blowup the relevant levers are KV dtype and `--max-model-len`, not weight quantization.
+
 ### Why a 4-bit checkpoint alone doesn't make inference fast: the Marlin kernel
 
 Quantizing weights to INT4 shrinks *memory*, but it does not automatically make *compute* faster. Running INT4 weights against FP16 activations means an unusual mixed-precision GEMM, and naive kernels for it only beat FP16 at **batch size 1** — the exact regime where you're not serving many users. At realistic serving batch sizes (8–32+ concurrent sequences), a poorly-implemented INT4 kernel leaves tensor cores underused and the 4-bit weight advantage evaporates.
@@ -251,6 +281,8 @@ Guidance:
 - **Blackwell (B200/GB200):** NVFP4 via NVIDIA Model Optimizer is the emerging frontier for 4-bit that's native to the hardware rather than dequantized on the fly — newer and less battle-tested than AWQ/FP8, validate carefully.
 - **Quality-sensitive tasks (code, math, long reasoning):** measure. 4-bit weight-only can visibly hurt; validate on *your* eval set, not just perplexity (see the war story in section C).
 - Quantization reduces *weight* memory, not KV — for long-context blowup, `--kv-cache-dtype fp8` and `--max-model-len` are the relevant levers.
+
+> **Saying it out loud.** This is a genuinely non-obvious point: quantizing weights to INT4 shrinks memory, but it does not automatically make compute faster. Running INT4 weights against FP16 activations is an unusual mixed-precision matmul, and naive kernels for it only beat FP16 at *batch size one* — which is exactly the regime where you're not serving anybody. At realistic serving batches of eight to thirty-two concurrent sequences, a bad INT4 kernel leaves the tensor cores underused and the whole 4-bit advantage evaporates. Marlin is the kernel that fixes it, holding close to the ideal 4x speedup out to about batch 32 via asynchronous global-to-shared copies and careful weight layout. vLLM auto-selects the Marlin path when you ask for AWQ or GPTQ, which is why a 2024-era checkpoint still serves fast today.
 
 ---
 
@@ -268,6 +300,8 @@ vLLM supports several draft sources, each with a different cost/benefit:
 **When to use:** latency-sensitive, **low-to-moderate batch** serving where the GPU has spare compute (decode is memory-bound, so verification is nearly free). Interactive chat, single-user, or bursty low-QPS endpoints, and — per the EAGLE-3.1 numbers above — still worthwhile at moderate concurrency, just with diminishing returns.
 
 **Tradeoff:** the win depends entirely on **acceptance rate**. Low acceptance means you paid for drafting and got little back — it can *reduce* throughput. And under **high batch load the GPU is already compute-saturated**, so speculation's "free" parallel verification isn't free anymore — its benefit shrinks or reverses. Rule: speculate when you're latency-bound and under-batched; skip it when you're throughput-bound and saturated. vLLM's `speculators` project (v0.3.0, vLLM blog 2025-12-13) now also supports **training** your own draft/EAGLE heads against a target model, rather than relying only on community-published drafts — useful if your traffic distribution doesn't match the drafts published for a given base model.
+
+> **Saying it out loud.** The mechanism is: a cheap draft proposes several tokens ahead, the big target model verifies all of them in one forward pass, accepted tokens are kept and the first rejection resets. Because verification is parallel, a good draft yields multiple tokens per target forward pass — and critically the output is provably identical in distribution to the target alone, so it's exact, not an approximation. But the title is the important part. Speculation helps when you're latency-bound and under-batched, because decode is memory-bound and the spare compute makes verification nearly free. Under high batch load the GPU is already compute-saturated, so that free lunch disappears — the EAGLE-3.1 numbers show it: roughly 2x at concurrency one, tapering to about 1.66x at concurrency sixteen. Low acceptance rate can make it a net loss.
 
 ---
 
@@ -291,6 +325,8 @@ INFO ... Maximum concurrency for 8192 tokens per request: 53.9x
 ```
 
 That confirms the ~442k-token / ~54-concurrent budget we computed by hand.
+
+> **Saying it out loud.** The baseline launch is genuinely one command — `vllm serve` with a model ID, a host and port, and a couple of memory flags — and what you get is an OpenAI-compatible HTTP server, so any existing SDK works by just repointing `base_url`. That API compatibility is a bigger deal than it sounds, because it means migrating off a hosted provider is a config change rather than a rewrite. What you should do immediately after launching, before touching any tuning, is read the startup logs: available KV cache memory, GPU KV cache size in tokens, and maximum concurrency. Those three lines convert your abstract flags into the one number that governs throughput — how many tokens of KV you can actually hold.
 
 ### 2. Call it with the OpenAI client
 
@@ -346,11 +382,15 @@ Symptoms to check first with a load test (`vllm bench serve` or a locust/k6 run)
 
 Iterate: change one knob, re-run the load test, compare tokens/s and p99. Stop when you're memory-limited (preemptions appear) or latency SLO-limited.
 
+> **Saying it out loud.** Tuning is symptom-driven, and the discipline is one knob at a time with a load test between each. If you have a big shared system-and-retrieval preamble, keep prefix caching on — hit rate is high and prefill work drops sharply. If the GPU has headroom and you're not OOM-ing, push memory utilization toward 0.94 and raise both the sequence and token budgets. If p99 inter-token latency is bad, *lower* `max-num-batched-tokens`, because smaller prefill chunks yield to decodes more often at a small throughput cost. If you see `preempted` warnings, you've over-committed KV — drop `max-num-seqs` or `max-model-len`, or add swap space. And you stop when you hit either preemption or your latency SLO, whichever comes first.
+
 ---
 
 ## (A) The 2025–2026 landscape
 
 vLLM has moved fast since the original SOSP '23 paper. If you last read the codebase in 2023–2024, four things have materially changed the picture — an interviewer who works in this space will expect you to know all four, with rough dates.
+
+> **Saying it out loud.** If you last looked at vLLM in 2023, four things have materially changed the picture. The V1 engine is a from-scratch rewrite with a unified scheduler and an isolated engine process, and it made chunked prefill and prefix caching default-on. Disaggregated prefill/decode moved from experimental flag to a real pattern, splitting the two phases onto physically separate GPU pools. Speculative decoding grew from "small draft model" into a family with EAGLE-3 as the acceptance-length leader. And quantization consolidated on Marlin-backed 4-bit for Ampere and FP8 for Hopper. The practical version: if a tutorial tells you to manually pass `--enable-chunked-prefill`, that advice is stale, and repeating it in an interview signals your mental model is frozen at the paper.
 
 ### A.1 The V1 engine rewrite
 
@@ -363,6 +403,8 @@ vLLM has moved fast since the original SOSP '23 paper. If you last read the code
 
 Practical implication: if you're reading a pre-2025 vLLM tutorial telling you to manually pass `--enable-chunked-prefill` or explain why prefix caching costs overhead at 0% hit rate, that advice is stale — verify against the current `vllm serve --help` and the V1 guide before repeating it in an interview.
 
+> **Saying it out loud.** V1 is a rewrite of the engine core, not a patch, and it's the default now. Two structural changes matter. The scheduler is unified: V0 had separate code paths for prefill-only steps, decode-only steps, and chunked mixing, whereas V1 represents every request uniformly as a request-ID-to-token-count map and schedules both through one path — which is what lets chunked prefill, prefix caching, and speculation compose cleanly instead of each needing bespoke logic. And the engine core runs in its own process, so tokenization, detokenization, and bookkeeping — all CPU work — overlap with GPU execution instead of serializing with it. That second one matters more every year, because as GPUs get faster the CPU side becomes a bottleneck it never used to be. Measured gain: up to 1.7x throughput over V0.
+
 ### A.2 Disaggregated prefill/decode serving
 
 Co-locating prefill (compute-bound) and decode (memory-bound) on the same GPUs is simple but creates exactly the interference chunked prefill only partially smooths over: a burst of long prompts still steals cycles from in-flight decodes, spiking ITL.
@@ -373,13 +415,19 @@ A concrete, dated example: AMD's **MORI-IO KV connector** (vLLM blog, **2026-04-
 
 **When it's worth the complexity:** high-scale deployments with long, variable prompts and a strict ITL/streaming-smoothness SLO, where you can afford separate autoscaling groups for prefill vs decode. For most single-node, moderate-QPS deployments, chunked prefill co-location is simpler and sufficient — disaggregation is an optimization you reach for once co-located tuning has plateaued.
 
+> **Saying it out loud.** Chunked prefill smooths prefill/decode interference but doesn't eliminate it — a burst of long prompts still steals cycles from in-flight decodes. Disaggregation takes it further: prefill and decode run on physically separate GPU pools, and the KV cache computed during prefill is *transferred* over NVLink or RDMA to the decode pool rather than recomputed. AMD's MORI-IO connector work splits one 8-GPU node into a 4-GPU prefill pool and a 4-GPU decode pool and reports about 2.5x higher goodput on identical hardware. The tradeoff is explicit and worth naming: TTFT goes *up*, because the request now hops between two pools, in exchange for much more stable inter-token latency. For a single-node moderate-QPS deployment, co-located chunked prefill is simpler and sufficient.
+
 ### A.3 Speculative decoding, current state
 
 As detailed in the Speculative Decoding section above, the field has moved from "small draft model" as the default mental model to a family of methods, with **EAGLE-3 / EAGLE-3.1** as the current state of the art for acceptance length (see the 2026-05-26 vLLM blog for the joint EAGLE/vLLM/TorchSpec numbers), **Medusa** as a simpler parallel-head alternative, and **n-gram/prompt-lookup** as a zero-extra-weights option for code/RAG-style repetition. AMD's Quark toolchain now also supports training and serving EAGLE-3 drafters on Instinct GPUs (vLLM blog, 2026-07-13), and Red Hat's developer blog (2026-04-16) documents concrete speedups applying speculative decoding to gpt-oss-style open models — evidence this is now routine production tooling, not a research curiosity.
 
+> **Saying it out loud.** The mental model has moved on from "speculative decoding means a small draft model." There are three families now. A separate small draft model is the classic, simple but needs a compatible checkpoint. N-gram or prompt-lookup drafting uses no extra weights at all — it just proposes tokens by matching repeated n-grams already in the prompt, which shines on code, tool-call replays, and RAG where output echoes input verbatim. And EAGLE-family methods attach a lightweight draft *head* to the target model's own hidden states, which is why they get much higher acceptance length than an independent draft of similar size. EAGLE-3.1 is the current state of the art. Tooling has caught up too — vLLM's `speculators` project can now train your own drafts against your traffic distribution.
+
 ### A.4 Quantization, current state
 
 `awq_marlin` and `gptq_marlin` (the Marlin-kernel-backed paths, see the Quantization section above) are the default fast path for 4-bit weight-only quantization on Ampere/Ada/Hopper today — vLLM auto-selects them when you request `awq`/`gptq` if the kernel is available for your hardware. FP8 W8A8 (via LLM Compressor / `llmcompressor`) is the standard Hopper-class recipe. NVIDIA Model Optimizer integration brings **NVFP4** onto vLLM's roadmap for Blackwell-class (B200/GB200) hardware — check the current `docs.vllm.ai/en/latest/features/quantization/` page for exact model/kernel coverage before committing to it, since this is the newest and fastest-moving corner of the quantization stack.
+
+> **Saying it out loud.** The current picture is simple enough to state in one breath. On Ampere, Ada, and Hopper, the Marlin-backed paths — `awq_marlin` and `gptq_marlin` — are the default fast path for 4-bit weight-only, and vLLM auto-selects them when you ask for AWQ or GPTQ if the kernel exists for your hardware. On Hopper-class, FP8 W8A8 via LLM Compressor is the standard recipe and is close to lossless in practice. And NVFP4 through NVIDIA's Model Optimizer is the emerging Blackwell-native 4-bit path. The caveat to attach every time: this is the fastest-moving corner of the stack, so check the current quantization docs for exact model and kernel coverage before you commit a production deployment to any of it.
 
 ### A.5 vLLM vs SGLang vs TensorRT-LLM, today
 
@@ -396,6 +444,8 @@ The three serious open-source-adjacent engines have converged on the same core i
 
 A representative **third-party** benchmark (Spheron Blog, "vLLM vs TensorRT-LLM vs SGLang: Which Is Fastest? H100 Benchmarks," dated **2026-03-23**; single H100 SXM5 80GB, Llama-3.3-70B-Instruct at FP8, 50 concurrent requests) reported: **TensorRT-LLM ≈ 2,100 tok/s**, **SGLang ≈ 1,920 tok/s**, **vLLM ≈ 1,850 tok/s** on raw output throughput, with TTFT p50 at 10 requests of **105 ms / 112 ms / 120 ms** respectively — but a **~28-minute TensorRT-LLM engine-compilation cold start** versus ~1 minute for vLLM and SGLang. Treat any single third-party number like this as a snapshot, not gospel — engines change fast, and you should always benchmark on your own model, hardware, and traffic shape before deciding. The qualitative conclusion that has held up across most 2025–2026 write-ups: **TensorRT-LLM wins raw throughput/latency on fixed NVIDIA hardware at the cost of build complexity and vendor lock-in; SGLang wins when prefix-sharing dominates your traffic (its RadixAttention is purpose-built for exactly that); vLLM remains the pragmatic default** for broad model support, hardware flexibility, and fast time-to-serve.
 
+> **Saying it out loud.** All three have converged on paged KV and continuous batching, so they now differentiate on specialization and operational cost. TensorRT-LLM wins raw throughput and latency on fixed NVIDIA hardware — a representative H100 benchmark put it around 2,100 tokens per second against SGLang's 1,920 and vLLM's 1,850 — but it pays for that with a roughly 28-minute per-model engine compilation versus about a minute for the other two, plus NVIDIA-only lock-in. SGLang's differentiator is RadixAttention, a radix-tree KV index purpose-built to maximize prefix sharing, so it wins when your traffic is chatbots, RAG, or agent loops. And vLLM stays the pragmatic default for breadth of model and hardware support and time-to-serve. Treat any single benchmark as a snapshot — benchmark your own model and traffic before deciding.
+
 ### A.6 Kubernetes-native orchestration: llm-d
 
 Running one `vllm serve` process is straightforward; running a *fleet* of disaggregated prefill and decode workers, each independently autoscaled, behind smart routing, is a distributed-systems problem in its own right. **llm-d** (announced 2025-05-20, authored by engineers from Red Hat, Google, and IBM, now a CNCF Sandbox project) exists to standardize that problem: it's a Kubernetes-native framework that, in its own words, provides "a well-lit path for anyone to serve at scale," built directly on top of vLLM rather than replacing it.
@@ -406,6 +456,8 @@ Concretely, llm-d integrates two pieces with vLLM:
 - **Disaggregated serving as a first-class deployment pattern** — llm-d's "well-lit paths" (its v0.2 release, per the llm-d blog) package the prefill/decode split from section (A.2) as a supported, documented Kubernetes deployment topology — separate prefill and decode `Deployment`s, independently autoscaled, with the KV-transfer connector wiring already solved — rather than something each team hand-rolls.
 
 **When it's worth adopting:** once you're already running vLLM behind Kubernetes at a scale where you'd otherwise be hand-building the routing and disaggregation plumbing from section (A.2) and (B) yourself. For a single-node or small-fleet deployment, plain `vllm serve` behind a conventional load balancer (with sticky routing by prefix hash if you want DIY prefix-affinity) remains simpler and is not something to give up prematurely.
+
+> **Saying it out loud.** Running one `vllm serve` is easy; running a fleet of independently-autoscaled disaggregated prefill and decode workers behind smart routing is a distributed-systems problem. llm-d exists to standardize that — a Kubernetes-native framework built on top of vLLM rather than replacing it, now a CNCF sandbox project. Two pieces matter. It uses the Gateway API Inference Extension, which routes on LLM-specific signals like prefix-cache affinity and queue depth instead of generic HTTP metrics — that turns prefix-cache hit rate from a per-replica property into a cluster-wide one. And it packages the prefill/decode split as a supported deployment topology with the KV-transfer wiring already solved. Worth adopting once you'd otherwise be hand-building that plumbing; premature otherwise.
 
 ### A.7 Timeline: how fast this space is moving
 
@@ -434,9 +486,13 @@ Treat this table as a snapshot as of this chapter's writing, not a permanent rec
 
 The single-GPU 8B walkthrough above teaches the knobs. Real "flagship" deployments — a 70B+ model, multiple nodes, a load test, and a principled read of *why* you're moving each dial — is where interviews (and production) actually live. This section builds that end to end.
 
+> **Saying it out loud.** The single-GPU walkthrough teaches you the knobs; the multi-node one is where interviews actually live, because it forces you to reason about topology, measurement, and cost together. The arc is: size the problem from the weight math, launch across nodes with the right TP-times-PP split, load-test it the way clients will actually hit it, read the Prometheus metrics to diagnose rather than guess, turn those metrics into alerts, and finally convert throughput into dollars per million tokens. Each of those steps is a place people skip straight to "we tuned it and it seemed fine" — and the difference between guessing and diagnosing is entirely in step four, reading KV cache usage and prefix hit rate side by side.
+
 ### B.1 Sizing the problem: Llama-3.1-70B, fp16, across 2 nodes
 
 Weights: \(70\text{B} \times 2\ \text{bytes} = 140\ \text{GB}\) — bigger than any single 80 GB GPU, and even TP-8 on one 8×80GB node leaves only \(80 - 140/8 = 62.5\ \text{GB}\) per GPU before KV, activations, and overhead — workable, but tight if you also want a large `--max-model-len` and high concurrency. We'll instead spread the model across **two 8-GPU nodes (16 GPUs total)**: `-tp 8` inside each node (over NVLink) and `-pp 2` across the two nodes (over the slower inter-node fabric), per the TP-first-then-PP rule from the Parallelism section above.
+
+> **Saying it out loud.** Start from the weight math. 70 billion parameters in fp16 is 140 gigabytes, which is bigger than any single 80-gig card. TP=8 on one 8-GPU node would put 17.5 gigabytes of weights on each card, leaving around 62 for KV and overhead — workable, but tight if you also want long context and high concurrency. So you spread across two 8-GPU nodes: TP=8 inside each node over NVLink, and PP=2 across the two nodes over the slower fabric. That's the tensor-parallel-first-then-pipeline rule applied concretely. And note what drove the decision — not "it doesn't fit," because it technically does, but the KV headroom left over after it fits, which is the number that determines your actual concurrency.
 
 ### B.2 Multi-node launch with Ray
 
@@ -503,6 +559,8 @@ vllm serve casperhansen/llama-3-70b-instruct-awq \
 
 Decision order, restated for a 70B+ model: **fit on one node with TP first → quantize to shrink weights and cut GPU count if hardware is scarce → go multi-node with PP only when a single node genuinely cannot hold model + working KV.**
 
+> **Saying it out loud.** vLLM's multi-node path runs on Ray: one node starts the Ray head, the other joins as a worker, and then you launch `vllm serve` exactly once, on the head node, with the combined tensor-parallel times pipeline-parallel world size. The thing that surprises people is that it's a single launch, not one per node — Ray places the workers for you. Two practical gotchas: the inter-node network has to actually be fast enough for the pipeline hand-off, and every node needs the same model weights accessible, which usually means a shared filesystem or a pre-warmed local cache. And your failure domain just got bigger — losing either node takes the whole replica down, which is why the readiness probe and router behavior matter more here than in the single-node case.
+
 ### Health checks and readiness probes
 
 A vLLM pod behind Kubernetes needs its readiness probe to reflect the real 60–90 second cold start from section C.3, not just "process is up":
@@ -526,6 +584,8 @@ livenessProbe:
 
 The distinction matters operationally: a **readiness** failure just removes the pod from the routing pool (correct during cold start); a **liveness** failure restarts the container (wrong during cold start — it would restart a pod that's still legitimately loading, resetting its progress and potentially causing the exact oscillation from section C.3). Give liveness a much longer `initialDelaySeconds` than readiness for precisely this reason.
 
+> **Saying it out loud.** A vLLM pod's readiness probe has to reflect a real 60-to-90-second cold start, not just "the process is up." That cold start is dominated by loading weights into GPU memory and then CUDA graph capture, and neither is something you can rush at probe time. So the probe hits an endpoint that only returns healthy once the engine is actually serving, and you give it a startup budget sized to the measured worst case — measured, not guessed. Getting this wrong has two distinct failure modes worth naming separately: too tight and Kubernetes crash-loops a perfectly healthy pod mid-load, too loose and the load balancer routes real traffic at a replica that isn't ready and every one of those requests times out.
+
 
 ### B.3 Benchmark run against the multi-node deployment
 
@@ -543,6 +603,8 @@ vllm bench serve \
 ```
 
 This reports, per run: **throughput (tokens/s, req/s)**, **TTFT** (p50/p90/p99), **ITL/TPOT** (p50/p90/p99), and total duration. Sweep `--request-rate` across a few values (e.g. 10, 20, 30, 50) to trace out a throughput-vs-latency curve — the shape you're looking for is a "knee" where p99 latency starts climbing steeply; that's your practical capacity ceiling, not whatever number a spec sheet claims.
+
+> **Saying it out loud.** Never tune by feel — load-test the deployment exactly the way clients will hit it. `vllm bench serve` against a realistic dataset like ShareGPT gives you throughput in tokens and requests per second, plus TTFT and inter-token latency at p50, p90, and p99. The important part isn't running it once, it's sweeping `--request-rate` across a few values — say 10, 20, 30, 50 — to trace the throughput-versus-latency curve. What you're looking for is the knee, the point where p99 starts climbing steeply while throughput has stopped rising. That knee is your practical capacity ceiling, and it's almost always well below whatever number a spec sheet or a vendor benchmark claims.
 
 ### B.4 Reading GPU memory utilization vs KV cache hit rate while tuning
 
@@ -567,6 +629,8 @@ curl -s http://<NODE0_IP>:8000/metrics | grep -E 'gpu_cache_usage_perc|gpu_prefi
 | Low–moderate | Dropping over time under load | Cache pressure is evicting prefix blocks before they're reused | Traffic doesn't have the reuse you assumed, or memory is too tight to keep both active batch and cached prefixes — reconsider whether prefix caching is earning its keep for this workload |
 
 The general principle: **KV cache usage tells you how full the tank is; prefix hit rate tells you how much of that fullness is "free" reused work versus active, paying-for-itself batch.** A full tank with a high hit rate is efficient. A full tank with a low hit rate and rising preemption is the KV over-commitment failure mode — tune `max-num-seqs`/`max-model-len`/`swap-space`, not `gpu-memory-utilization` upward.
+
+> **Saying it out loud.** This is the step people skip and it's the difference between guessing and diagnosing. Two metrics, read side by side. `gpu_cache_usage_perc` tells you how full the KV tank is; sustained near 1.0 means you're memory-bound and about to preempt. `gpu_prefix_cache_hit_rate` tells you what fraction of prefill tokens came from cache instead of being recomputed. The combination is what diagnoses. High usage with a high hit rate is healthy — the tank is full of reused work doing real good. High usage with a *low* hit rate and preemption warnings is the over-commitment failure mode, and the fix is lowering `max-num-seqs` or `max-model-len`, not raising `gpu-memory-utilization`. Usage tells you how full; hit rate tells you how much of that fullness is free.
 
 ### B.5 Observability: turning the metrics into alerts
 
@@ -608,17 +672,21 @@ groups:
 
 The key discipline: **alert on `VLLMPreemptionRateHigh` directly**, not only on downstream p99-latency SLO burn. Section (C.1)'s incident was visible in preemption logs minutes before it became a paging-worthy latency alert — closing that gap is the entire value of this dashboard. Pair it with a panel plotting `gpu_cache_usage_perc` and `gpu_prefix_cache_hit_rate` on the same time axis as request rate, so a traffic-shape change (e.g. the C.1 burst of long documents) is visually obvious as "cache usage climbed while hit rate stayed flat" rather than requiring someone to piece it together from logs after the fact.
 
+> **Saying it out loud.** Reading `/metrics` by hand during a tuning session is fine; leaving it there is not. The same signals belong on a Grafana dashboard with alerts that page *before* an SLO breach rather than after. A minimal high-signal set: KV cache usage sustained near full, preemption rate above zero for any meaningful window, queue depth trending up, and prefix cache hit rate dropping. The point that generalizes past vLLM: the metric that would have caught each of this chapter's incidents earliest is almost never the one on the primary latency-and-error-rate dashboard. Alerting only on SLO burn means you always find out after the users do — alerting on the engine's own internal pressure signals is what turns postmortems into things you catch in minutes.
+
 ### B.6 Cost-per-token worked calculation
 
-Tie the tuning knobs back to a dollar figure, since that's what a "lowest cost per token" system-design answer (section D.2) ultimately needs to produce. Using the multi-node Llama-3.1-70B deployment from B.1–B.2 as the base case, and approximate on-demand H100 pricing of **~\$2/GPU-hour** (use your actual contracted rate — this varies widely by cloud and commitment):
+Tie the tuning knobs back to a dollar figure, since that's what a "lowest cost per token" system-design answer (section D.2) ultimately needs to produce. Using the multi-node Llama-3.1-70B deployment from B.1–B.2 as the base case, and approximate on-demand H100 pricing of **~$2/GPU-hour** (use your actual contracted rate — this varies widely by cloud and commitment):
 
-| Configuration | GPUs | \$/hour (fleet) | Throughput (tok/s, from a `vllm bench serve` sweep) | Approx cost per 1M output tokens |
+| Configuration | GPUs | $/hour (fleet) | Throughput (tok/s, from a `vllm bench serve` sweep) | Approx cost per 1M output tokens |
 |---|---|---|---|---|
-| fp16, TP8×PP2 (B.2 Option A/C) | 16 | \$32/hr | ~2,000 tok/s aggregate | \$32 / (2000×3600/1e6) ≈ **\$4.44** |
-| AWQ 4-bit, TP2 (B.2 Option B) | 2 | \$4/hr | ~1,400 tok/s (single replica, smaller batch ceiling) | \$4 / (1400×3600/1e6) ≈ **\$0.79** |
-| FP8, TP4, one node | 4 | \$8/hr | ~1,800 tok/s | \$8 / (1800×3600/1e6) ≈ **\$1.23** |
+| fp16, TP8×PP2 (B.2 Option A/C) | 16 | $32/hr | ~2,000 tok/s aggregate | $32 / (2000×3600/1e6) ≈ **$4.44** |
+| AWQ 4-bit, TP2 (B.2 Option B) | 2 | $4/hr | ~1,400 tok/s (single replica, smaller batch ceiling) | $4 / (1400×3600/1e6) ≈ **$0.79** |
+| FP8, TP4, one node | 4 | $8/hr | ~1,800 tok/s | $8 / (1800×3600/1e6) ≈ **$1.23** |
 
 The arithmetic is simply \(\text{cost per 1M tokens} = \dfrac{\text{fleet \$/hr}}{\text{tokens/s} \times 3600 / 10^6}\). The point isn't that any one row is "correct" — real throughput numbers must come from your own `vllm bench serve` sweep against real traffic (section B.3), and real GPU pricing depends on your contract — it's that **this is the calculation an interviewer wants to see you reach for**, and that quantization plus right-sizing GPU count can move cost per token by 3–5× for the same model, which is usually a bigger lever than any single scheduler flag.
+
+> **Saying it out loud.** Tie the knobs to dollars, because that's what a "lowest cost per token" answer needs to produce. The arithmetic is just fleet dollars per hour divided by tokens per second times 3,600, over a million. Using roughly $2 per H100-hour as of this writing — use your own contracted rate, it moves a lot — a 16-GPU fp16 fleet at 2,000 tokens per second is about $4.44 per million output tokens, a 4-GPU FP8 setup at 1,800 tokens per second is about $1.23, and a 2-GPU AWQ 4-bit replica at 1,400 is about $0.79. The point isn't that any row is right — real throughput has to come from your own sweep. It's that quantization plus right-sizing GPU count moves cost per token by three to five times, which dwarfs any single scheduler flag.
 
 ### B.7 Smoke-test checklist before going live
 
@@ -633,6 +701,8 @@ A short, concrete pre-launch checklist that exercises the failure modes this cha
 7. **Failover / restart** — kill one replica (or one node, in the multi-node TP×PP case) under load and confirm the router removes it from rotation via the readiness probe without cascading latency elsewhere.
 
 None of these are exotic — each maps directly to one of the failure modes or war stories earlier in this chapter. Running them once, deliberately, before launch is far cheaper than discovering them live.
+
+> **Saying it out loud.** Seven things I'd run against the actual deployment before it sees traffic, and each one maps to a failure mode from earlier in the chapter. Check the startup logs match your hand calculation, because a mismatch means a flag didn't take. Send one request at exactly `max-model-len` to confirm it succeeds. Run a burst at your real expected peak and confirm zero preemption lines — if they appear, you're under-provisioned for the SLO, not just for the benchmark. Replay production-shaped traffic and confirm prefix hit rate is non-trivial if your design assumed reuse. Measure actual cold start and set the readiness probe from the measurement. Run the task-specific quality eval if you quantized. And kill a replica under load to confirm the router drops it cleanly.
 
 
 ---
@@ -654,6 +724,8 @@ None of these are exotic — each maps directly to one of the failure modes or w
 
 Reality check: the three have converged — TGI and TensorRT-LLM adopted paged KV and in-flight batching. **TensorRT-LLM often wins raw latency/throughput on NVIDIA** thanks to ahead-of-time kernel compilation, at the cost of a per-model engine-build step and NVIDIA lock-in. **vLLM wins on flexibility, ease, and hardware breadth**, and is the usual default. See section (A.5) above for SGLang's place in this picture and concrete 2026 benchmark numbers. Always benchmark on *your* model, hardware, and traffic shape before deciding.
 
+> **Saying it out loud.** The short comparison: vLLM gives you the best throughput per dollar out of the box with the broadest model support and a one-command setup. TGI is a solid production server that fits tightly into the Hugging Face ecosystem and has adopted most of the same ideas. TensorRT-LLM behind Triton gets you peak NVIDIA-GPU performance through ahead-of-time compiled engines, and it genuinely is faster — but it costs a per-model, per-shape compilation step that can run tens of minutes, plus NVIDIA-only lock-in. So the decision rule is about how fixed your deployment is: if the model and shapes are stable and long-lived, the compile cost amortizes and TensorRT wins. If you're iterating across model families, vLLM's time-to-serve is worth more than the last 15% of throughput.
+
 ---
 
 ## Failure modes and pitfalls
@@ -666,6 +738,8 @@ Reality check: the three have converged — TGI and TensorRT-LLM adopted paged K
 - **`max-num-batched-tokens` too low with chunked prefill off.** If a prompt exceeds the token budget and chunked prefill isn't enabled, requests fail. Keep chunked prefill on, or set the budget ≥ `max-model-len`.
 - **Assuming `max-num-seqs` is the batch limit.** Usually **KV memory** binds first. Raising `max-num-seqs` without KV headroom just causes preemption. Watch the `# GPU blocks` log, not just the seq cap.
 - **Prefix cache eviction under pressure.** Cached prefixes compete with active KV; under load they're evicted and hit rate falls — throughput quietly regresses. Size memory for both if prefix reuse is core to your workload.
+
+> **Saying it out loud.** The recurring vLLM failures, in rough order of frequency. OOM at startup from setting `gpu-memory-utilization` too high, because vLLM pre-allocates the KV pool and activation spikes push you over — back off to 0.90 and grow. Preemption and recompute thrash, when admitted sequences collectively exceed KV capacity; frequent `preempted` warnings mean you over-committed. Long-context blowup, where a handful of 128K requests eat the whole pool and starve everyone. Quantization quality loss that perplexity doesn't catch. Speculative decoding backfiring under high batch load. And the conceptual one: assuming `max-num-seqs` is your batch limit when KV memory almost always binds first — raising it without memory headroom just buys you preemption.
 
 ---
 
@@ -693,6 +767,8 @@ Real incidents read differently from tuning tables — they teach you what the f
 
 **Lesson:** preemption logs are not noise — they are the single earliest, cheapest signal that your admission control (`max-num-seqs`, `max-model-len`) is miscalibrated against your *actual* traffic distribution, not the average case you load-tested against. Size for your **tail** request shape, not your median, and alert on preemption rate directly rather than waiting for it to show up as a latency SLO breach.
 
+> **Saying it out loud.** A RAG assistant on one A100, sized and load-tested against typical traffic — short questions, twelve-hundred-token contexts, comfortably inside a 442,000-token KV budget. Then a launch drove users pasting entire six-to-eight-thousand-token documents for summarization, while normal short traffic continued. The KV pool filled, the scheduler started preempting, and preempted sequences got their KV discarded and recomputed later — so the system was redoing prefill work it had already done, which made it slower, which made it preempt more. p99 latency spiked while throughput looked deceptively normal. The lesson: your capacity number is a function of the *traffic shape*, not just the request rate, and a single long-context traffic class can invalidate a load test that was honest for the workload you had yesterday.
+
 ### C.2 A quantization choice that quietly hurt output quality
 
 **Setup:** a coding-assistant service moved a 34B code model from fp16 to **AWQ 4-bit weight-only quantization** to fit two GPUs instead of four, halving infrastructure cost. Pre-launch validation ran the standard perplexity check on a held-out slice of a general text corpus — the numbers looked fine, within ~1–2% of the fp16 baseline — and the team shipped.
@@ -708,6 +784,8 @@ Real incidents read differently from tuning tables — they teach you what the f
 3. Added the task-specific pass-rate eval to the **pre-deployment gate** for any future quantization or model change — perplexity remained a sanity check, but was no longer the sole quality gate.
 
 **Lesson:** quantization quality loss is *task-dependent*, and a generic proxy metric like perplexity can be flat-out blind to regressions that matter enormously to users on structured tasks (code, math, precise extraction). Before shipping any quantization change, validate on an eval set that resembles what your users actually do — and prefer FP8 over 4-bit weight-only when the hardware supports it and the task is precision-sensitive, exactly as the Quantization section above recommends.
+
+> **Saying it out loud.** This is the scariest kind of incident because nothing alerts. A coding-assistant team moved a 34B code model from fp16 to AWQ 4-bit to halve their GPU count, validated with a perplexity check on general text that came back within one or two percent, and shipped. Over the following two weeks, thumbs-down feedback climbed and tickets came in about "subtly broken code." Nothing crashed; latency, error rate, and perplexity were all green. The root cause is that perplexity averages over everything, while code correctness depends on a small number of high-precision decisions — matching brackets, off-by-one indices, exact argument order — that are disproportionately sensitive to quantization noise. The fix was FP8 instead of 4-bit, plus a task-specific pass-rate eval as a permanent pre-deployment gate.
 
 ### C.3 Autoscaling cold-start thrashing
 
@@ -726,6 +804,8 @@ Real incidents read differently from tuning tables — they teach you what the f
 
 **Lesson:** vLLM replicas are not fungible with stateless microservice pods for autoscaling purposes — a 60–90 second cold start (dominated by weight loading and CUDA graph capture) means the autoscaler must react to a **leading** signal (queue depth, request rate trend) with real lead time, not a **lagging** one (current utilization), or it will systematically over- and under-shoot during any traffic ramp. This is the same "measure the right signal, not just any green-looking metric" theme as section C.2, applied to the autoscaling layer instead of the quality-eval layer.
 
+> **Saying it out loud.** A chatbot behind an HPA scaling on GPU utilization at a 70% target. Traffic ramped 4x over ten minutes, the HPA correctly scheduled new pods — but each vLLM pod took 60 to 90 seconds to become ready, dominated by loading weights and CUDA graph capture. During that window the existing replicas absorbed the whole ramp, utilization stayed high, and the HPA kept asking for *more* replicas on top of ones still warming. When the first batch finally landed, capacity overshot, utilization dropped, and it started scaling back down right as the next wave arrived. The fix was scaling on `num_requests_waiting` — a leading signal — instead of current utilization, a lagging one, plus pre-baked weights and a scale-down cooldown. vLLM replicas are simply not fungible with stateless pods for autoscaling.
+
 ### C.4 On-call quick-reference: what these three incidents teach as a single checklist
 
 All three war stories reduce to the same underlying discipline — *know which signal actually leads the problem, and alert on that, not on its downstream symptom.* As a runbook a new on-call engineer can use directly:
@@ -738,6 +818,8 @@ All three war stories reduce to the same underlying discipline — *know which s
 | Prefix-cache hit rate silently dropped | `vllm:gpu_prefix_cache_hit_rate` alongside `gpu_cache_usage_perc` | Cache pressure evicting reused prefixes, or a genuine traffic-shape change | Confirm which with the B.4 table; add memory or reduce concurrency if it's pressure, investigate traffic if it's a shape change |
 
 The common thread across all four rows: **the metric that would have caught the problem earliest is almost never the one on the primary latency/error-rate dashboard.** Building the section-B.5 alerting rules directly from `vllm:*` Prometheus metrics — rather than only alerting on downstream SLO burn — is what turns these from postmortems into things you catch in minutes.
+
+> **Saying it out loud.** All three incidents reduce to one discipline: know which signal actually leads the problem, and alert on that rather than its downstream symptom. Paged for a p99 spike while throughput looks fine? Check the preemption counter first — that's KV over-commitment. Slow-building quality complaints with every standard metric green? That's a model or quantization change that hurt a narrow capability perplexity can't see. Oscillating replica count during ramps? That's an autoscaler on a lagging signal against a slow cold start. The common thread, and the thing worth saying explicitly: the metric that would have caught each of these earliest is almost never the one on your primary latency and error-rate dashboard.
 
 
 
@@ -754,6 +836,8 @@ The PagedAttention kernel therefore takes the **block table** as an input. For a
 3. Accumulates the softmax-weighted sum of V vectors from the same blocks.
 
 Because the block is the unit of gather, the kernel does a small indirection per block (once per 16 tokens), not per token — cheap relative to the matmul. The block table lives in GPU memory alongside the cache. Modern vLLM builds this on FlashAttention/FlashInfer backends that natively accept paged KV, so you keep FlashAttention's IO-awareness *and* paging. This is the crux: paging costs almost nothing at kernel time, yet returns most of the wasted memory as usable batch.
+
+> **Saying it out loud.** Interviewers probe this, so be precise. Standard fused attention like FlashAttention assumes a sequence's K and V live in one contiguous tensor it can stride through — and paged KV breaks that assumption outright, since the blocks are scattered in arbitrary order. So the PagedAttention kernel takes the block table as an *input*: for each query it reads the logical-to-physical mapping, computes attention scores against the K vectors in each physical block, and accumulates the softmax-weighted V sum block by block. The key efficiency point is that the block is the unit of gather, so the indirection happens once per sixteen tokens rather than once per token — negligible against the matmul. That's the crux: paging costs almost nothing at kernel time, and returns most of the wasted memory as usable batch.
 
 ---
 
@@ -772,6 +856,8 @@ Each iteration the scheduler:
 3. If **running** collectively needs more blocks than exist (e.g., all sequences grew a token and a new block boundary was crossed), it **preempts** the lowest-priority sequences — either **swap** (copy their KV blocks to CPU, restore later) or **recompute** (drop KV, re-run prefill when readmitted). Recompute is the default for short sequences; swap wins for long ones where recompute is expensive.
 
 The default policy is FCFS-ish with the newest/lowest-priority preempted first. The practical takeaway: **preemption is the pressure-relief valve, and seeing it constantly in logs means your admission settings exceed your true KV capacity.** It is correct behavior, not a bug — but it costs throughput, so tune it away. Section (C.1) walks through exactly this failure end to end.
+
+> **Saying it out loud.** The scheduler keeps three queues and reconciles them every single step. Waiting is admitted-but-not-started. Running is actively decoding or prefilling. Swapped is preempted sequences whose KV blocks are parked in CPU memory. Each iteration it frees blocks from anything that finished, tries to promote waiting requests into running subject to the block budget and the sequence and token caps, and if running collectively needs more blocks than exist, it preempts — either swapping KV to CPU or discarding and recomputing it later. Recompute is default for short sequences, swap wins for long ones where recompute is expensive. The takeaway to say out loud: preemption is the pressure-relief valve and it's correct behavior, not a bug — but seeing it constantly means your admission settings exceed your true KV capacity, and it costs throughput.
 
 ---
 
@@ -797,6 +883,8 @@ Metrics that matter, and what they mean:
 - **p50 vs p99** — always look at the tail. High p99 with fine p50 usually means preemption or prefill interference.
 
 Sweep one knob at a time (`gpu-memory-utilization`, `max-num-batched-tokens`, `max-num-seqs`) and plot throughput vs p99 latency. The right operating point is the knee of that curve for your SLO — not the max-throughput point, which usually violates latency targets. Section (B.3)–(B.4) above extends this to a multi-node 70B deployment and shows how to read the Prometheus KV-cache-usage and prefix-hit-rate metrics alongside it.
+
+> **Saying it out loud.** Never tune by feel — vLLM ships a benchmark harness that mirrors real serving, and the discipline is one knob at a time. The four metrics that matter: throughput in tokens and requests per second, which is what you maximize for batch work; TTFT, which is what a chat user feels as lag before anything happens; inter-token latency, which is decode smoothness and is what gets hurt by big un-chunked prefills; and always p50 versus p99, because a fine p50 with a bad p99 almost always means preemption or prefill interference specifically. Then plot throughput against p99 latency and pick the knee of that curve for your SLO — deliberately *not* the max-throughput point, which will violate your latency target.
 
 ---
 
@@ -838,6 +926,8 @@ vllm serve casperhansen/llama-3-70b-instruct-awq \
 
 Decision order: **fit on one node with TP first; quantize to shrink weights and cut GPU count; go multi-node with PP only when a single node genuinely cannot hold model + working KV.**
 
+> **Saying it out loud.** An 8B fits one card; a 70B in fp16 is 140 gigabytes of weights, so it does not. The options in the order you'd consider them: tensor-parallel across four or eight GPUs on one node over NVLink, which is the first thing to try because intra-node all-reduce is cheap. Quantize to 4-bit or FP8, which can bring a 70B down to two or four cards and is often the bigger cost lever. Or go multi-node with pipeline parallelism across nodes on top of tensor parallelism within them. The reasoning to make explicit: you're not just asking "does it fit," you're asking "how much KV headroom is left after it fits," because that leftover is what determines concurrency and therefore cost per token.
+
 ---
 
 ## Reading the startup logs (your first diagnostic)
@@ -857,6 +947,8 @@ INFO ... # GPU blocks: 27648, # CPU blocks: 2048
 - **# CPU blocks** — swap capacity, sized by `--swap-space`.
 
 If you never look at anything else, look at these four lines. They convert the abstract flags into the one number that governs throughput: how many tokens of KV you can hold.
+
+> **Saying it out loud.** Four log lines at startup tell you whether your config is sane, and reading them takes ten seconds. Available KV cache memory is what's left after weights and overhead — if it's tiny, lower `max-model-len`, quantize, or add GPUs. GPU KV cache size in tokens is your total batch budget; divide by average request length for realistic concurrency. Maximum concurrency is how many full-context sequences fit at once, and if that's below your expected load you *will* preempt under traffic. And CPU blocks is your swap capacity from `--swap-space`. If you look at nothing else, look at those four, because they convert abstract flags into the single number that governs throughput: how many tokens of KV you can hold.
 
 ---
 
@@ -927,13 +1019,15 @@ A realistic senior-level prompt. Worked sketch, in the order an interviewer want
 
 | Candidate config | Cost per 1M tokens (B.6) | Meets TTFT SLO at target QPS? | Decision |
 |---|---|---|---|
-| AWQ 4-bit, TP2, one node | ~\$0.79 | No — smaller batch ceiling and 2 GPUs undersized for peak concurrency, TTFT p99 blows past 500 ms under load | Reject: cheapest per token but violates the SLO, which is a hard constraint, not a soft preference |
-| FP8, TP4, one node | ~\$1.23 | Yes, with headroom, and validated against a task-specific eval (section C.2) | **Likely pick** — clears the SLO and is meaningfully cheaper than the fp16 fleet |
-| fp16, TP8×PP2, two nodes | ~\$4.44 | Yes, with the most headroom | Reject as the default: clears the SLO but at ~3.6× the cost of the FP8 option for no additional SLO benefit — only justified if FP8 fails the quality eval |
+| AWQ 4-bit, TP2, one node | ~$0.79 | No — smaller batch ceiling and 2 GPUs undersized for peak concurrency, TTFT p99 blows past 500 ms under load | Reject: cheapest per token but violates the SLO, which is a hard constraint, not a soft preference |
+| FP8, TP4, one node | ~$1.23 | Yes, with headroom, and validated against a task-specific eval (section C.2) | **Likely pick** — clears the SLO and is meaningfully cheaper than the fp16 fleet |
+| fp16, TP8×PP2, two nodes | ~$4.44 | Yes, with the most headroom | Reject as the default: clears the SLO but at ~3.6× the cost of the FP8 option for no additional SLO benefit — only justified if FP8 fails the quality eval |
 
 This is the shape of answer that closes the loop: **the cheapest option that still clears the hard latency constraint, chosen from measured numbers, not the cheapest option in isolation and not the safest-but-most-expensive option by default.**
 
 A strong answer names the tension between cost and latency explicitly at each step, rather than treating them as independently optimizable — that's usually the actual signal the interviewer is listening for.
+
+> **Saying it out loud.** The structure that wins this one: treat the SLO as a hard constraint and cost as the thing you minimize inside it — never the other way round. So first, do the weight and KV math to enumerate feasible configurations: fp16 across two nodes, FP8 on one node, 4-bit on two GPUs. Second, compute cost per million tokens for each from a real `vllm bench serve` sweep, not a guess. Third, check each against the TTFT SLO under real load, and reject anything that violates it *regardless* of how cheap it is — the 4-bit config is often cheapest per token and still the wrong answer because its batch ceiling blows the tail latency. Fourth, gate the quantized option on a task-specific quality eval, not perplexity. That sequencing is the signal being graded.
 
 ### D.3 Red flags vs green flags
 

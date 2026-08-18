@@ -10,6 +10,8 @@ Containers are also the unit that Kubernetes, Nomad, ECS, and every autoscaler s
 
 The intuition first, then the exact mechanisms.
 
+> **Saying it out loud.** The reason containerizing an LLM server is different from containerizing a normal web app comes down to two things: it needs a physical GPU handed into the container, and it depends on tens of gigabytes of model weights you really don't want to redownload on every restart. Get either wrong and you hit a very predictable set of failures — a 40 GB image, a container that can't see the GPU, a `CUDA driver version is insufficient` on some nodes but not others, or a Hugging Face token baked permanently into a layer. And this matters beyond convenience, because the image is the unit that Kubernetes and every autoscaler schedules, so a bad image is a bad foundation for everything downstream. The one thing I'd lead with: the driver lives on the host, the container only ships CUDA userspace, and that contract is the source of most GPU container pain.
+
 ---
 
 ## Core intuition
@@ -23,6 +25,8 @@ Three ideas carry most of the weight.
 **3. Build image ≠ runtime image.** The tools you need to *compile* CUDA kernels (nvcc, headers, build-essential) are hundreds of MB you never need to *run* the server. Multi-stage builds let you compile in a fat stage and copy only the artifacts into a lean runtime stage.
 
 Hold these three and the rest is detail.
+
+> **Saying it out loud.** Three ideas do most of the work here. First, the container does not have its own GPU driver — the driver is a kernel module on the host, and the container only ships the userspace CUDA libraries, so the host driver has to be new enough for whatever CUDA version you built against. Second, weights are data, not code: your code changes daily and is tiny, a 14 GB checkpoint changes rarely and is huge, so coupling them into one artifact means every one-line code fix redistributes the whole model. Third, the image you build in is not the image you ship — nvcc and headers are gigabytes you need to compile and never need to run. Hold those three and everything else in this chapter is detail.
 
 ---
 
@@ -50,6 +54,8 @@ There are three flavors, and picking the wrong one is a common source of bloat:
 
 Rule of thumb: build in `devel`, ship on `runtime`. If your framework ships prebuilt wheels (most do), you may not even need `devel`.
 
+> **Saying it out loud.** NVIDIA publishes three flavors of CUDA base image and picking the wrong one is the most common source of bloat. `base` is minimal CUDA runtime libraries, a couple hundred megabytes. `runtime` adds the math libraries like cuBLAS and optionally cuDNN — call it two to three gigabytes, and that's what you actually ship. `devel` adds nvcc, headers, and static libraries, which puts you at five to seven gigabytes, and you only need that if you're compiling CUDA kernels. So the rule is: build in `devel`, ship on `runtime` — and pin the minor version explicitly, `12.4.1` not `12`, because `12` is a moving target that will silently change under you.
+
 ### Driver/runtime compatibility
 
 The host driver exposes a maximum supported CUDA version. CUDA has *forward compatibility* within a major version and *minor-version compatibility* so that, e.g., a driver supporting CUDA 12.2 can generally run CUDA 12.4 userspace on data-center GPUs via the compat package — but do not rely on this casually. The safe posture:
@@ -66,6 +72,8 @@ CUDA driver version is insufficient for CUDA runtime version
 
 That means the container's CUDA userspace is newer than the host driver can serve. Fix by upgrading the host driver or downgrading the image's CUDA version — you cannot fix it inside the image. (See the "driver skew across a mixed GPU fleet" case study later in this chapter — this exact error is what took down one team's rollout.)
 
+> **Saying it out loud.** This is the single most important contract in GPU containers: the host's driver has to be new enough for the CUDA userspace inside your image, and you cannot fix a violation from inside the image. Check the host with `nvidia-smi` — it reports a driver version and the maximum CUDA version that driver supports — then pick a container CUDA version at or below it, pinned to the minor. If you get it wrong you see exactly one error: `CUDA driver version is insufficient for CUDA runtime version`, and the only fixes are upgrade the host driver or ship a lower-CUDA image. The nasty version of this failure is a mixed-generation fleet, where a third of your pods come up healthy and two-thirds crash-loop, so it looks like a flaky partial outage rather than a version mismatch.
+
 ### GPU partitioning: MIG and time-slicing
 
 Two GPUs is not always the right unit of allocation — sometimes you want to run several smaller inference workloads on one physical GPU. NVIDIA data-center GPUs (A100/H100-class) support two partitioning mechanisms, and interviewers like to check you know the difference:
@@ -75,15 +83,21 @@ Two GPUs is not always the right unit of allocation — sometimes you want to ru
 
 For a single dedicated LLM server per GPU (the common case in this chapter's examples), neither matters — you're using the whole device. They become relevant once you're packing multiple smaller models or replicas onto shared GPUs, which is a natural follow-up question after "how do you containerize a model server" in a systems-design interview.
 
+> **Saying it out loud.** If you want to run several small workloads on one physical GPU, there are two ways and they give you very different guarantees. MIG — Multi-Instance GPU — is hardware partitioning: an A100 or H100 splits into up to seven fully isolated instances, each with its own dedicated slice of SMs, memory, and memory bandwidth, and one instance genuinely cannot starve another. Time-slicing is software: the driver just multiplexes compute between containers sharing the whole card, with no memory isolation at all, so one container can allocate all the VRAM and OOM its neighbors. So the tradeoff is real isolation with fixed, host-configured partition sizes versus trivial setup with no guarantees. For hard multi-tenancy you use MIG; time-slicing is for dev, test, or workloads you already trust.
+
 ### The CUDA forward-compatibility package
 
 The "pin container CUDA ≤ host driver" rule earlier in this section has one documented escape hatch worth knowing by name: NVIDIA ships a **CUDA forward-compatibility package** for data-center GPUs that lets a container built against a newer CUDA toolkit run on an older driver than would normally be required, by shipping a compatible driver shim inside the container image itself. It is intentionally scoped — it applies to data-center GPU driver branches, not consumer GPUs, and it does not make every combination of "any CUDA version on any driver" work. Treat it as a documented exception for a specific, narrow upgrade-sequencing problem (e.g., you need to ship a newer CUDA-versioned image before every node's driver has been upgraded yet), not as a reason to stop tracking the driver/CUDA contract explicitly.
+
+> **Saying it out loud.** There's one documented escape hatch from the "container CUDA must be no newer than the host driver" rule, and it's worth knowing by name: NVIDIA's CUDA forward-compatibility package ships a driver shim inside the image so a newer CUDA toolkit can run on an older driver. It's deliberately narrow, though — it's scoped to data-center GPU driver branches, not consumer cards, and it does not make arbitrary CUDA-version-on-arbitrary-driver combinations work. The right way to think about it is as a solution to an upgrade-sequencing problem: you need to ship a newer image before every node's driver has been rolled. It is not a reason to stop tracking the driver contract explicitly, and treating it as one is how you end up debugging a partial outage across a mixed fleet.
 
 ---
 
 ## Mechanism 2 — The NVIDIA Container Toolkit and `--gpus`
 
 A plain `docker run` gives the container no GPU. Two pieces make it work.
+
+> **Saying it out loud.** A plain `docker run` gives your container zero GPUs — you have to explicitly wire it up, and there are two pieces. On the host you install the NVIDIA Container Toolkit once and register it with the Docker daemon; that's the thing that mounts the host driver's libraries and device nodes into the container at startup. Then at run time `--gpus all` or `--gpus '"device=0,1"'` selects which devices to expose. Note what you install on the host: the driver, and the toolkit — not the CUDA toolkit, that lives in your image. And the very first diagnostic when a container "can't see the GPU" is `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`; if that fails, the problem is host-level and you should stop debugging your application.
 
 ### The toolkit
 
@@ -109,6 +123,8 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 
 If that prints your GPU table, host driver + toolkit + runtime are all good. This is the first thing to run when a GPU container "can't see the GPU."
 
+> **Saying it out loud.** The toolkit is a set of host packages plus a runtime shim, and what it actually does is inject the host's driver libraries and `/dev/nvidia*` device nodes into your container when it starts. You install it once per host with the package manager, then run `nvidia-ctk runtime configure --runtime=docker` to write the nvidia runtime into the Docker daemon config, and restart Docker. The prerequisite people trip on is that the NVIDIA *driver* must already be installed on the host — the toolkit doesn't install it. And the verification is one command: run `nvidia-smi` inside a stock CUDA base image with `--gpus all`. If that prints your GPU table, then driver, toolkit, and runtime registration are all correct, and any remaining problem is yours.
+
 ### `--gpus`
 
 Once the toolkit is installed, `--gpus` selects which GPUs to expose:
@@ -128,6 +144,8 @@ Under the hood this sets `NVIDIA_VISIBLE_DEVICES` and triggers the toolkit's inj
 ## Mechanism 3 — Handling large model weights
 
 This is where architecture decisions bite hardest. You have three classic options, plus a fourth that emerged in 2025.
+
+> **Saying it out loud.** Where the weights live is the biggest architectural decision in this chapter, and there are basically four answers. You can bake them into the image — hermetic and air-gap-friendly, but now your image is 15 to 150 gigabytes and every code change redistributes the whole checkpoint. You can mount them as a volume, which is what the official vLLM and TGI images assume and what most production does. You can download them at startup into a persistent cache, which is smallest and most flexible but pays a multi-gigabyte cold start. Or, newer, you can ship them as a separate OCI artifact versioned independently of the engine. The failure mode I'd name for option C: if the cache volume isn't actually persistent, you redownload the whole model on every single restart, and that bill is real.
 
 ### Option A — Bake weights into the image
 
@@ -157,7 +175,7 @@ The container downloads weights from Hugging Face (or S3/GCS) on first boot into
 
 ### The Hugging Face cache — make it persist
 
-The `huggingface_hub` library caches downloads under `HF_HOME` (default `~/.cache/huggingface`; the hub cache is `\(HF\_HOME\)/hub`). The env vars that matter:
+The `huggingface_hub` library caches downloads under `HF_HOME` (default `~/.cache/huggingface`; the hub cache is `$HF_HOME/hub`). The env vars that matter:
 
 - `HF_HOME` — root of all HF caches. Set this and everything follows.
 - `HF_HUB_CACHE` (older: `HUGGINGFACE_HUB_CACHE`) — the model blob cache specifically.
@@ -175,6 +193,8 @@ The whole point of Options B/C is to mount a volume at the cache path so weights
 
 Miss this mount and every `docker run` redownloads the model — slow, costly, and rate-limit-prone.
 
+> **Saying it out loud.** This is a two-line fix for a genuinely expensive bug. The `huggingface_hub` library caches downloads under `HF_HOME`, defaulting to `~/.cache/huggingface`, and if you don't mount a persistent volume at that path, every `docker run` redownloads the entire model from scratch. The exact path differs by image — vLLM's official image caches at `/root/.cache/huggingface`, while TGI sets the cache to `/data` — so you mount to whichever one your image actually uses. Set `HF_HOME` explicitly and everything else follows, and pass `HF_TOKEN` at runtime for gated models rather than baking it into a layer. The cost of missing this isn't just slow starts: it's bandwidth charges and getting rate-limited by the Hub at exactly the moment you're scaling up.
+
 ### Quantization formats and their effect on image and weight size
 
 Weight size is not a fixed property of a model — the quantization format you choose shifts it by 2–4x, which feeds directly back into the bake/mount/download decision above. A 70B-parameter model is roughly 140 GB in fp16, roughly 70 GB in int8, and commonly 35–40 GB in 4-bit formats (GPTQ, AWQ, or GGUF's `Q4_K_M`-style schemes). This matters for containerization in three concrete ways:
@@ -182,6 +202,8 @@ Weight size is not a fixed property of a model — the quantization format you c
 - **Bake-into-image (Option A) becomes far more viable** for a 4-bit-quantized model than for the fp16 original — a 35 GB image is still large, but it is a very different operational proposition than a 140 GB one, and may cross the threshold into "acceptable for our registry and node bandwidth."
 - **The serving engine constrains the format.** vLLM, TGI, and TensorRT-LLM each support a different subset of quantization schemes with different kernel-level performance, so "which quantization format" and "which base image" are coupled decisions — you can't pick a format your engine's image doesn't have kernels for and expect the speed benefit to materialize.
 - **Quantized weights still deserve the same weights-vs-code separation** as the fp16 case — the file is smaller, but it is still large, slow-changing data, and belongs on a mounted volume or content-addressed artifact rather than baked into a layer that gets rebuilt every time the application code changes, for the same CI/registry-cost reasons covered in the war stories below.
+
+> **Saying it out loud.** Weight size isn't a fixed property of a model — quantization moves it by two to four times, and that feeds straight back into the bake-versus-mount decision. A 70B model is roughly 140 GB in fp16, about 70 GB in int8, and commonly 35 to 40 GB in 4-bit schemes like GPTQ, AWQ, or GGUF's Q4_K_M. That difference can genuinely flip "bake into the image" from absurd to merely large. Two catches worth naming. Your serving engine constrains the format — vLLM, TGI, and TensorRT-LLM each support different subsets with different kernel performance, so format and base image are a coupled decision. And even at 35 GB, weights are still slow-changing bulk data, so they still belong on a volume or an artifact rather than in a layer your CI rebuilds on every commit.
 
 
 ---
@@ -191,6 +213,8 @@ Weight size is not a fixed property of a model — the quantization format you c
 ### Multi-stage
 
 A multi-stage build uses multiple `FROM` statements. Early stages compile; the final stage copies only what's needed. For an LLM server that means: compile custom kernels / install a heavy build toolchain in a `devel` stage, then `COPY --from=builder` the installed environment into a slim `runtime` stage. The `devel` layers never ship.
+
+> **Saying it out loud.** A multi-stage build just means multiple `FROM` statements in one Dockerfile: an early stage does the heavy work, and the final stage copies only the finished artifacts. For an LLM server that's concrete — install into a virtualenv in a `devel` base that has nvcc and build-essential, then `COPY --from=builder /opt/venv` into a slim `runtime` base and never ship the compilers. The win is straightforward: you're dropping three to four gigabytes of build toolchain that has no business being on a production node, and every one of those packages is CVE surface you'd otherwise have to answer for in a security review. Cost is essentially nothing — a slightly longer Dockerfile.
 
 ### Targeting specific GPU architectures: `TORCH_CUDA_ARCH_LIST`
 
@@ -204,6 +228,8 @@ RUN pip install --no-binary :all: torch
 ```
 
 This is a build-stage-only concern — it has no effect once you're installing prebuilt wheels (the common, recommended path from Mechanism 4) — but it's worth knowing by name for the case where you *are* compiling from source, since it's a direct, fast answer to "why is our custom-kernel build so slow" or "why is this wheel so large" in a design discussion.
+
+> **Saying it out loud.** If you're compiling CUDA kernels from source, PyTorch defaults to targeting a broad list of GPU compute capabilities so the resulting wheel works on everything from an older card to an H100. That breadth costs real build time and binary size, and it's mostly wasted if you know exactly which SKUs you deploy on. Setting `TORCH_CUDA_ARCH_LIST` to just the architectures you actually run — say `"8.0 9.0"` for A100 and H100 — narrows the compiled kernel set to those. The important caveat: this only matters in a build stage that actually compiles. If you're installing prebuilt wheels, which is the recommended path, it does nothing. But it's a fast, specific answer to "why is our custom-kernel build twenty minutes long."
 
 
 ### Layer caching order
@@ -222,6 +248,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 ```
 
+> **Saying it out loud.** Docker caches each instruction as a layer and reuses it until an input changes — and crucially, everything *after* a changed layer gets rebuilt. So you order your Dockerfile from least volatile to most volatile: base image, then system packages, then dependency manifests and `pip install`, then finally your application source. The concrete win is copying `requirements.txt` and installing before you copy your code, so a one-line code change reuses the cached PyTorch install instead of reinstalling several gigabytes. Add a BuildKit cache mount on the pip cache and even a genuine dependency change gets faster. Get the order backwards and every trivial commit reinstalls your entire CUDA-linked dependency tree — that's minutes per build, on every build.
+
 ### Registry-backed BuildKit cache in CI
 
 Layer caching (above) only helps within a single machine's local Docker cache. CI runners are frequently ephemeral or shared across many jobs, so the local cache that made your dependency layer fast on your laptop may not exist on the runner that picks up the next PR — which is exactly the trap that made War story 2's 40 GB image so painful in CI. BuildKit's registry cache backend fixes this by pushing/pulling the build cache itself as a registry artifact, so any runner can warm its cache from the last successful build regardless of which machine ran it:
@@ -234,6 +262,8 @@ docker buildx build \
 ```
 
 `mode=max` caches every intermediate layer (not just the final stage), which matters for multi-stage Dockerfiles like the one in this chapter — otherwise the builder stage's expensive `pip install` layer isn't reusable across runners even though the final runtime-stage layers are. Combined with keeping weights out of the build context entirely (Mechanism 3), this is what keeps CI build times in the range War story 2's fix achieved (under two minutes) rather than the 25-plus minutes the baked-weights version suffered.
+
+> **Saying it out loud.** Layer caching only helps on a machine that still has the cache, and CI runners are typically ephemeral or shared — so the dependency layer that's instant on your laptop is a cold build on whichever runner picks up the next PR. The fix is BuildKit's registry cache backend: push the build cache itself to your registry as an artifact with `--cache-to type=registry`, and any runner can warm from the last successful build with `--cache-from`. Use `mode=max` so intermediate stages get cached too, otherwise your builder stage's expensive `pip install` isn't reusable at all in a multi-stage Dockerfile. Combined with keeping weights out of the build context, this is the difference between the 25-plus-minute CI builds in war story two and builds under two minutes.
 
 
 ### `.dockerignore`
@@ -254,6 +284,8 @@ data/
 ```
 
 This is also your first line of defense against `COPY . .` accidentally baking weights or a `.env` file into a layer.
+
+> **Saying it out loud.** The build context is everything Docker uploads to the daemon before it even starts building, and without a `.dockerignore` that includes your `.git` directory, your `__pycache__`, your `.env` file, and any stray checkpoint sitting in `models/`. So it's slow *and* it's a secret-leak vector. A minimal one excludes `.git`, `*.pyc`, `*.pt`, `*.safetensors`, `models/`, `data/`, and `.env`. Think of it as the first line of defense against a careless `COPY . .` baking a 30 GB checkpoint or a live Hugging Face token into a layer that then gets pushed to a registry — and remember that once a secret is in image history, deleting the file in a later layer does not remove it.
 
 ---
 
@@ -289,11 +321,15 @@ The long `start-period` matters: model load can take minutes, and you don't want
 
 **Config via env, not baked files.** Model id, tensor-parallel size, port, and dtype should be env vars / CLI args so one image serves many configs.
 
+> **Saying it out loud.** Four habits separate a demo image from a production one. Pin everything — base image by digest, Python deps by lockfile, your own image by an immutable version tag, never `:latest`. Run as non-root, because a container escape from UID 0 is a much worse day than one from an unprivileged user. Keep secrets out of layers entirely: no `ENV HF_TOKEN=`, no `COPY .env` — pass them at runtime or use BuildKit secret mounts, because image history is forever. And add a HEALTHCHECK with a generous `start-period`, something like 180 to 300 seconds, because model load genuinely takes minutes and the classic self-inflicted failure is your orchestrator killing the container while it's still legitimately warming up.
+
 ---
 
 ## Mechanism 6 — Operating the container: logs, exec, monitoring, and shutdown
 
 Building the image is half the job; running it in production for months is the other half. A few operational mechanics are specific to GPU containers and worth knowing cold.
+
+> **Saying it out loud.** Building the image is half the job; running it for months is the other half, and a few things here are GPU-specific. Log to stdout in structured JSON so an aggregator can read it, not to a file inside the container nobody mounts out. When something's wrong, `docker exec` in and run `nvidia-smi` from *inside* the container — it shows exactly which processes in this container are holding GPU memory. Watch GPU memory utilization, not just compute, because a server can look completely idle on the compute graph while sitting at 95% VRAM. And give yourself a real shutdown grace period, because Docker's default is ten seconds and that's not enough to drain an in-flight generation.
 
 ### Logs and exec
 
@@ -304,6 +340,8 @@ docker exec -it my-llm-server nvidia-smi        # GPU state as seen by *this* co
 docker exec -it my-llm-server nvidia-smi pmon   # per-process GPU utilization inside the container
 ```
 
+> **Saying it out loud.** Two everyday tools. `docker logs -f` streams stdout and stderr, which is why your server should log there rather than to a file inside the container that no aggregator will ever see — and structured JSON lines make that downstream parsing actually work. Then `docker exec -it <container> bash` drops you inside a running container, and the single most useful thing to run there is `nvidia-smi`. It reflects the same driver and devices as the host because the toolkit injected them, and its process list tells you precisely which processes in *this* container are holding GPU memory. That's what lets you distinguish a genuine OOM from fragmentation from some other process on the card — a distinction you cannot make from the host view alone.
+
 ### Monitoring GPU utilization and health from outside the container
 
 For host-level and fleet-level observability, don't rely on shelling into every container. Two standard options:
@@ -313,12 +351,16 @@ For host-level and fleet-level observability, don't rely on shelling into every 
 
 The metric to alert on that's easy to miss: **GPU memory utilization**, not just compute utilization. A server can show low SM utilization (looks "idle") while sitting at 95% VRAM usage from an oversized KV cache or a memory leak across requests — the next allocation OOMs with no warning if you were only watching compute.
 
+> **Saying it out loud.** Don't build your GPU observability on shelling into containers. For a quick manual look, `nvidia-smi dmon` on the host gives you a live per-GPU stream. For anything durable, you run NVIDIA's `dcgm-exporter` as a sidecar or daemonset and it exposes utilization, memory, ECC errors, power, and temperature as Prometheus metrics you can label back to the owning pod. The metric that's easy to miss, and the one I'd insist on alerting: GPU *memory* utilization, separately from compute. A leaking KV cache will push you to 95% VRAM while SM utilization stays boringly flat, and then the next allocation OOMs with zero warning on the dashboard everyone was watching.
+
 ### Resource limits: what cgroups do and do not control for GPUs
 
 The `deploy.resources.limits`/`reservations` block shown earlier in this chapter's compose file controls **CPU and memory** through the host's cgroups — Docker genuinely enforces those. It does **not** give you an equivalent hard limit on GPU compute or GPU memory the way it does for CPU shares or RAM. `--gpus` controls *which* GPUs a container can see, not *how much* of a shared GPU's compute or memory it's capped at using cgroups semantics. Practically:
 
 - If you run one container per GPU (the common pattern for LLM serving, since a large model typically wants a whole device or several via tensor-parallel), this limitation doesn't bite — the container has the whole GPU and there's nothing else to contend with.
 - If you deliberately share a GPU across containers (time-slicing, or just running two processes on one device without MIG), nothing at the container-runtime layer stops one from allocating all the VRAM and OOM-ing the other. NVIDIA's **MPS (Multi-Process Service)** can give more predictable compute sharing between cooperating processes, and MIG (above) gives hardware-enforced isolation — but plain Docker resource limits do not extend to the GPU the way they do to CPU/RAM. Don't assume `mem_limit` or `cpus` in your compose file constrains GPU memory; it doesn't.
+
+> **Saying it out loud.** This one catches people: the CPU and memory limits in your compose file are enforced by the host's cgroups and are genuinely real, but there is no cgroup equivalent for the GPU. `--gpus` controls *which* devices a container can see, not how much of a shared device it's allowed to consume. So if you run one container per GPU — the normal pattern for LLM serving, since a big model wants a whole card or several — this never bites you, because there's nothing to contend with. But if you deliberately share a card between containers, nothing at the runtime layer stops one from allocating all the VRAM and OOM-ing the other. MPS gives more predictable compute sharing between cooperating processes; MIG gives hardware-enforced isolation. `mem_limit` gives you nothing.
 
 ### Graceful shutdown and restart policy
 
@@ -328,6 +370,8 @@ The `deploy.resources.limits`/`reservations` block shown earlier in this chapter
 - Handle SIGTERM in the application itself if the framework allows it — stop accepting new requests immediately (so the load balancer's health/readiness check can flip and stop routing new traffic) while letting in-flight requests complete within the grace window, rather than dropping everything the instant SIGTERM arrives.
 
 Restart policy (`restart: unless-stopped` used in this chapter's compose file, or `on-failure` with a max retry count) determines what happens after a crash. For a GPU server, prefer a policy with a capped retry count or backoff over unconditional restart-forever: a driver mismatch or an OOM that recurs deterministically on every restart will otherwise crash-loop indefinitely, burning GPU-node scheduling slots and generating alert noise, when what you actually want after N failures is for the orchestrator to mark the replica unhealthy and stop retrying until a human looks at it.
+
+> **Saying it out loud.** `docker stop` sends SIGTERM, waits ten seconds by default, then SIGKILLs — and ten seconds is often not enough for an LLM server to finish streaming an in-flight generation. So you do two things. Raise the grace period past your longest expected generation, `stop_grace_period` in compose or `terminationGracePeriodSeconds` in Kubernetes. And handle SIGTERM in the app: immediately stop accepting new work so the readiness check flips and the load balancer drains you, while letting in-flight requests finish inside the window. On restart policy, prefer a capped retry or backoff over restart-forever, because a driver mismatch or a deterministic OOM will crash-loop indefinitely, burning scarce GPU scheduling slots and generating alert noise instead of getting a human's attention.
 
 ### A debugging playbook for "the container won't come up"
 
@@ -340,6 +384,8 @@ When a GPU container fails on a node and the cause isn't obvious from the first 
 5. **Is the healthcheck timing out during legitimate model load, or is the process actually wedged?** Check `docker logs -f` for load-progress output and compare elapsed time against `start-period`; don't assume a failed healthcheck means a hung process without checking whether it's simply still loading.
 6. **Is this node's driver actually the one you tested against?** On a mixed-generation fleet, confirm the specific node's driver version rather than assuming fleet-wide uniformity — this is the failure mode from War story 1 below, and it is easy to lose an hour to before checking it directly.
 
+> **Saying it out loud.** When a GPU container won't start, work cheapest-check-first instead of reading the application logs. Step one: does a stock CUDA base image with `--gpus all` print `nvidia-smi` on this host? If not, it's host-level — toolkit, runtime, or driver — and your image is irrelevant. Step two: compare the driver's reported CUDA version against your image's CUDA tag. Step three: if the symptom is a `Bus error` or an NCCL hang rather than a CUDA init failure, suspect the 64-megabyte default `/dev/shm` before you suspect the model. Step four: check the cache volume is actually mounted and writable by the running user. Step five: check whether the healthcheck is failing because the process is wedged or because it's simply still loading — those look identical from the outside and only the logs distinguish them.
+
 
 
 ---
@@ -347,6 +393,8 @@ When a GPU container fails on a node and the cause isn't obvious from the first 
 ## The 2025–2026 landscape
 
 The mechanics above (driver contract, toolkit, multi-stage) haven't changed. What has changed since roughly 2024 is *how much of this you have to build yourself* versus *what ships as a hardened, official artifact* — and how seriously the industry now treats GPU images as a supply-chain surface. Four threads matter for a working engineer today.
+
+> **Saying it out loud.** The mechanics — driver contract, toolkit, multi-stage builds — haven't changed. What's changed since about 2024 is how much of this you build yourself. The toolkit is moving from its old hook-based injection to CDI, a vendor-neutral device spec that Docker, Podman, containerd, and Kubernetes all understand, which finally makes rootless GPU containers practical. Most teams now start from an official vendor image — vLLM's, TGI's, or NVIDIA NIM — instead of hand-rolling a Dockerfile. And GPU images are now treated as a supply-chain surface in their own right, because a CUDA plus PyTorch base drags in a huge dependency graph. The interview-relevant version: know when a vendor image is the right answer, and know that "custom Dockerfile" now needs a justification.
 
 ### 1. The NVIDIA Container Toolkit has moved to CDI, and rootless is now a real option
 
@@ -371,6 +419,8 @@ podman --cdi-spec-dir=$HOME/.config/cdi run --rm \
 
 Two caveats that bite in practice: (1) rootless containers still need the invoking user to have read/write on the `/dev/nvidia*` device files — usually via membership in the host's `video` (or `render`) group, passed through with `--group-add keep-groups`; and (2) on SELinux hosts (Fedora/RHEL-family) you may need `sudo setsebool -P container_use_devices on` or GPU access is silently denied. Rootless matters for the same reason it always has — a compromised process inside the container can't leverage root-equivalent privileges on the host — and it is now something you can actually put in a hardening checklist rather than an aspiration.
 
+> **Saying it out loud.** CDI — the Container Device Interface — is a vendor-neutral way of describing how to inject a device into a container, and Docker, Podman, containerd, and Kubernetes all understand the same spec. That replaces the old approach where NVIDIA's runtime patched the OCI spec via a hook at container start. The practical payoff is rootless: for years rootless GPU containers were awkward because the device nodes and the injection hook both assumed a privileged daemon, and `nvidia-ctk cdi generate` into your user's config directory closes that gap. Two gotchas that will waste your afternoon: the invoking user still needs read-write on `/dev/nvidia*`, usually via the `video` or `render` group, and on SELinux hosts you need `container_use_devices` on or GPU access is silently denied.
+
 ### 2. Official, hardened images are the default path for the mainstream servers
 
 Five years ago most teams hand-rolled a Dockerfile like the one in this chapter. Today, for the two most common serving stacks, you usually start from the vendor's image and only write a custom Dockerfile when you have a genuinely custom serving path:
@@ -381,12 +431,16 @@ Five years ago most teams hand-rolled a Dockerfile like the one in this chapter.
 
 The interview-relevant takeaway: know when to reach for an official/vendor image (the common case now) versus when a custom multi-stage build is actually warranted (custom serving logic, a framework without an official image, or hard constraints on image size/content that the vendor image doesn't meet).
 
+> **Saying it out loud.** Five years ago everyone hand-rolled a Dockerfile like the one in this chapter; today you usually start from the vendor's image and only write your own when you have genuinely custom serving logic. vLLM publishes `vllm/vllm-openai`, Hugging Face publishes TGI on GHCR, and NVIDIA NIM goes further by packaging pre-optimized engines tuned per GPU SKU behind an OpenAI-compatible API. The honest tradeoff is size — a recent vLLM tag runs around 12.6 gigabytes, and a maintainer's own answer to "can I slim it" was essentially "not really, and not without ongoing maintenance burden." So budget registry storage and pull time rather than fighting it. The thing to be able to say in an interview is which specific constraint would push you off the official image.
+
 ### 3. Image-size reduction has two live approaches: harden the base, or stop shipping weights as layers
 
 Two independent techniques are gaining traction for the "these images are enormous" problem:
 
 - **Hardened, minimal base images.** Chainguard publishes CUDA/PyTorch-family images built to a zero-known-CVE target, rebuilt daily, each with an SBOM and reproducible from signed build configs. Their own comparison (chainguard.dev/unchained/securing-the-foundations-of-ai-applications-with-chainguard-images) found the official PyTorch Docker Hub image carried 1 critical, 23 high, 1,189 medium, and 72 low CVEs (as measured July 24, 2024) against zero in their equivalent image at the same time, driven mostly by stripping unnecessary OS packages rather than by removing CUDA/PyTorch functionality. This is the same "runtime not devel, `--no-install-recommends`, clean apt lists" discipline from Mechanism 4/5 in this chapter, taken to its logical extreme by a vendor who productizes it.
 - **Stop treating weights as image layers at all.** Docker's rationale for packaging AI models as **OCI artifacts** rather than image layers (docker.com/blog/oci-artifacts-for-ai-model-packaging) is worth understanding even if you don't adopt Docker Model Runner: model weight files are high-entropy, so compressing them into a tar layer (the normal image-layer behavior) buys negligible size reduction while costing real (de)compression time, and it prevents the inference engine from `mmap`-ing the file directly off disk. Docker's model-artifact manifest instead stores the weights as an *uncompressed* layer under model-specific media types (e.g., `application/vnd.docker.ai.gguf.v3`) alongside a JSON config carrying architecture/quantization/parameter-count metadata — decoupling "which weights" from "which engine" so you don't duplicate a 15 GB checkpoint across every framework's image. It is early days for this pattern in mainstream LLM-serving production, but the direction — weights as a distinct, content-addressed, uncompressed OCI artifact rather than baked into `devel`/`runtime` layers — is the one to watch, and it's a clean answer to "is there a better option than bake/mount/download?" if it comes up in an interview.
+
+> **Saying it out loud.** Two different attacks on "these images are enormous." One is hardening the base: Chainguard builds CUDA and PyTorch images to a zero-known-CVE target with daily rebuilds and SBOMs, and their comparison against the official PyTorch Docker Hub image found 1 critical, 23 high, and over 1,100 medium CVEs there versus zero in theirs, mostly by stripping unnecessary OS packages rather than removing functionality. The other is refusing to ship weights as layers at all. Weight files are high-entropy, so compressing them into a tar layer buys almost nothing in size while costing real decompression time and preventing the engine from `mmap`-ing them straight off disk. That's Docker's argument for OCI model artifacts: uncompressed, content-addressed, and decoupled from whichever engine you're running.
 
 ### 4. Supply-chain scanning is now expected on AI images specifically, not just on your app images
 
@@ -399,9 +453,13 @@ Because a CUDA + PyTorch + framework image drags in an unusually large OS + Pyth
 
 None of this replaces the fundamentals earlier in this chapter (multi-stage, `.dockerignore`, non-root, pinned digests). It's the layer on top: assume your CUDA/PyTorch base has a nontrivial CVE surface, and have an explicit story — vendor-hardened base, CI scanning gate, or both — for managing it, rather than discovering it during a customer security questionnaire.
 
+> **Saying it out loud.** A CUDA plus PyTorch plus framework image pulls in a far bigger OS and Python dependency graph than a typical microservice, so it accumulates CVEs faster — which is why that Chainguard comparison is so lopsided. The standard response has three parts: a scanning gate in CI with Docker Scout or Trivy that fails the promote step above a critical or high threshold, an SBOM attached to the image so security can answer "are we exposed to this CVE" without re-scanning running containers, and cosign signing so the deploy pipeline verifies the image actually came from your CI. The practical adaptation for GPU images specifically: because they're ten to a hundred times the size of a normal service image, you scan once at push time and verify signature and digest at deploy, rather than re-scanning on every node.
+
 ### 5. Kubernetes-adjacent: the GPU Operator abstracts the host-side setup
 
 Everything in Mechanism 2 (install the toolkit, configure the Docker/containerd runtime, verify with `nvidia-smi`) is manual host configuration. On a Kubernetes fleet, the **NVIDIA GPU Operator** packages that entire host-side setup — driver installation/management, container toolkit, device plugin, DCGM monitoring, and (as of the 25.10 release line) CDI support — as a set of components the cluster manages itself, so individual node bootstrap scripts stop being where GPU readiness lives. This chapter deliberately stays at the single-host `docker run`/compose level; the GPU Operator (and the rest of the Kubernetes-specific device-plugin and scheduling story) belongs to this guide's Kubernetes chapter, but it's worth knowing the name and roughly what it replaces before that chapter goes deep, since an interviewer moving from "containerize this" to "now put it in a cluster" is testing whether you know the boundary between the two layers.
+
+> **Saying it out loud.** Everything in the toolkit section — install the packages, configure the container runtime, verify with `nvidia-smi` — is manual host configuration, and on a Kubernetes fleet you stop doing that by hand. The NVIDIA GPU Operator packages the whole host-side story: driver management, the container toolkit, the device plugin, DCGM monitoring, and CDI support, all managed by the cluster itself, so GPU readiness stops living in per-node bootstrap scripts. It's worth knowing the name and roughly what it replaces before you get to the Kubernetes chapter, because an interviewer moving from "containerize this" to "now put it in a cluster" is specifically testing whether you know where the boundary between those two layers is.
 
 ---
 
@@ -511,6 +569,8 @@ docker run --gpus all --shm-size 1g -p 8080:80 \
   --model-id teknium/OpenHermes-2.5-Mistral-7B
 ```
 
+> **Saying it out loud.** If I had to describe the production Dockerfile in one breath: build in a `devel` CUDA base into an isolated virtualenv, copy just that virtualenv into a slim `cudnn-runtime` stage, create a non-root user that owns the cache directory, set a healthcheck with a five-minute start period, and use exec-form ENTRYPOINT so signals actually reach the process. Then at run time you pass `--gpus all`, mount the weights cache volume, and inject the token as an environment variable rather than baking it. The one flag people forget is `--ipc=host` or `--shm-size=1g` — Docker's default shared memory is 64 megabytes, and tensor-parallel NCCL communication needs far more, so without it you get cryptic hangs and `Bus error` crashes that look nothing like a shared-memory problem.
+
 ### The full stack: LLM server + reverse proxy + resource limits
 
 A single `docker run` is fine for a dev box. A production compose file needs at minimum: the model server, a reverse proxy in front of it (TLS termination, request buffering, and a stable port even if you swap the backend image), and explicit resource limits so one runaway container can't starve its neighbors on a shared host. Here is a more complete `docker-compose.yaml`:
@@ -588,6 +648,8 @@ llm.example.com {
 
 Two details that matter more than they look: `expose` (not `ports`) on the `llm` service means the model server is reachable only from the `proxy` service on the compose network, not directly from the host or internet — the proxy is the only public entry point, which is where you'd add auth, rate limiting, and TLS. And `depends_on: condition: service_healthy` means the proxy won't route traffic to the model server until its `HEALTHCHECK` passes — closing the "requests arrive during the multi-minute model load and get 502s" gap.
 
+> **Saying it out loud.** A single `docker run` is fine on a dev box; production wants at least three things in the compose file. The model server itself, exposed only internally rather than published to the host. A reverse proxy in front for TLS termination, request buffering, and a stable port so you can swap the backend image underneath. And explicit CPU and memory limits so one runaway container can't starve its neighbors. The detail that saves you an incident: gate the proxy on the model server's healthcheck with `depends_on: condition: service_healthy`, so callers get a clean connection refusal instead of a wall of 502s during the several minutes the model is loading. And remember those resource limits cover CPU and RAM only — they do nothing for GPU memory.
+
 ### Adding GPU observability to the stack
 
 The compose file above is functionally complete but operationally blind — nothing exports GPU metrics. Adding NVIDIA's DCGM exporter as a sidecar makes GPU utilization, memory, and temperature visible to Prometheus/Grafana without touching the `llm` service:
@@ -608,6 +670,8 @@ The compose file above is functionally complete but operationally blind — noth
 ```
 
 Point Prometheus at `dcgm-exporter:9400/metrics` and alert on GPU memory utilization specifically, not just SM/compute utilization — a server can look idle on compute while sitting dangerously close to an out-of-memory KV-cache allocation, and compute-only dashboards miss that entirely (see Mechanism 6's monitoring note above).
+
+> **Saying it out loud.** A working compose file is still operationally blind — nothing in it exports a single GPU metric. Adding NVIDIA's DCGM exporter as a sidecar container fixes that without touching your serving service at all: it exposes GPU utilization, memory, temperature, power, and ECC errors on a port Prometheus can scrape. The reason to do this at compose time rather than later is that the interesting failures are gradual — a KV-cache leak creeping up over days, thermal throttling under sustained load — and you cannot see a trend you never started recording. The specific alert I'd add first is GPU memory utilization with a warning threshold well under 100%, so you get runway before a hard out-of-memory rather than an alert that arrives with the crash.
 
 
 ### CI smoke-test stage
@@ -662,6 +726,8 @@ jobs:
 
 The split matters: the CPU job runs on every PR and catches most regressions cheaply; the GPU job runs on a real GPU runner against a *tiny* model (`opt-125m`, not your 70B production model) so the full request path — container start, healthcheck, an actual generation call — is exercised without needing an expensive GPU for every commit.
 
+> **Saying it out loud.** GPU CI runners are expensive and often unavailable, so the pragmatic split is two jobs. On every pull request, build the image and verify it starts and imports correctly on a plain CPU runner — that catches the large class of bugs that have nothing to do with the GPU: a broken `pip install`, a bad entrypoint, a missing environment variable, a syntax error. Then reserve a real GPU runner for a nightly or pre-promote job that runs an actual generation call against a *tiny* model like `opt-125m`, not your 70B production checkpoint. That exercises the full path — container start, healthcheck, real inference — for a couple of cents instead of an expensive GPU-hour on every commit.
+
 
 ---
 
@@ -680,6 +746,8 @@ The split matters: the CPU job runs on every PR and catches most regressions che
 Pin the model **revision** (commit SHA) or artifact **digest**, not just the repo name or tag, when reproducibility matters for any of these options.
 
 A note that cuts across every row of this table: the quantization format (see Mechanism 3's earlier note) shifts where each option's numbers land — a 4-bit-quantized 70B model bakes into an image at a size that would have been unthinkable in fp16, which is why "bake vs. mount vs. download" is a decision you should revisit per model/format combination, not settle once for the whole fleet.
+
+> **Saying it out loud.** If someone asks me to compare the weight-handling options, I'd frame it as a tradeoff between self-containment and lifecycle coupling. Baking into the image gives you the best reproducibility and works air-gapped, but you're at 15 to 150 gigabytes and every code change redistributes the model. Mounting a volume is the production default — small image, fast start, models shared across containers — but the image is no longer self-contained and you have to provision the volume. Downloading at startup is the most flexible and smallest, but a cold start pays a multi-gigabyte download and now Hugging Face's uptime is in your critical path. The rule that applies to all of them: pin the model *revision* by commit SHA or artifact digest, not the repo name — a tag can move under you.
 
 ---
 
@@ -700,6 +768,8 @@ A note that cuts across every row of this table: the quantization format (see Me
 - **`no kernel image is available for execution on the device`** — a from-source build's `TORCH_CUDA_ARCH_LIST` didn't include the compute capability of the GPU you're actually running on (e.g., built for 8.0/9.0, deployed on an older 7.5-class card). Fixed by rebuilding with the right architecture list, or by using a prebuilt wheel that already covers it — not a runtime-configurable option.
 - **GPU memory creep goes unnoticed** — dashboards only track SM/compute utilization, which can look healthy (or idle) right up until an allocation fails. Track GPU memory utilization per container (DCGM exporter) as a first-class metric, not an afterthought.
 - **Crash-loop storm from an unconditional restart policy** — a deterministic failure (driver mismatch, OOM on every boot) combined with `restart: always` and no backoff burns node scheduling slots and pages on-call repeatedly instead of failing fast. Cap retries or use `on-failure` with a backoff, and treat "restarted N times in M minutes" as its own alert.
+
+> **Saying it out loud.** The failure list here is short and repeats across every team. Driver mismatch — container CUDA newer than the host driver supports, unfixable from inside the image. GPU invisible, which means the toolkit isn't installed or `--gpus` was omitted. Giant images from shipping the `devel` base or baking weights. Redownloading weights every restart because the cache path isn't on a persistent volume. Secrets in layers, which live in image history forever. Running as root by default. And `/dev/shm` too small at 64 megabytes, which produces NCCL hangs and `Bus error` crashes that look nothing like a shared-memory problem. The pattern worth naming: almost all of these are silent or misleading at the symptom level — the error you see is rarely the layer where the bug lives.
 
 ---
 
@@ -747,6 +817,8 @@ Because the autoscaler load-balanced across both node types, roughly a third of 
 
 **Fix and lesson.** The team added a driver-version floor check to node bootstrap (fail node registration if `nvidia-smi --query-gpu=driver_version --format=csv,noheader` is below a pinned minimum) so the *fleet's* minimum driver version becomes an explicit, enforced contract rather than an implicit assumption about whichever node an engineer happened to test on. They also added a one-line preflight in the container's entrypoint — run `nvidia-smi` before starting the server and exit with a clear error if it fails — so a driver mismatch produces an immediate, legible failure instead of a framework-level CUDA init stack trace three layers down. The generalizable lesson: **treat "minimum supported host driver version" as a versioned contract between infra and the serving image, checked at both node-bootstrap time and container-start time — not something that's implicitly whatever driver happened to be on the box someone tested on.**
 
+> **Saying it out loud.** A team ran an autoscaling GPU pool that mixed two node generations — older nodes on driver 535, newer ones on 550 — and shipped an image built on CUDA 12.4. A routine dependency bump triggered a rolling redeploy, and pods landing on the newer nodes came up fine while pods on the older nodes crash-looped with `CUDA driver version is insufficient`. Because the autoscaler spread across both types, roughly a third were healthy — so it presented as a confusing partial outage, and on-call spent forty minutes in the app logs before anyone ran `nvidia-smi` on a failing node. Root cause: the image's CUDA version had only ever been validated against one engineer's dev box. The fix and the lesson: treat minimum host driver version as an enforced contract, checked at node bootstrap and preflighted in the container entrypoint.
+
 ### War story 2 — the 40 GB image that broke CI, not just the registry
 
 **Setup.** An early version of a custom serving image baked model weights directly into the image (Option A from Mechanism 3) because it was simple and "worked on my machine." The weights were a 34B-parameter checkpoint in fp16, roughly 70 GB of safetensors, compressing to a ~40 GB image layer.
@@ -757,6 +829,8 @@ Because the autoscaler load-balanced across both node types, roughly a third of 
 
 **Fix and lesson.** The team moved to Option B (mount a volume pre-populated with weights on each node, refreshed out-of-band from the deploy pipeline) for production, and kept a from-scratch build with a *tiny* stand-in model (`facebook/opt-125m`, a few hundred MB) for CI so the Dockerfile/dependency layers were still validated on every PR without moving real weights through the build pipeline at all. Deploy time for a code-only change dropped from ~20 minutes to under a minute; CI build time dropped from 25+ minutes to about 90 seconds. The generalizable lesson: **the moment your image is dominated by data rather than code, your CI and registry tooling need a data-vs-code split too — don't let a shared cache and registry sized for normal service images silently absorb a 40 GB workload; separate the lifecycles explicitly (Mechanism 3's bake/mount/download decision isn't just a runtime-architecture choice, it's a CI/registry-cost decision too).**
 
+> **Saying it out loud.** A team baked a 34B fp16 checkpoint into their image because it was simple — about 70 gigabytes of safetensors, roughly a 40 gigabyte layer. The interesting part is that the registry wasn't even the worst pain: CI ran `docker build` on every PR, the shared runner's cache was sized for normal service images, so it evicted the 40 GB layer between runs and nearly every PR paid the full copy again. Builds took 25-plus minutes, and shipping a one-line fix meant redistributing the entire checkpoint to every node — a 30-second deploy became 20 minutes. They moved to volume-mounted weights in production and a tiny `opt-125m` stand-in for CI: build time went from 25 minutes to about 90 seconds, deploy from 20 minutes to under one. The lesson: when your image is dominated by data, your CI and registry assumptions are wrong too.
+
 ### War story 3 — the "idle" GPU that was actually one bad allocation from falling over
 
 **Setup.** A dashboard tracked GPU SM/compute utilization per node as the primary GPU health signal, on the reasonable-sounding assumption that "low utilization = healthy, high utilization = busy."
@@ -764,6 +838,8 @@ Because the autoscaler load-balanced across both node types, roughly a third of 
 **What happened.** A slow KV-cache memory leak, triggered only by a specific long-context request pattern, grew VRAM usage across days while compute utilization stayed unremarkable — the server was mostly waiting on generation, not compute-bound, so nothing on the compute dashboard moved. The first visible symptom was a hard CUDA out-of-memory crash under otherwise normal load, with no warning in the metrics anyone was watching.
 
 **Fix and lesson.** The team added GPU memory utilization (not just compute) as an explicit, alerted metric via DCGM, with a warning threshold well below 100% so there was runway to intervene before a hard OOM. The generalizable lesson, and the reason it's paired with Mechanism 6's monitoring note earlier in this chapter: **compute utilization and memory utilization are different signals that fail independently — a GPU container can look "idle" by one measure while one allocation away from crashing by the other, so watch both, not just the one that's easiest to eyeball on `nvidia-smi`.**
+
+> **Saying it out loud.** A team dashboarded GPU compute utilization as their primary health signal, on the very reasonable assumption that low utilization means healthy. Then a slow KV-cache leak, triggered only by a particular long-context request pattern, grew VRAM usage over days while compute utilization stayed completely flat — because the server was waiting on generation, not compute-bound. The first symptom anyone saw was a hard CUDA out-of-memory crash under otherwise ordinary load, with nothing on the dashboard having moved beforehand. The fix was adding GPU memory utilization as an alerted DCGM metric with a warning threshold well below 100%. The generalizable lesson: compute and memory utilization are different signals that fail independently, and the one that's easiest to eyeball on `nvidia-smi` is not the one that catches this.
 
 
 
@@ -840,6 +916,8 @@ A common follow-up prompt: *design the containerization and rollout for a model 
 ```
 
 Talking points an interviewer wants to hear, in roughly this order: (1) the image is built multi-stage (`devel` → `runtime`), non-root, healthchecked, exec-form entrypoint; (2) weights are *not* baked in — mounted or cached per node pool so a code-only rollout doesn't redistribute the checkpoint (tie this directly to the CI/registry-cost war story); (3) `--ipc=host`/`--shm-size` is set because TP=4 needs real shared memory for NCCL; (4) node pools have an enforced minimum driver version, checked at bootstrap and preflighted in the entrypoint, so a mixed-generation fleet can't silently crash-loop a subset of replicas; (5) the reverse proxy is the only externally exposed surface and only routes to replicas passing healthcheck; (6) rollout is canary-then-promote, gated by a CI pipeline that scans for CVEs and smoke-tests on both CPU (every PR) and GPU (pre-promote); (7) secrets come from the orchestrator's secret store, never from the image.
+
+> **Saying it out loud.** For a four-GPU tensor-parallel replica with zero-downtime deploys, I'd walk it in this order. The image is multi-stage, non-root, healthchecked, exec-form entrypoint. Weights are not baked in — they're on a mounted volume or warm cache per node pool, so a code-only rollout doesn't push the checkpoint again. `--ipc=host` is set because TP=4 needs real shared memory for NCCL, and the 64-megabyte default will hang you. Node pools enforce a minimum driver version at bootstrap and preflight it in the entrypoint, so a mixed fleet can't silently crash-loop a subset of replicas. A reverse proxy is the only exposed surface and only routes to healthy replicas. And the rollout is canary-then-promote behind a CI gate that scans for CVEs and smoke-tests on CPU every PR, GPU before promotion. Secrets come from the orchestrator, never the image.
 
 ### Red flags vs. green flags
 

@@ -10,6 +10,8 @@ But LLM serving breaks several of Kubernetes' defaults. Models take **minutes** 
 
 Autoscaling (HPA, KEDA, custom metrics, scale-to-zero) is deep enough to deserve its own chapter — see *Autoscaling GPU Inference*. Here we reference it but focus on deployment, scheduling, health, weights, and lifecycle.
 
+> **Saying it out loud.** Once you've got a working inference server, the question stops being "does it generate text" and becomes "how do I run twelve of these across a GPU fleet, upgrade them without dropping traffic, and not set money on fire." Kubernetes is the default answer because it gives you a declarative fleet, health-gated routing, rolling upgrades, and a scheduler that can place a pod on exactly the right GPU. But LLM serving breaks three Kubernetes defaults hard: models take *minutes* to load, so naive probes crash-loop them forever; GPUs can't be overcommitted, so your CPU bin-packing intuition is simply wrong; and images plus weights are tens of gigabytes, so cold start dominates everything. Most Kubernetes-for-LLM incidents are one of those three defaults biting.
+
 ---
 
 ## Core intuition
@@ -26,6 +28,8 @@ Three mental models carry most of the chapter:
 
 Keep these four in mind and the rest of the chapter is mostly detail: GPUs are exclusive integers, health is time-aware, weights are the real payload, and disruptions are bounded on purpose.
 
+> **Saying it out loud.** Four mental models carry this whole chapter. One: a GPU is an indivisible, non-overcommittable device — unlike CPU which is compressible and memory which you can oversubscribe, a GPU goes to exactly one container as an integer, and there's no bursting above your limit. Two: health is a function of time, not just liveness — a pod that's been alive forty seconds without finishing a 140 GB model load isn't broken, it's starting, and Kubernetes has a dedicated primitive for that called the startup probe. Three: the weights are the workload — for a normal service the image *is* the app, here the image is just a runtime and the weights are ten times larger. Four: voluntary disruption is the one you control, and a PodDisruptionBudget is the few lines of YAML between a clean rolling drain and a full outage.
+
 ---
 
 ## Mechanisms in depth
@@ -39,6 +43,8 @@ For a stateless replicated inference server the standard trio is:
 - **Ingress** (or Gateway API) — L7 routing, TLS termination, path/host rules, into the Service.
 
 A subtlety unique to LLM serving: **long request durations and streaming**. Token-streaming responses (SSE) can run for tens of seconds to minutes. Make sure your Ingress/proxy timeouts (`proxy-read-timeout` on the NGINX ingress, backend request timeout on cloud LBs) are raised, and that buffering is disabled so tokens flush as they generate. Default 30–60s timeouts will cut long generations.
+
+> **Saying it out loud.** The standard trio is boring and that's good: a Deployment declares N replicas and handles rolling updates and self-healing, a Service gives you a stable virtual IP that load-balances across the *ready* pods, and an Ingress or Gateway does L7 routing and TLS on the way in. The one thing genuinely different about LLM serving is request duration — a token-streaming response can run for minutes, and every proxy in the path defaults to a 30- or 60-second read timeout. So you raise `proxy-read-timeout` on the ingress and the backend timeout on any cloud load balancer, and you disable response buffering so tokens flush as they're generated. Miss that and long generations get truncated mid-sentence, and it'll look like a model bug rather than a proxy config.
 
 ### 2. GPU scheduling: the NVIDIA device plugin
 
@@ -60,6 +66,8 @@ Key rules that trip people up:
 
 The device plugin is often installed as part of the **NVIDIA GPU Operator**, which additionally manages the driver, the container toolkit, DCGM metrics exporter, Node Feature Discovery, and MIG configuration — so you don't hand-install drivers on every node.
 
+> **Saying it out loud.** Kubernetes has no built-in concept of a GPU at all. What makes it work is the NVIDIA device plugin — a DaemonSet on every GPU node that discovers the cards and advertises them to the kubelet as an extended resource called `nvidia.com/gpu`. From there the scheduler treats it like any countable resource, with two rules people trip on. Extended resources must be whole integers and request must equal limit, so there's no requesting half a GPU and bursting. And GPUs are never double-booked: two pods each asking for one GPU on a single-GPU node means the second sits `Pending`, by design, because two processes fighting over one card's VRAM would OOM each other unpredictably. Sharing exists, but it's explicit opt-in via MIG, MPS, or time-slicing.
+
 ### 2b. GPU sharing: MIG vs time-slicing vs MPS
 
 One whole GPU per pod is wasteful for small models that use a few GB of a 80 GB card. Three mechanisms let you pack more, each changing what the device plugin advertises:
@@ -71,6 +79,8 @@ One whole GPU per pod is wasteful for small models that use a few GB of a 80 GB 
 | **MPS** (Multi-Process Service) | **Soft** — shared memory, concurrent kernels with optional compute caps | A daemon runs many clients' kernels concurrently | `nvidia.com/gpu` (configured slots) | Higher utilization than time-slicing, some control |
 
 Critical caveat: **time-slicing gives no memory isolation** — two pods on one time-sliced GPU can OOM each other, and "requesting 2 shared GPUs" does **not** guarantee 2x the compute. For production multi-tenant serving, **MIG** is the safe choice; time-slicing/MPS are for dev or trusted, well-characterized co-tenancy. All three are configured via the device plugin / GPU Operator, not by the pod author.
+
+> **Saying it out loud.** Giving a whole 80 GB card to a model that uses six gigabytes is wasteful, so there are three ways to pack more on — and they differ mainly in what guarantee they give you. MIG is hardware partitioning: an A100 or H100 splits into up to seven instances with genuinely separate memory and compute slices, so tenants can't touch each other. Time-slicing is pure oversubscription: the plugin just advertises four replicas of one card and the driver context-switches, with zero memory isolation. MPS sits in between — concurrent kernels with soft compute caps but still shared memory. The caveat that matters: time-slicing does *not* give you 4x compute and does *not* stop two pods from OOM-ing each other, so for anything multi-tenant you use MIG and treat the other two as dev-only.
 
 ### 3. Getting pods onto GPU nodes: selectors, taints, tolerations
 
@@ -93,6 +103,8 @@ You almost never want a random CPU workload landing on an expensive GPU node, an
   ```
 
 Use both: the taint keeps freeloaders off, the selector/affinity ensures your pod picks the right GPU SKU. A **GPU node pool** is simply a node group with a fixed instance type (all A100, or all L4), its own taint, and often its own cluster-autoscaler settings so you can scale GPU capacity independently of the CPU fleet.
+
+> **Saying it out loud.** You need two complementary things, and people usually remember one. Taints are repulsion: you taint GPU nodes so nothing schedules there unless it explicitly tolerates the taint, which keeps random CPU workloads off your expensive hardware — cloud GPU pools often apply `nvidia.com/gpu=present:NoSchedule` for you. Node selectors and affinity are attraction: they pull your pod toward the right SKU using labels the GPU Operator and Node Feature Discovery add, like `nvidia.com/gpu.product`. Use both, because they solve different problems. The failure mode from getting it wrong is silent: a pod missing the toleration doesn't error, it just sits `Pending` forever, and the only place that tells you is `kubectl describe pod`.
 
 ### 4. Probes done right for multi-minute model loads
 
@@ -122,6 +134,8 @@ The effective grace window is `periodSeconds * failureThreshold`. Size it to you
 - **readiness** should reflect "can serve a request" — many servers expose `/health` (up) vs a readiness endpoint that only returns 200 once the model is loaded and warmup is done. Gate traffic on the latter.
 - **liveness** should be *cheap and lenient* — it exists to recover a genuinely wedged process (deadlock, CUDA error), not to police slow loads. Use a modest `periodSeconds` and a `failureThreshold` of 3+ so a single slow health check doesn't kill a healthy pod mid-inference.
 
+> **Saying it out loud.** This is the number-one LLM-on-Kubernetes bug, full stop. There are three probes: startup asks "has it finished starting yet," readiness asks "should traffic go here right now," and liveness asks "is this wedged and needs a restart." The classic disaster is copying a liveness probe from a CPU microservice — thirty seconds of initial delay, three failures allowed — onto a model that takes four minutes to load. The kubelet kills it at sixty seconds, it restarts, loads again, gets killed again, forever. The fix is the startup probe, because while it's pending it *suppresses* liveness and readiness entirely; give it `periodSeconds: 10` and `failureThreshold: 60` for a ten-minute budget sized to your worst-case cold load. Then keep liveness cheap and lenient — it exists to recover a deadlock, not to police a slow load.
+
 ### 5. Resource requests/limits and why GPUs aren't overcommitted
 
 For CPU and memory you set requests (scheduling guarantee) and limits (cap). For LLM pods:
@@ -131,6 +145,8 @@ For CPU and memory you set requests (scheduling guarantee) and limits (cap). For
 - **GPU:** `nvidia.com/gpu` request == limit == integer, always. There is no overcommit. The reason is physical: GPU memory (VRAM) has no swap and no soft limit the scheduler understands. If two pods both assumed they had the whole 80 GB, the second allocation would fail at CUDA-malloc time, not at schedule time — an ugly runtime crash instead of a clean `Pending`. So Kubernetes refuses to double-book.
 
 Corollary — **GPU fragmentation**: because allocation is integer and per-node, a cluster with eight 8-GPU nodes and lots of single-GPU pods can end up unable to schedule a pod that needs 4 GPUs *on one node*, even though 20 GPUs are free cluster-wide. Multi-GPU / tensor-parallel pods need whole nodes or careful bin-packing (topology-aware scheduling, `podAffinity`, or a scheduler like the NVIDIA/Volcano gang scheduler).
+
+> **Saying it out loud.** For CPU, set a request so the scheduler reserves headroom but be careful with limits, because throttling the event loop that handles tokenization and HTTP will tank your throughput — many teams set a CPU request and no limit at all. For memory, set request and limit close together and generous, because host RAM stages the weights before they land in VRAM, and an OOMKill mid-load looks exactly like a probe failure. For GPU, request equals limit equals an integer, always. The physical reason is that VRAM has no swap and no soft limit the scheduler understands: if two pods both assumed they had the whole 80 GB, the second would fail at CUDA-malloc time — an ugly runtime crash instead of a clean `Pending`. The corollary is fragmentation: twenty GPUs free cluster-wide can still mean zero schedulable for a pod that needs four on one node.
 
 ### 6. Serving the model weights
 
@@ -144,6 +160,8 @@ Where do the weights come from at pod start? Four common patterns, with tradeoff
 | **Node-local cache / model cache** | Cache weights on local NVMe, or use a model-cache layer (e.g. Run:ai model streamer, KServe modelcar, Fluid) | Fast warm starts; streams weights into VRAM | More moving parts; cache warmup / eviction to manage |
 
 Rules of thumb: bake weights into the image only for small models or when immutability matters more than pull time. For large models, keep the runtime image lean and fetch weights via `initContainer` or a pre-populated read-only PVC, and *cache on the node* so replicas 2..N start fast. Beware the **thundering herd**: ten pods cold-starting simultaneously all pulling 140 GB from the same bucket will saturate egress and each other.
+
+> **Saying it out loud.** Four ways to get weights onto a node, and the choice determines your cold-start time. Baked into the image is simplest and immutable, but you're pulling a 30-to-100-gigabyte image on every cold node. An initContainer downloading from S3 keeps the image lean but re-downloads on every cold start unless you cache it. A shared read-only PVC means you download once and many pods mount it — usually the right answer for large models — though your network filesystem bandwidth becomes the bottleneck when replicas load concurrently. Node-local NVMe cache is fastest for warm restarts but adds cache-warming and eviction to manage. The failure mode to name is the thundering herd: ten pods cold-starting at once, each pulling 140 GB from the same bucket, saturating egress and slowing each other down.
 
 ### 7. Rolling updates, PodDisruptionBudgets, graceful shutdown
 
@@ -162,6 +180,8 @@ Rules of thumb: bake weights into the image only for small models or when immuta
 
 - **Graceful shutdown:** on SIGTERM, a good inference server should stop accepting new requests, drain in-flight generations, then exit. Kubernetes gives it `terminationGracePeriodSeconds` (default 30s) before SIGKILL — raise this well above your longest expected generation (e.g. 120–300s) so streaming requests aren't cut off. Pair it with a `preStop` hook or a readiness flip so the pod is pulled from Service endpoints *before* it starts draining, avoiding races where traffic hits a shutting-down pod.
 
+> **Saying it out loud.** Three lifecycle things, and each has a GPU-specific twist. On rolling updates, `maxSurge` costs *real extra GPUs* — surging by one means the autoscaler has to find another GPU node, which may not exist — so GPU fleets often run `maxSurge: 0, maxUnavailable: 1` and accept reduced capacity during the rollout. On PodDisruptionBudgets: without one, a routine node drain or an autoscaler scale-down can evict every replica simultaneously and take the whole service down, so you always ship a `minAvailable`. On graceful shutdown: the default `terminationGracePeriodSeconds` is thirty seconds, which will SIGKILL a pod in the middle of a two-minute generation, so raise it to a couple hundred and flip readiness first so traffic drains before the pod starts shutting down.
+
 ### 8. Serving frameworks & operators
 
 You don't have to hand-roll Deployments. Higher-level tools add model-aware features (autoscaling on GPU/queue metrics, scale-to-zero, canary, standardized model formats):
@@ -171,6 +191,8 @@ You don't have to hand-roll Deployments. Higher-level tools add model-aware feat
 - **KubeAI** — an open, k8s-native inference operator focused on OpenAI-compatible serving of LLMs (vLLM/Ollama), with built-in autoscaling and model management, no Istio/Knative dependency. Lighter-weight alternative to KServe.
 - **Ray Serve (KubeRay)** — deploy via the `RayService` CRD. Shines for **multi-model, model-composition, and distributed (multi-node tensor/pipeline-parallel)** serving where a request fans across many actors/GPUs. More of a distributed compute framework than a thin serving layer.
 
+> **Saying it out loud.** You don't have to hand-roll Deployments forever. KServe gives you an `InferenceService` CRD with autoscaling including scale-to-zero, canary rollouts, and first-class vLLM support — good when you're a platform team abstracting over many models. KubeAI is a lighter alternative focused on OpenAI-compatible LLM serving without dragging in Istio and Knative. Ray Serve via KubeRay is the one to reach for when a single request has to fan across many GPUs or nodes, or when you're composing models together — it's really a distributed compute framework, not a thin serving layer. And NVIDIA NIM plus the NIM Operator is the vendor-supported path if you're standardized on NVIDIA's optimized engines. The honest tradeoff: each of these buys you features and costs you a layer of abstraction to debug through.
+
 ---
 
 ### 9. Networking specifics: Gateway API, timeouts, affinity
@@ -179,6 +201,8 @@ You don't have to hand-roll Deployments. Higher-level tools add model-aware feat
 - **Streaming timeouts.** Token-by-token SSE/HTTP responses can run minutes. On the NGINX ingress set `nginx.ingress.kubernetes.io/proxy-read-timeout` and `proxy-send-timeout` to several hundred seconds and disable buffering (`proxy-buffering: "off"`) so tokens flush live. Cloud L7 LBs have their own backend timeout you must raise.
 - **Session affinity for KV-cache reuse.** With prefix/KV caching, routing a follow-up request to the *same* replica that holds the cache boosts throughput. Basic `sessionAffinity: ClientIP` on the Service helps; smarter setups use a cache-aware router (e.g. the vLLM production stack / router) instead of round-robin.
 - **Headless Services for multi-node.** Distributed (tensor/pipeline-parallel across nodes) runtimes often need pod-to-pod addressing; a headless Service (`clusterIP: None`) plus a StatefulSet gives stable per-pod DNS.
+
+> **Saying it out loud.** Four networking things bite specifically for LLMs. Gateway API is where the ecosystem is going over classic Ingress, and it expresses timeouts and traffic splitting much more cleanly, which matters when you're canarying model versions. Streaming timeouts are the practical killer — set `proxy-read-timeout` to several hundred seconds and turn buffering off, or your SSE stream gets cut. Session affinity actually matters here in a way it doesn't for stateless services, because with prefix caching, routing a follow-up request back to the replica that already holds that KV cache is a real throughput win — `sessionAffinity: ClientIP` is the crude version, a cache-aware router is the good one. And for multi-node tensor parallelism you need a headless Service plus a StatefulSet for stable pod-to-pod DNS.
 
 ### 10. Observability: know when a GPU pod is unhealthy
 
@@ -190,6 +214,8 @@ Standard pod metrics miss the GPU. Add:
 
 A "ready" pod pinned at 0% GPU utilization with a growing request queue is the classic silent failure — the health endpoint returns 200 but inference is wedged. Alert on the *metric*, not just the probe.
 
+> **Saying it out loud.** Standard pod metrics tell you nothing about the GPU, so you add two layers. DCGM exporter, which ships with the GPU Operator, feeds Prometheus GPU utilization, memory, temperature, ECC errors, and throttling. And server-level metrics from the runtime itself — queue depth, time-to-first-token, tokens per second, running versus waiting requests — which are what actually drive autoscaling and tell you *why* latency moved. The specific alert worth naming is the silent failure: a pod that passes its readiness probe, sits at 0% GPU utilization, and has a growing request queue. The HTTP endpoint returns 200, so Kubernetes thinks it's fine, but inference is wedged. Alert on the metric, not just the probe — the probe is exactly the thing that's lying to you.
+
 ### 11. Spot / preemptible GPUs and cost
 
 GPU nodes are the dominant cost, so many teams run inference on **spot/preemptible** instances at a large discount — accepting that the cloud can reclaim the node with ~30–120s notice.
@@ -199,17 +225,23 @@ GPU nodes are the dominant cost, so many teams run inference on **spot/preemptib
 - Cold-start time is your enemy here: a reclaimed spot pod must re-download weights and reload the model before serving. Node-local weight caches and pre-pulled images shrink the recovery gap.
 - Right-size the GPU: an 8B model on an 80 GB H100 wastes the card — MIG-slice it or pick a smaller SKU (L4/L40S) and let the *comparison table* of frameworks + autoscaling do the packing.
 
+> **Saying it out loud.** GPU nodes dominate the bill, so running inference on spot or preemptible instances is tempting — big discount, but the cloud can reclaim the node on roughly 30 to 120 seconds notice. Three things make that survivable. Spread replicas across on-demand and spot with topology spread constraints, and keep an on-demand baseline protected by a PDB, so a reclamation storm can't take the whole service down. Make sure your graceful shutdown path — SIGTERM, drain, terminate — actually fits inside that notice window, because if it doesn't, every reclamation drops in-flight requests. And cold start is your real enemy: a reclaimed pod has to re-fetch weights and reload the model before it serves anything, so node-local weight caches and pre-pulled images are what shrink the recovery gap.
+
 ---
 
 ## The 2025–2026 landscape
 
 The mechanisms above are stable, but the tooling around them moved fast between 2025 and 2026. Five developments matter most if you're standing up a new GPU-serving platform today.
 
+> **Saying it out loud.** The mechanisms are stable but the tooling moved fast. GPU scheduling is heading toward Dynamic Resource Allocation, which went GA in Kubernetes 1.34 and replaces "advertise an integer count" with claim-based allocation that can express things like "two GPUs on the same NVLink island." KServe grew LLM-native features — autoscaling on vLLM queue metrics via KEDA, declarative multi-node tensor and pipeline parallelism. A standard traffic layer arrived in the Gateway API Inference Extension, so routing to the replica holding the right prefix cache is no longer bespoke per team. And Kueue finally solved quota arbitration between serving and batch. The throughline: GPUs are still exclusive integer units — DRA makes the *claims* richer, it doesn't make the scarcity go away.
+
 ### GPU sharing has matured: MIG, time-slicing, MPS — and DRA is coming for all of them
 
 Through 2025 the **NVIDIA GPU Operator** (on the 24.9.x/25.x release line) remained the standard way to install the device plugin, driver, container toolkit, DCGM exporter, Node Feature Discovery, and MIG manager as one Helm-installed stack rather than hand-provisioning each piece. Its `ClusterPolicy` CRD is the single control surface: flip `mig.strategy` between `single` and `mixed`, and the operator relabels nodes and reconfigures the device plugin automatically. Time-slicing configuration is a plain `ConfigMap` the device plugin reads at startup (shown in the extended example below) — still oversubscription with no memory isolation, exactly as described above.
 
 The structurally bigger change is **Dynamic Resource Allocation (DRA)**, which graduated to General Availability in **Kubernetes v1.34** (released September 1, 2025). DRA replaces the device plugin's "advertise an integer count" model with **claim-based allocation**: a `ResourceClaim` lets a pod ask for a *class* of device with structured parameters (a specific MIG profile, a specific interconnect topology, a set of GPUs that share an NVLink domain) instead of just a count of `nvidia.com/gpu`. NVIDIA and the major cloud Kubernetes offerings shipped early DRA driver support in 2025–2026 specifically to express MIG profiles and multi-GPU topology (e.g. "give me 2 GPUs on the same NVLink island") in ways the old device-plugin integer model could never express. DRA does not replace the device plugin overnight — most production clusters in 2026 still run the classic `nvidia.com/gpu` device plugin — but it is the direction the scheduler is heading, and it is the answer if an interviewer asks "how would Kubernetes GPU scheduling need to evolve to express topology?"
+
+> **Saying it out loud.** The GPU Operator is still how you install the whole host-side stack — device plugin, driver, toolkit, DCGM, MIG manager — as one Helm chart, with `ClusterPolicy` as the single control surface. The structural change is DRA, Dynamic Resource Allocation, which went GA in Kubernetes 1.34 in September 2025. Instead of asking for a count of `nvidia.com/gpu`, a pod files a `ResourceClaim` for a *class* of device with structured parameters — a specific MIG profile, a driver version floor, or two GPUs sharing an NVLink domain. That last one is the killer example, because the old integer model literally cannot express topology, which is exactly why multi-GPU pods end up stranded by fragmentation. Most 2026 clusters still run the classic device plugin, but DRA is the right answer to "how would GPU scheduling need to evolve."
 
 ### KServe grew LLM-native primitives
 
@@ -221,13 +253,19 @@ The structurally bigger change is **Dynamic Resource Allocation (DRA)**, which g
 - **Envoy AI Gateway integration** — token-aware rate limiting and model-routing policy at the gateway layer.
 - The release also bumped the bundled vLLM backend to 0.8.5, adding support for newer model families and an OpenAI-compatible embeddings API.
 
+> **Saying it out loud.** KServe 0.15, mid-2025, added the things a raw Deployment makes you hand-roll. KEDA-based autoscaling on actual vLLM metrics — `num_requests_running`, queue depth, scraped from the vLLM Prometheus endpoint — instead of guessing from CPU percent, which for a GPU workload is close to meaningless. Native `tensorParallelSize` and `pipelineParallelSize` fields, so a model too big for one node is a declaration rather than a hand-orchestrated StatefulSet plus headless Service. Distributed KV cache via LMCache, which offloads and shares cache across replicas to cut time-to-first-token on multi-turn traffic. And Envoy AI Gateway integration for token-aware rate limiting. The pattern worth noticing: every one of those is a serving-specific concern that generic Kubernetes primitives handle badly.
+
 ### A standard traffic layer arrived: the Gateway API Inference Extension
 
 Before mid-2025, every team invented its own "route to the replica holding the right prefix cache" logic. The **Gateway API Inference Extension** (introduced June 5, 2025, `sigs.k8s.io/gateway-api-inference-extension`) standardizes this with two new resources sitting on top of the Gateway API: **`InferencePool`** groups model-server pods sharing hardware/model config, and **`InferenceModel`/`InferenceObjective`** declares model identity and request priority (interactive chat vs. batch) for the router to act on. Implementations shipped fast: **Istio** added support in 2025, as did **NGINX Gateway Fabric**, and Google's **GKE Inference Gateway** is built directly on it — using signals like KV-cache utilization (via `GCPBackendPolicy`) to route model-aware rather than round-robin. This is the closest thing the ecosystem has to a standard answer for "how do you route LLM traffic on Kubernetes" as of 2026.
 
+> **Saying it out loud.** Before mid-2025, every team wrote their own logic for "route this request to the replica that already has the right prefix cache." The Gateway API Inference Extension standardizes that with two resources on top of Gateway API: an `InferencePool` groups model-server pods that share hardware and model config, and `InferenceModel` or `InferenceObjective` declares model identity and request priority — so interactive chat and batch traffic can be routed and prioritized differently. Istio, NGINX Gateway Fabric, and Google's GKE Inference Gateway all shipped support, with GKE routing on signals like KV-cache utilization rather than round-robin. Why it matters: round-robin across LLM replicas actively destroys prefix-cache hit rates, so cache-aware routing is a throughput win you get from the traffic layer, not the model.
+
 ### Kueue: batch/queue scheduling for GPU jobs
 
 **Kueue** (`kueue.sigs.k8s.io`, a Kubernetes SIG project, on the v0.18/v0.19 release line as of early 2026) fills a gap raw Kubernetes scheduling never solved: **fair, quota-aware admission of batch and GPU jobs across teams**. Where the default scheduler will happily let one team's fine-tuning job or eval sweep grab every GPU in the cluster, Kueue adds `ClusterQueue`/`LocalQueue` objects with quotas, borrowing/lending between cohorts, priority-based FIFO admission, and **gang scheduling** (all-or-nothing pod admission — no more a distributed training job launching 7 of 8 needed pods and deadlocking). It integrates with the cluster-autoscaler via *provisioning requests*, so a queued job can trigger new GPU nodes only once it's actually about to be admitted. **MultiKueue** extends this across clusters, dispatching an admitted job's pods to whichever connected cluster has capacity — relevant for fine-tuning/eval batch workloads more than steady-state serving, but increasingly used to arbitrate GPU access between a serving fleet and a training/eval fleet sharing the same pool.
+
+> **Saying it out loud.** Kueue fills a gap the default scheduler never addressed: fair, quota-aware admission of GPU jobs across teams. Out of the box, one team's eval sweep or fine-tuning run can grab every GPU in the cluster and there's nothing to stop it. Kueue adds `ClusterQueue` and `LocalQueue` objects with quotas, borrowing and lending between cohorts, and priority-based FIFO admission. The feature I'd single out is gang scheduling — all-or-nothing admission — which stops a distributed job from launching seven of the eight pods it needs and deadlocking capacity while it waits for the eighth. It also hooks into the cluster autoscaler via provisioning requests, so a queued job only triggers new GPU nodes once it's actually about to be admitted rather than speculatively.
 
 ### Multi-cluster and multi-region serving
 
@@ -236,6 +274,8 @@ Two 2025–2026 developments matter here. First, **llm-d** — a distributed inf
 Second, **multi-cluster GKE Inference Gateway** (announced March 2026) extends the Gateway API Inference Extension across cluster and region boundaries: a dedicated **config cluster** holds the routing policy while multiple **target clusters** run the actual model pods, giving you cross-region failover, GPU/TPU capacity pooling (burst into whichever region has free accelerators), and model-aware routing globally instead of per-cluster. The pattern generalizes beyond GKE: the shared idea is *separate the routing control plane from the serving data plane* so a regional outage or a capacity crunch in one cluster doesn't take down the whole service — the multi-region equivalent of the PodDisruptionBudget mindset from single-cluster serving.
 
 **What this means for the chapter's core intuitions:** GPUs are still exclusive, integer-scheduled units — DRA makes the *claims* richer, not the underlying scarcity softer. Health is still time-aware — KServe's KEDA integration scales on real serving pressure instead of guessing from CPU. The weights are still the workload — llm-d's disaggregation and KV-cache tiering are just more sophisticated answers to "where do the weights/cache live." And disruption is still bounded on purpose — multi-cluster routing is the PDB idea applied at the scale of a whole region.
+
+> **Saying it out loud.** Two things worth knowing here. llm-d is a distributed inference stack — Red Hat, Google, IBM, CoreWeave, NVIDIA — that joined the CNCF as a sandbox project in March 2026, and it sits above vLLM and adds disaggregated prefill and decode, meaning you run the compute-bound prefill phase and the memory-bandwidth-bound decode phase on different hardware sized for each. They report up to 70% higher tokens per second in disaggregated configurations. Separately, multi-cluster GKE Inference Gateway extends the Inference Extension across regions, with a config cluster holding routing policy and target clusters running the pods. The generalizable idea in both: separate the routing control plane from the serving data plane, which is really the PodDisruptionBudget mindset applied at the scale of a region.
 
 ---
 
@@ -361,6 +401,8 @@ Notes on the choices:
 - `maxSurge: 0` trades a little capacity during rollout for *not needing an extra GPU*.
 - The `preStop` sleep + 180s grace period gives streaming requests time to finish and the load balancer time to stop routing before the process exits.
 
+> **Saying it out loud.** If I had to describe a correct GPU Deployment manifest out loud: one `nvidia.com/gpu` under limits, a toleration for the GPU node taint and a nodeSelector for the right SKU, a startup probe with a budget sized to worst-case cold load, a readiness probe that only passes once the model is actually loaded, a lenient liveness probe that only takes over afterward, an initContainer fetching weights into a shared cache volume, a PodDisruptionBudget with `minAvailable`, and a termination grace period well above your longest generation. Every single one of those exists because of a specific failure — probes crash-looping a healthy load, drains evicting all replicas, SIGKILL cutting a stream mid-token. It's not ceremony; it's a list of incidents somebody already had.
+
 ## Brief KServe example
 
 The same intent, far less YAML, using KServe's `InferenceService`. KServe wires up autoscaling, routing, and the storage fetch for you.
@@ -386,6 +428,8 @@ spec:
 ```
 
 KServe pulls the weights from `storageUri` (S3/GCS/PVC/HTTP), applies a `ServingRuntime` for the vLLM format, and manages the Deployment/Service/autoscaler behind the CRD. You still tune probes and node placement via the `ServingRuntime` or pod overrides.
+
+> **Saying it out loud.** The KServe version of that same manifest is about fifteen lines: an `InferenceService` with min and max replicas, a model format of vLLM, a `storageUri` pointing at S3, and a GPU resource limit. KServe fetches the weights, applies a `ServingRuntime` for the format, and manages the Deployment, Service, and autoscaler behind the CRD for you. The honest tradeoff is that you've traded explicit control for less YAML — you still tune probes and node placement, just through the `ServingRuntime` or pod overrides rather than directly, and when something goes wrong you're now debugging through an abstraction layer. Which is fine, as long as you understand what the raw manifest would have looked like, because that's what the CRD is generating underneath.
 
 ---
 
@@ -485,6 +529,8 @@ spec:
 
 In a real cluster you'd usually scope that last egress rule to your cloud provider's object-storage IP ranges rather than `0.0.0.0/0`; it's left broad here because most teams reach weights through a NAT gateway whose egress IP isn't something the pod's `NetworkPolicy` can pin down more tightly without also breaking other HTTPS egress (registry pulls, telemetry). The important part is the *shape*: ingress restricted to the gateway/ingress and monitoring namespaces only, egress restricted to DNS and HTTPS — nothing else in or out.
 
+> **Saying it out loud.** The key thing to understand about MIG and time-slicing on Kubernetes is that neither is configured in the pod spec. They're set at the GPU Operator and device-plugin layer — a `ClusterPolicy` for MIG, a plain ConfigMap for time-slicing — and the pod just requests whatever resource name the plugin ends up advertising, like `nvidia.com/mig-1g.10gb` instead of `nvidia.com/gpu`. That separation matters because it means a MIG reconfiguration is a *node-level* operation that drains and repartitions the card, which is why nodes dip through a `Pending`-inducing window during a MIG change. Add a NetworkPolicy on top so the inference pods only accept traffic from the gateway namespace — on a shared GPU cluster the pods are multi-tenant neighbors, and default-allow networking is not what you want there.
+
 ---
 
 ## Debugging playbook: Pending and crash-looping GPU pods
@@ -515,6 +561,8 @@ kubectl get events --field-selector involvedObject.name=<pod>
 - `OOMKilled` in the container's `lastState` → raise the **memory limit** (host RAM to stage weights).
 - initContainer errors (S3 auth, disk full on `emptyDir` `sizeLimit`) → weights fetch is failing; the main container never starts.
 - CUDA/driver errors in logs → driver/toolkit mismatch (a job for the **GPU Operator**), or the GPU was already claimed.
+
+> **Saying it out loud.** Two symptoms cover almost every GPU pod incident, and both have a mechanical first move. If a pod is `Pending`, run `kubectl describe pod` and read the scheduler's own message — it names the exact constraint. `Insufficient nvidia.com/gpu` means no free GPUs, `untolerated taint` means you're missing a toleration, `didn't match node affinity` means your selector label is wrong, and `Insufficient cpu` means the GPU was free but the node couldn't fit your CPU or RAM request. If it's `CrashLoopBackOff` during startup, pull the logs from the *previous* attempt with `--previous` and check the events. Repeated liveness failures at suspiciously identical ages means a probe is killing the load; `OOMKilled` in `lastState` means host RAM, not VRAM. The scheduler is usually telling you the answer already.
 
 ### Walkthrough: a pod stuck `Pending` after a MIG config change
 
@@ -572,6 +620,8 @@ A concrete sequence, the way it actually unfolds on-call — this is the "20 fre
 
 **Lesson generalized:** `Insufficient nvidia.com/gpu` in the scheduler event is necessary but not sufficient diagnosis — always compare `allocatable` against `capacity` per node before assuming "the cluster is full." A gap between them almost always means the device plugin (or MIG manager, or driver container) is unhealthy on that specific node, not that GPUs are actually unavailable cluster-wide.
 
+> **Saying it out loud.** Here's the shape of a real one. A pod sits `Pending` ten minutes; describe says `Insufficient nvidia.com/gpu` on four nodes. The move that cracks it is comparing each node's *allocatable* GPUs against its *capacity* — and two nodes show allocatable zero against capacity eight. That gap is never "the cluster is full," it's the device plugin being unhealthy on those specific nodes. Sure enough, the plugin pods are crash-looping because a MIG profile change flipped the node labels but the physical repartition hadn't finished, and the plugin restarted mid-reconfiguration trying to enumerate MIG devices that didn't exist yet. Nothing about the pod spec was ever wrong. The generalizable lesson: `Insufficient nvidia.com/gpu` is a necessary but not sufficient diagnosis — always check allocatable versus capacity per node before believing the cluster is out of GPUs.
+
 ### A note on cold-start math
 
 Cold-start time for a scaled-up or rescheduled pod is roughly:
@@ -579,6 +629,8 @@ Cold-start time for a scaled-up or rescheduled pod is roughly:
 \[ T_{cold} = T_{provision} + T_{pull} + T_{weights} + T_{load} + T_{warmup} \]
 
 where \( T_{provision} \) is node acquisition (0 if a node is warm, minutes if the cluster-autoscaler must boot a GPU VM), \( T_{pull} \) is image pull, \( T_{weights} \) is fetching weights to the node, \( T_{load} \) is loading them into VRAM, and \( T_{warmup} \) is CUDA-graph capture / first-token warmup. Your **startup probe** budget must exceed \( T_{weights} + T_{load} + T_{warmup} \) (the init container covers \( T_{weights} \) separately if you split it out), and your autoscaling responsiveness is gated by the whole sum — which is why node-local caches and pre-pulled images matter so much.
+
+> **Saying it out loud.** Cold start for a GPU pod is a sum of five terms, and it's worth naming all of them: node provisioning if the autoscaler has to boot a VM, image pull, fetching the weights onto the node, loading them into VRAM, and warmup like CUDA graph capture. Two things fall out of that. Your startup probe budget has to exceed the load-plus-warmup portion, or you crash-loop a perfectly healthy pod. And your autoscaling responsiveness is gated by the entire sum — which is why a scale-up decision made in ten seconds can still take eight minutes to deliver capacity. That's the number that makes node-local weight caches and pre-pulled images worth the operational complexity: they're the only terms you can actually attack.
 
 ## Comparison: serving-on-Kubernetes options
 
@@ -591,6 +643,8 @@ where \( T_{provision} \) is node acquisition (0 if a node is warm, minutes if t
 | **KubeAI** | Lightweight k8s-native LLM operator | Yes, incl. scale-from-zero | OpenAI-compatible serving without Istio/Knative | Younger ecosystem, smaller community |
 
 Rule of thumb: start with a **raw Deployment** to understand the mechanics; graduate to **KServe** or **KubeAI** when you have many models and want autoscaling/canary for free; reach for **Ray Serve** when a single request must fan across multiple GPUs/nodes or you're composing models; adopt **NIM/Triton** when NVIDIA's optimized engines and support matter.
+
+> **Saying it out loud.** My rule of thumb: start with a raw Deployment so you actually understand the mechanics — GPU requests, probe timing, PDBs, weight fetching. Graduate to KServe or KubeAI once you have many models and want autoscaling and canary rollouts for free rather than hand-wiring an HPA per service. Reach for Ray Serve when a single request has to fan across multiple GPUs or nodes, or when you're composing several models into a pipeline — that's genuinely a different problem shape. And adopt NIM or Triton when NVIDIA's optimized engines and vendor support matter more than portability. The tradeoff running through all of it is control versus ceremony: the raw path is the most flexible and the most YAML, and every abstraction above it is a layer you'll eventually have to debug through.
 
 ---
 
@@ -610,6 +664,8 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 - **Time-slicing treated as a free lunch.** Advertising 4x replicas of a GPU does not give 4x compute or any memory isolation — two co-scheduled pods can OOM each other. Reach for MIG when tenants don't fully trust each other.
 - **No quota between serving and batch/training on a shared cluster.** Without Kueue-style quotas, a large eval sweep or fine-tuning job can starve the serving fleet of GPUs with no admission control to stop it.
 
+> **Saying it out loud.** The recurring failures on Kubernetes are pretty consistent. Probes killing pods mid-load — that's number one, and it's always a missing startup probe. GPU fragmentation, where twenty GPUs are free cluster-wide but no single node has the four your tensor-parallel pod needs. Huge image pulls compounding with node provisioning time. Thundering-herd weight downloads when N pods cold-start at once. No PDB, so a routine node drain takes the whole service down. Missing tolerations leaving pods `Pending` silently. An `emptyDir` cache that dies with the pod so every reschedule re-downloads the model. And a thirty-second grace period SIGKILL-ing pods mid-generation. The pattern: most of them look like something else — hardware failure, network outage, model bug — which is why the diagnosis discipline matters more than memorizing the list.
+
 ---
 
 ## Production case studies & war stories
@@ -625,6 +681,8 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 **Fix.** Added a `startupProbe` with `periodSeconds: 10, failureThreshold: 30` (a 300s budget), and left liveness to only take over after startup succeeded — the pattern in the fully worked example above. Rollouts went from "always crash-loops for the first 10 minutes, eventually succeeds by luck when a fast node happens to finish in time" to clean on the first attempt.
 
 **Lesson.** A crash loop with a *suspiciously consistent* time-to-first-crash is a probe timing bug, not hardware. Check the arithmetic (`initialDelaySeconds + periodSeconds * failureThreshold`) against your actual worst-case load time before blaming nodes. This is the single most common LLM-on-Kubernetes incident, and it is entirely self-inflicted — the fix is always a startup probe, never "replace the GPU."
+
+> **Saying it out loud.** A team moved a 34B model onto Kubernetes and copied a probe config from an existing CPU microservice: liveness with thirty seconds initial delay, ten-second period, three failures. No startup probe. Every rollout produced the same thing — pod Running, then CrashLoopBackOff, forever — and on-call's first theory was bad GPU hardware, so they cordoned two nodes before anyone did the arithmetic. The math: 30 plus 10 times 3 is a sixty-second grace window against a 180-second load. The kubelet killed it at T+60 every single time, deterministically; it only *looked* random because PVC read latency varied slightly per node. The fix was a startup probe with a 300-second budget. The lesson worth stealing: a crash loop with a suspiciously *consistent* time-to-crash is a probe timing bug, never hardware.
 
 ### Case 2: 20 free GPUs, one pod stuck Pending — fragmentation across nodes
 
@@ -643,6 +701,8 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 
 **Lesson.** "GPUs free cluster-wide" and "GPUs schedulable for this pod" are different numbers whenever a workload needs more than one GPU per node. Multi-GPU workloads need topology-aware placement designed in from the start (dedicated pools, gang scheduling, or DRA), not discovered as an incident.
 
+> **Saying it out loud.** Five 8-GPU nodes, lots of single-GPU pods, and one 4-GPU tensor-parallel deployment that sat `Pending` for over an hour while dashboards cheerfully showed twenty of forty GPUs free. The cause is bin-packing: the scheduler had spread the small pods evenly across all five nodes, leaving three or four free GPUs on each — and no node with four free *together*, which is what the tensor-parallel pod needs for NVLink bandwidth between them. The immediate fix is manually consolidating; the structural fix is splitting the node pool so multi-GPU workloads get a tainted pool sized exactly to their parallelism degree. The lesson: "GPUs free cluster-wide" and "GPUs schedulable for this pod" are different numbers the moment a workload needs more than one GPU on one node, and you encode topology into pool shape up front instead of discovering it as an incident.
+
 ### Case 3: the thundering herd that looked like a network outage
 
 **Setup.** An autoscaling event scaled a 70B-model service from 2 to 10 replicas in response to a traffic spike. All 8 new pods had cold `emptyDir` caches and started `initContainer`s pulling the same 140GB from one S3 bucket simultaneously.
@@ -650,6 +710,8 @@ Rule of thumb: start with a **raw Deployment** to understand the mechanics; grad
 **Symptom.** Network egress on the bucket's region saturated; all 8 pods' downloads slowed to a crawl, *and* the 2 already-healthy pods saw elevated latency as the shared NAT gateway's connection tracking maxed out. On-call initially chased it as a networking/NAT problem.
 
 **Fix and lesson.** Pre-populate a read-only RWX PVC (or a node-local cache warmed ahead of the spike) so scale-up pods mount already-present weights instead of re-downloading; if that's not feasible, stagger initContainer starts (e.g. a prefetch step with concurrency limits, or node-level caching so only the *first* pod on a given node downloads). The autoscaling chapter covers pre-warming pools for exactly this reason — cold-start stampedes are an autoscaling problem wearing a networking costume.
+
+> **Saying it out loud.** An autoscaler took a 70B service from two replicas to ten during a traffic spike. All eight new pods had cold `emptyDir` caches, so all eight initContainers started pulling the same 140 gigabytes from one S3 bucket at the same moment. Egress saturated, every download crawled, and the two already-healthy pods got slower too because the shared NAT gateway's connection tracking maxed out — so on-call chased it as a networking problem for a while. The fix is to make scale-up pods mount weights that are already there: a pre-populated read-only PVC, or a node-local cache so only the first pod on each node downloads. Failing that, stagger the initContainers with a concurrency limit. The framing I like: cold-start stampedes are an autoscaling problem wearing a networking costume.
 
 ---
 
@@ -702,6 +764,8 @@ Key decisions to narrate:
 5. **Bound blast radius per pool** — separate PDBs, separate node pools' taints, so a bad rollout or node drain on the 405B pool can't touch the 1B pool's availability.
 
 Interviewers are usually grading whether you *separate concerns by parallelism/latency class* rather than proposing one Deployment-per-model with no shared reasoning about GPU topology — that's the signal that differentiates a strong answer.
+
+> **Saying it out loud.** Serving 1B through 405B on one cluster with mixed interactive and batch traffic — the move is to separate concerns by *parallelism degree* and *latency class*, not to make one Deployment per model and hope. So: MIG-slice the 1B model since it's small and latency-sensitive and deserves hardware isolation; put 8B on a full but cheaper GPU like an L4; give 70B a gang-scheduled TP=4 pool sized exactly to its parallelism; give 405B a dedicated multi-node pool. Route by model identity and priority using `InferencePool` and `InferenceObjective` so interactive chat gets reserved capacity and batch runs best-effort. Autoscale each pool independently on vLLM queue depth, not CPU. And arbitrate quota with Kueue so an eval sweep can't starve the serving fleet. What's being graded is whether you separate by topology class at all.
 
 ### Red flags vs. green flags
 
@@ -791,6 +855,8 @@ A quick before/after for orientation:
 | Who advertises capacity | Device plugin DaemonSet per node | A DRA driver implementing the `resource.k8s.io` API |
 | MIG / topology awareness | Encoded indirectly via distinct resource names (`nvidia.com/mig-1g.10gb`) | Expressed natively in the claim's device request |
 | Maturity in production (2026) | Default, battle-tested | Early; vendor driver support still rolling out |
+
+> **Saying it out loud.** The concrete difference between the two models is one sentence: the device-plugin form asks for *a count*, and the DRA form asks for *a claim against a device class*. In practice that means instead of `resources.limits: nvidia.com/gpu: 1`, you reference a `ResourceClaimTemplate` whose device request is where richer selection criteria live — a specific MIG profile, GPUs sharing an NVLink domain, a minimum driver version. That's the thing the integer model structurally cannot express, and it's why fragmentation and topology are so painful today. The honest state of play in 2026, though, is that the device plugin is still the default and battle-tested path, and DRA driver support is still rolling out — so know the shape of it, recognize it in YAML, and keep operating the classic model day to day.
 
 ### kubectl diagnostic cheat sheet
 
@@ -906,6 +972,8 @@ spec:
 
 Every piece here traces back to a mechanism explained earlier in the chapter: the MIG resource name (section 2b and the extended build example), `maxSurge: 0` for GPU-scarce rollouts (section 7), a startup probe sized in seconds appropriate to a *small* model's faster load (section 4 — contrast the 600s budget on the 70B example), a PDB (section 7), and the ingress/egress shape from the `NetworkPolicy` extended example above. Small models on shared MIG hardware still get the same disciplines as the 70B single-GPU deployment — just with numbers scaled down.
 
+> **Saying it out loud.** The combined manifest is worth reading as a checklist rather than as YAML. It requests a MIG slice instead of a whole card, because this is a small latency-sensitive model on a multi-tenant pool where hardware isolation beats density. It has a startup probe sized to worst-case load, with liveness and readiness taking over only afterward. It has a PodDisruptionBudget so a node drain can't evict everything at once. It has a termination grace period longer than the longest generation, with readiness flipping first so traffic drains before shutdown begins. And it has a NetworkPolicy restricting ingress to the gateway namespace, because on a shared cluster your neighbors are other people's workloads. Every line traces to a specific failure mode from earlier in the chapter.
+
 ---
 
 ## Glossary — quick reference for interviews
@@ -983,6 +1051,8 @@ spec:
 ```
 
 The `serving-cluster-queue` guarantees the interactive fleet its 16-GPU baseline; the `batch-eval-cluster-queue` shares the same `cohort` and can *borrow* up to 12 more GPUs when serving isn't using its full quota, but never starves serving below its nominal reservation. This is the concrete mechanism behind bullet 4 of the system-design answer ("arbitrate GPU quota with Kueue") and the fix in war-story Case 2's "longer-term" remediation.
+
+> **Saying it out loud.** The concrete shape of GPU quota arbitration is three objects. A `ResourceFlavor` that identifies the hardware class by node label. A `ClusterQueue` for serving with a nominal quota — say sixteen GPUs — that's a guaranteed baseline nobody can take. And a second `ClusterQueue` for batch and eval in the same cohort, with a small nominal quota but a borrowing limit, so it can expand into serving's idle capacity when serving isn't using it, and gets pushed back out when serving needs it. That's the whole idea: batch gets to use the expensive idle hardware without ever being able to starve the interactive fleet below its reservation. It's the mechanism behind "arbitrate quota with Kueue" and the long-term fix for the fragmentation war story.
 
 ---
 

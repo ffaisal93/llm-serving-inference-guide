@@ -14,6 +14,8 @@ A model is *right, wrong, or plausibly-wrong-in-a-way-that-looks-right*. A new c
 
 So model serving needs everything a normal progressive-delivery pipeline has — traffic splitting, automated analysis, progressive promotion, automatic rollback — *plus* a quality gate that reads the body. The rest of this chapter builds that pipeline from the bottom up and then shows you the failure modes that bite teams who forget the italicized sentence above.
 
+> **Saying it out loud.** Shipping code and shipping a model look identical from a distance — build an artifact, put it behind a service, shift traffic, watch dashboards — but they're not the same problem. A web service is basically right or wrong: it returns a 200 or a 500, it's fast or slow, and error rate plus latency plus saturation catch essentially every regression that matters. A model is right, wrong, or *plausibly wrong in a way that looks right*. A new checkpoint can return 200 on everything, faster than the old one, while hallucinating more, refusing more valid prompts, or regressing on your hardest five percent of inputs. The one sentence to remember: model regressions live in the response *body*, and infra canaries only watch the *envelope*.
+
 ---
 
 ## Core intuition: models fail in ways infra canaries don't catch
@@ -38,6 +40,8 @@ The mental model:
 
 Canary analysis for models = the union of both. If your pipeline only has the first, you have built a very sophisticated way to ship regressions with confidence.
 
+> **Saying it out loud.** Picture ten percent of traffic on a new summarizer. Error rate identical, p95 latency actually 70 milliseconds *better*, no restarts, throughput up. A standard Flagger or Argo canary promotes that rollout, confidently. Meanwhile groundedness dropped from 0.91 to 0.78 and refusal rate on valid prompts went from 1.2% to 6.5%. Those two rows are invisible to the canary because reading them requires *scoring the generated text*, which is not a Prometheus counter you get for free. The distinction to hold: infra metrics answer "did the request complete correctly," and they're cheap and real-time. Quality metrics answer "was the answer good," and they're expensive, often delayed, and specific to your task. Canary analysis for models is the union — with only the first half, you've built a very sophisticated way to ship regressions confidently.
+
 ### A second example, different modality: code completion
 
 The summarization example makes the point with text-quality metrics, but the pattern generalizes to any generative task with its own notion of "correct." Picture a code-completion model behind an IDE plugin, canaried the same way:
@@ -52,6 +56,8 @@ The summarization example makes the point with text-quality metrics, but the pat
 
 Same shape, different domain-specific quality signal: for a summarizer it's groundedness/refusal; for a code-completion model it's does-it-compile and does-it-pass-the-tests. The infra gate is blind to both for the same structural reason — neither compile-rate nor test-pass-rate is a property of the HTTP response envelope, they're properties of *running the generated code*, which means the quality gate here necessarily looks like a `job` metric provider (Pattern C from Mechanism 2): spin up a sandboxed compile/test harness against a sample of the canary's suggestions and gate on its pass rate. The specific metric changes with the task; the requirement that *some* task-specific quality signal exists in the gate does not.
 
+> **Saying it out loud.** The pattern generalizes to any generative task with its own notion of correct. Take a code-completion model in an IDE: same story — error rate flat, p95 latency down 30 milliseconds, throughput up — while suggestion compile-rate dropped from 94% to 88% and test-pass-rate on a held-out repo suite fell from 71% to 58%. Same structural blindness for the same reason: neither compile-rate nor test-pass-rate is a property of the HTTP envelope, they're properties of *running the generated code*. Which tells you what the gate has to look like in practice — a sandboxed compile-and-test harness run against a sample of the canary's suggestions. The specific metric changes with the task; the requirement that some task-specific quality signal exists in the gate does not.
+
 ---
 
 ## The four strategies and when each fits model serving
@@ -62,6 +68,8 @@ Before mechanisms, get the taxonomy straight. All four move traffic from an old 
 - **Blue-green** — stand up the full new version (green) alongside the full old version (blue), test green out-of-band, then flip 100% of traffic at once. Instant cutover, instant rollback (flip back), but you pay for two full fleets during the overlap.
 - **Canary** — run the new version at small scale, send it a *slice* of real traffic (1% → 5% → 25% → …), analyze, and promote in steps. Small blast radius, gradual confidence.
 - **Shadow (mirror)** — send the new version a *copy* of real traffic but **discard its responses**. Users never see canary output. Pure evaluation, zero user risk.
+
+> **Saying it out loud.** Four ways to move traffic from old to new, differing in blast radius and undo speed. Rolling update swaps pods a few at a time with no old-versus-new concept at the traffic layer — that's the Kubernetes default and it's the wrong choice here. Blue-green stands up the full new fleet alongside the old and flips 100% at once: instant cutover and instant rollback, but you pay for two full fleets. Canary runs the new version small, sends it a slice of real traffic, analyzes, and promotes in steps. Shadow sends the new version a *copy* of traffic and throws the responses away — zero user risk, pure evaluation. For models, canary is the workhorse and shadow goes first for anything scary.
 
 ### Strategy comparison
 
@@ -79,6 +87,8 @@ Rules of thumb for model serving:
 - **Shadow first for scary changes** (new architecture, new quantization, new base model). It gives you production-distribution eval data with zero user exposure — then canary the survivors.
 - **Blue-green when the mix itself is the problem** — e.g. a prompt-format or tokenizer change where having v1 and v2 answer the same *conversation* would be incoherent, so you want an atomic switch gated on a full eval run.
 
+> **Saying it out loud.** My rules of thumb. Never roll out a new model with a bare rolling update — you lose the old-versus-new traffic distinction exactly when you need it most, and GPU pods are slow enough to cycle that a "quick" rollback isn't quick. Canary is the default: small weight, automated analysis on infra *and* quality, progressive promotion. Shadow first for genuinely scary changes — new architecture, new quantization, new base model — because it gives you production-distribution eval data with zero user exposure, and then you canary the survivors. And blue-green specifically when the *mix* is the problem: a tokenizer or prompt-format change where having v1 and v2 answer alternating turns of the same conversation would be incoherent, so you want an atomic switch gated on a full eval run.
+
 ---
 
 ## The 2025–2026 landscape
@@ -92,6 +102,8 @@ The mechanisms in this chapter (Istio/Gateway API weights, Argo Rollouts, Flagge
 **The bigger shift: mesh-free canaries via Gateway API are now a documented, supported path, not a workaround.** Flagger's own tutorial for this reads almost exactly like the Istio walkthrough later in this chapter, except the traffic-shifting object is a plain `HTTPRoute` attached to a `Gateway`, and Flagger edits its backend weights directly — no sidecars, no `VirtualService`, no mesh control plane to operate: <https://docs.flagger.app/tutorials/gatewayapi-progressive-delivery>. This matters for model serving specifically because GPU inference pods are already resource-heavy; not running an Envoy sidecar per pod is a real cost and complexity saving when your bottleneck is GPU memory, not network hops. The catch, per Flagger's own docs, is that you inherit whatever your specific Gateway implementation supports — session affinity needs `ResponseHeaderModifier` support, mirroring needs `RequestMirror` support, and not every Gateway controller implements every optional Gateway API feature yet.
 
 **The Gateway API project has been formalizing exactly this "mesh-agnostic canary" use case since GEP-1324** (the GAMMA initiative — Gateway API for Mesh Management and Administration), which is explicitly framed around requests like "I want to deploy a canary version of my application that splits traffic based on HTTP properties," and deliberately stays agnostic to sidecar-vs-sidecar-free mesh data planes. Practically: whether your traffic layer is Istio, Linkerd, a Gateway-API-native controller, or no mesh at all, the same `HTTPRoute` weight-splitting vocabulary now works, which is why Argo Rollouts, Flagger, and the mesh vendors have all converged on it as the interchange format. GEP: <https://gateway-api.sigs.k8s.io/geps/gep-1324/>.
+
+> **Saying it out loud.** The mechanisms here are years-old stable primitives; three things changed recently. First, you can now do canaries *without a service mesh* — Gateway API `HTTPRoute` weight-splitting is a documented, supported path in both Argo Rollouts and Flagger, which matters for GPU serving specifically because not running an Envoy sidecar per pod is a real saving when your bottleneck is GPU memory. Second, the quality-gate piece is getting formalized into specs and papers instead of hand-rolled scripts. Third, there's now a purpose-built LLM routing layer that understands models rather than just replica pools. Net for 2026: pick Argo or Flagger on their merits, route through Gateway API unless you already depend on mesh features, and treat the quality-gate webhook as a first-class metric provider rather than a manual step before or after.
 
 ### LLM-specific routing: the Gateway API Inference Extension
 
@@ -126,11 +138,15 @@ Where this fits relative to everything else in this chapter: it is a **routing-l
 
 Net for 2026: pick Argo Rollouts or Flagger on their existing merits (imperative fine-grained steps vs. declarative convention — see the comparison later in this chapter), route traffic through Gateway API `HTTPRoute` unless you have a mesh-specific reason not to (mTLS, L7 policy you already depend on), watch the Gateway API Inference Extension if your routing layer needs to be model- and cache-aware rather than just replica-aware, and treat the quality-gate webhook/job as a first-class metric provider in your AnalysisTemplate/Canary, not a separate manual step that happens "before" or "after" the automated pipeline.
 
+> **Saying it out loud.** Everything else in this chapter splits traffic by replica pool, completely unaware that the thing behind the pool is an LLM. The Inference Extension adds two CRDs that fix that. An `InferencePool` groups model-server replicas but load-balances with an Endpoint Picker that's aware of KV-cache state and queue depth instead of doing round robin. And an `InferenceModel` sits in front doing model-*identity* routing — which named model or LoRA adapter a request wants, at what priority — which is where you express an 80/20 canary in terms of model versions rather than pools. The reason that matters: a plain `HTTPRoute` weight can't simultaneously respect a version split *and* route for cache locality, because it has no concept of cache state. But it's a better dial, not a different decision process — you still wrap it in Argo or Flagger analysis.
+
 ---
 
 ## Mechanism 1: Traffic splitting
 
 Canary and shadow both need to route a *fraction* of requests somewhere. There are four common layers to do it, from crudest to most precise.
+
+> **Saying it out loud.** Canary and shadow both need to route a fraction of requests somewhere, and there are four layers to do it at, from crudest to most precise. Replica-ratio splitting through a shared Service — nine stable pods and one canary pod gives you roughly ten percent. Mesh-level weighted routing via an Istio `VirtualService`. Vendor-neutral weighting via Gateway API `HTTPRoute`. And header or session-based routing when requests aren't independent. That last distinction is the LLM-specific one: weighted splitting assumes each request stands alone, and a multi-turn chat conversation absolutely does not — if turn three lands on v2 after turns one and two hit v1, the assistant contradicts itself in a different voice.
 
 ### 1a. Kubernetes Service — replica-ratio splitting (crude, avoid)
 
@@ -156,6 +172,8 @@ Why this is bad for models:
 - No session affinity, no header-based routing, no clean rollback primitive.
 
 Use it only for a quick-and-dirty test. For anything real, split at the mesh/gateway layer.
+
+> **Saying it out loud.** The oldest trick is two Deployments sharing one Service through a common label selector, so the traffic split is roughly the replica ratio — nine stable pods, one canary, ten percent. It needs no mesh and no extra controller, which is its only virtue. The problems are real, though. Your minimum canary weight is bounded by replica count, so a one-percent canary needs ninety-nine stable pods, which is absurd on GPUs. You can't decouple weight from capacity, so a small canary is structurally slower per request. And there's no session stickiness at all. For GPU model serving specifically, that coupling is what makes it wrong — you end up choosing between a meaningful traffic weight and a sane number of expensive replicas.
 
 ### 1b. Istio VirtualService — weighted routing
 
@@ -195,6 +213,8 @@ spec:
 
 To advance the canary you edit the two `weight` values (90/10 → 75/25 → 0/100). To roll back, set `v2` to `0`. This is the primitive Argo Rollouts and Flagger drive for you (below) — they rewrite these weights automatically.
 
+> **Saying it out loud.** Istio's contribution is decoupling weight from replica count: a `DestinationRule` defines named subsets by pod label, and a `VirtualService` assigns weights across them that sum to 100. So you can send one percent of traffic to a canary that has two replicas — the weight and the capacity are independent knobs, which is exactly what the Service-based approach couldn't do. That decoupling is what makes real canary ladders possible on GPUs, where you can't afford ninety-nine stable replicas just to express one percent. The cost is that you're now operating a mesh control plane and a sidecar per pod, which on GPU nodes is memory and complexity you may not want — hence the move toward Gateway API for teams that don't otherwise need mTLS or L7 policy.
+
 ### 1c. Gateway API — the vendor-neutral successor
 
 Gateway API (`HTTPRoute`) does the same weighting in a mesh-agnostic way. Note the docs' precise wording: **weight is a proportional split, not a percentage** — the sum of weights in a rule is the denominator.
@@ -219,6 +239,8 @@ spec:
 
 `90 + 10 = 100` so v2 gets 10%. If you'd written `9` and `1`, v2 still gets 10% — the ratio is what matters. Gateway API is where new tooling is converging; prefer it for greenfield (see The 2025–2026 landscape, above), and note that the Gateway API Inference Extension's `InferencePool`/`InferenceModel` pair is built as a layer *on top of* this same `HTTPRoute` vocabulary, not a replacement for it.
 
+> **Saying it out loud.** Gateway API does the same weighting in a mesh-agnostic way through `HTTPRoute` backend refs, and there's one detail worth getting right because interviewers ask it: **weight is a proportional split, not a percentage.** The sum of the weights in a rule is the denominator. So weights of 3 and 1 mean 75/25, not 3% and 1% with 96% going nowhere. The reason this vocabulary won is that Argo Rollouts, Flagger, and the mesh vendors all converged on it as an interchange format, so the same weight-splitting expression works whether you're on Istio, Linkerd, a Gateway-native controller, or no mesh at all. The catch: optional features like mirroring and session affinity depend on what your specific Gateway controller actually implements.
+
 ### 1d. Header / session-based routing (for stateful serving)
 
 Weighted splitting assumes requests are independent. LLM chat sessions are not — a multi-turn conversation must hit the *same* model version, or turn 3 answers in v2's voice after turns 1–2 were v1's. Route by a stable key instead:
@@ -236,6 +258,8 @@ Weighted splitting assumes requests are independent. LLM chat sessions are not �
 ```
 
 More on session pinning in Failure Modes.
+
+> **Saying it out loud.** Weighted splitting quietly assumes requests are independent, and LLM chat sessions are not. If a multi-turn conversation gets split across versions, turn three answers in v2's voice with v2's context handling after turns one and two came from v1 — incoherent to the user, and it also corrupts your quality measurement, because now neither version is being evaluated on a clean conversation. So you route by a stable key instead: a session ID header, a consistent hash of the user ID, or an explicit opt-in cohort header for internal users. The rule to state plainly: pin at the *conversation* level, not the request level, whenever the model's output depends on prior turns — which is essentially always for chat.
 
 ### 1e. Model-serving-native canary: KServe
 
@@ -264,6 +288,8 @@ Two things worth knowing before you reach for it:
 
 The takeaway: whether the split lives in a `VirtualService`, an `HTTPRoute`, an `InferenceModel`, or `canaryTrafficPercent`, it's still just the *traffic* half of the problem — the analysis/quality-gate half from Mechanism 2 is what actually decides whether to keep ramping.
 
+> **Saying it out loud.** Everything above is generic Kubernetes traffic splitting bolted onto a model server as if it were any HTTP backend. If you deploy through KServe, canarying is a first-class field on the `InferenceService` — you set `canaryTrafficPercent` on the component you're updating and KServe manages the two revisions for you, using Knative underneath. The appeal is that the canary concept lives at the same level as the model, so a rollout is one field change rather than coordinated edits across a Deployment, a DestinationRule, and a VirtualService. The tradeoff is the usual one with abstractions: you get less control over the exact ladder and analysis, and you're debugging through a layer — so it fits teams standardizing on KServe, not teams that need fine-grained step control.
+
 ---
 
 ## Mechanism 2: Automated canary analysis
@@ -277,6 +303,8 @@ The shape of both:
 3. At each step it queries metrics (usually Prometheus) over an interval, a number of times.
 4. If a metric violates its condition too many times → **abort and roll back**.
 5. If all steps pass → **promote** (canary becomes stable).
+
+> **Saying it out loud.** Staring at Grafana while you bump weights doesn't scale and definitely doesn't fire at three in the morning, so you automate the promote-or-rollback decision. Both dominant tools have the same shape: you declare steps — weights and pauses — plus metrics with thresholds; the controller shifts traffic to the first step, queries the metrics over an interval a set number of times, and if a metric violates its condition too often it aborts and rolls back, otherwise it advances. Argo Rollouts is the imperative, fine-grained one where you spell out each step. Flagger is the declarative one where you state a convention and it generates the ladder. The important design property in both: the *failure* path is fully automatic, and only the success path is allowed to wait on a human.
 
 ### Argo Rollouts: AnalysisTemplate
 
@@ -327,6 +355,8 @@ Field semantics that trip people up:
 - `count` — how many times total; the analysis runs `count × interval` before it can succeed.
 - `successCondition` / `failureCondition` — a boolean expression over `result` (the query's returned vector). Provide one or the other.
 - `failureLimit` — how many failed measurements are tolerated before the whole AnalysisRun fails and triggers rollback. `failureLimit: 0` means one bad read aborts.
+
+> **Saying it out loud.** An `AnalysisTemplate` is a reusable bundle of metric checks, and each metric has four numbers that matter. The `interval` is how often you query. The `count` is how many times total. The `failureCondition` is the expression that means bad. And `failureLimit` is how many bad readings you tolerate before aborting — which exists specifically so one noisy measurement doesn't roll back a healthy deploy. A typical infra template watches success rate and p95 latency from your mesh's Prometheus metrics. The thing to notice about the design: it's reusable and referenced by name, so the same quality gate can be shared across every model rollout in the org rather than copy-pasted, which is how a quality bar actually gets enforced rather than suggested.
 
 ### Wiring it into a Rollout
 
@@ -392,6 +422,8 @@ What happens on `kubectl apply` with a new image:
 
 This is a **correct, faster, greener** rollout of the bad summarizer from the intuition section — because `infra-metrics` never looks at output quality. Now we fix that.
 
+> **Saying it out loud.** The `Rollout` object replaces your Deployment, and its canary strategy is an explicit list of steps you interleave: `setWeight` to shift traffic, `pause` to dwell, and `analysis` to run a template. So you literally write out one percent, wait ten minutes, run infra checks, five percent, wait fifteen, run infra plus cheap proxies, and so on. The virtue of that verbosity is that the ladder is legible in one place and reviewable in a pull request — someone can see exactly how much user exposure each gate is protecting. The other capability worth knowing: `spec.strategy.canary.analysis` runs *background* analysis continuously across the whole rollout, which is how you get a circuit breaker on error rate that doesn't have to wait for the next step boundary.
+
 ### Adding a model-quality gate
 
 The quality gate is *just another metric in the AnalysisTemplate* — the trick is where the number comes from. Three patterns, cheapest to strongest:
@@ -448,6 +480,8 @@ Reference this template alongside `infra-metrics` in a later canary step so qual
 
 > Tie-in to evaluation: these gates are only as good as the eval behind them. Everything from your offline eval chapter — golden datasets, LLM-as-judge calibration, reference-based metrics, statistical significance on small samples — is exactly what feeds Pattern B and C. A canary quality gate is *your offline eval, run online, on a traffic sample, wired to a rollback switch.*
 
+> **Saying it out loud.** Here's the key reframe: the quality gate is *just another metric in the AnalysisTemplate*. The whole trick is where the number comes from, and there are three patterns from cheapest to strongest. Pattern A is proxy signals already in Prometheus if your server emits them — refusal rate, empty-completion rate, mean output length as a truncation proxy, guardrail trigger rate, mean logprob. Those cost nothing and catch gross failures. Pattern B is a `web` provider calling an eval service that scores a window of recent canary responses. Pattern C is a `job` provider running a blocking eval suite. Start with A because it's free and instrument it today; graduate to B and C as the stakes rise. What you must not do is stop at latency and error rate.
+
 ### Flagger: the same idea, declared on one object
 
 Flagger folds steps + metrics + webhooks into a single `Canary` resource and drives the mesh for you. Equivalent rollout:
@@ -498,11 +532,15 @@ Flagger's control loop: every `interval` it nudges weight up by `stepWeight`, ch
 
 Argo vs Flagger, briefly: Argo Rollouts is imperative-steps + first-class `AnalysisTemplate`/`Experiment` (great when you want fine-grained control and blue-green *and* canary in one tool); Flagger is declarative and convention-driven with batteries-included webhooks (great when you want less YAML and a strong load-test/conformance story). Both roll back automatically on metric breach. Pick one; don't run both on the same workload.
 
+> **Saying it out loud.** Flagger folds the steps, metrics, and webhooks into a single `Canary` resource and drives the mesh for you — you declare a step weight, a max weight, an interval, and a failure threshold, and Flagger generates the ladder rather than you enumerating it. The real philosophical difference from Argo is declarative convention versus imperative control: Flagger is less YAML for the common case and less flexible when you want a non-uniform ladder, like dwelling much longer at 25% than at 5%. The other thing to know is that Flagger treats every configured metric and every rollout-phase webhook as a hard AND — a single failure halts and rolls back. Which is what you want for a quality gate, and worth confirming rather than assuming.
+
 ---
 
 ## Build it in practice — extended
 
 The AnalysisTemplate/Flagger snippets above showed infra metrics and quality metrics as separate examples. In production you gate on **both at once** — a single analysis step where a canary must clear a Prometheus-based infra threshold *and* a webhook-based quality score before the next weight bump fires. Below is a complete, corrected worked example: the eval-service contract, the Argo Rollouts side, and the Flagger equivalent.
+
+> **Saying it out loud.** In real pipelines you gate on infra *and* quality at once — a single analysis step where the canary must clear a Prometheus threshold and a webhook-based quality score before the next weight bump fires. That means three pieces: an eval service you own that scores recent canary responses, the Argo or Flagger wiring that calls it, and — the piece people get wrong — a clean distinction between "failed the gate" and "not enough data yet." Those two are completely different outcomes, and conflating them is precisely how you get flaky rollbacks that erode trust in the pipeline until someone turns the gate off. Which is worse than never having built it.
 
 ### The eval-service contract both tools call into
 
@@ -537,6 +575,8 @@ def score(req: dict):
 ```
 
 The `202` branch matters: "not enough samples yet" and "the model failed" are different outcomes, and conflating them is how you get the flaky-rollback pitfall from Mechanism 3. Argo's JSON-based `successCondition` can distinguish the two explicitly (below); a pure-status-code webhook (Flagger) has to be more careful about what it returns while still warming up.
+
+> **Saying it out loud.** The scoring service is small and you own it: pull a window of recently-logged canary responses, score them however your offline eval work calibrated, and return enough for the gate to check both the score *and* the sample size. That second return value is the whole point. If you've only got twelve judged samples so far, that is not a failure — it's not-yet-ready, and it should return a 202 rather than a 500. Argo can distinguish them explicitly because its `successCondition` reads named JSON fields, so you can require both a score threshold and a minimum sample count. A pure status-code webhook like Flagger's has to be more careful, because a 500 while warming up looks identical to a genuine regression.
 
 ### Argo Rollouts: one AnalysisTemplate, two independent metrics, both must pass
 
@@ -629,6 +669,8 @@ Wire it into the same canary ladder as before, just swapping the template name:
 
 Quality gating is deliberately deferred to the 25% step rather than 5% — at 5% traffic the eval service can't reliably gather 100 samples in a 5-minute window, so gating it there would violate the sample-size principle from Mechanism 3, below. At 25% of, say, 300 rps, 100 samples arrive in well under a minute.
 
+> **Saying it out loud.** Argo's semantics here are worth stating precisely because they're what makes the composite gate work. When a rollout step references multiple `AnalysisTemplate`s, the controller *merges* them, and the `AnalysisRun` only reaches Successful when every metric in every referenced template passes. There is no OR — a `web` provider failing rolls back exactly like a `prometheus` provider failing. That's precisely the gated-on-both behavior you want, and it means you can keep infra checks and quality checks in separate reusable templates without inventing any combination logic. The other documented detail that makes it practical: when a `web` provider's `jsonPath` resolves to an object rather than a scalar, `successCondition` can reference its fields by name — so score and sample count can be checked in one condition.
+
 ### Flagger: the same "both must pass" gate via a metric + a pre-rollout webhook
 
 Flagger expresses the same idea with a built-in `request-success-rate`/`request-duration` metric pair plus a **synchronous webhook** that must return HTTP 200 before Flagger advances the weight. Flagger treats *every* configured metric and *every* `rollout`-phase webhook as a hard AND — any single failure halts and rolls back:
@@ -675,6 +717,8 @@ spec:
 
 The eval service here must return a 2xx only when it judges the canary healthy (e.g. `quality_score >= 0.85` internally, with the same `n_samples >= 100` guard) and a non-2xx otherwise — Flagger doesn't parse a JSON body from `rollout` webhooks the way Argo's `web` provider does, so the scoring logic (and the sample-size guard) has to live inside the webhook handler rather than in the CRD. This is the main practical difference between the two tools' quality-gate ergonomics: Argo lets the CRD assert on the JSON response; Flagger wants a boolean expressed as an HTTP status code.
 
+> **Saying it out loud.** Flagger expresses the same composite gate differently: its built-in success-rate and duration metrics, plus a synchronous webhook that has to return HTTP 200 before Flagger advances the weight. And Flagger treats every metric and every rollout-phase webhook as a hard AND, so any single failure halts and rolls back — same semantics as Argo, different surface. The practical difference is that Flagger's gate signal is an HTTP *status code* rather than a JSON body, which is exactly why the not-enough-samples case needs care: you can't encode "score is 0.87 but n is only 12" in a status code without deciding what that means. Returning 202 for warming-up is the convention, but it's a convention you have to implement deliberately.
+
 ---
 
 ## Mechanism 3: Progressive promotion and automatic rollback
@@ -698,6 +742,8 @@ Design principles:
 - **Automatic beats manual.** The controller aborts the moment `failureLimit`/`threshold` is crossed. Humans add an optional `pause: {}` (indefinite) step for a manual approval gate before 100% on high-stakes rollouts — but the *failure* path should never require a human.
 - **Analysis can also run for the whole rollout**, not just per-step. Argo's `spec.strategy.canary.analysis` (background analysis) runs continuously and can abort at any weight the instant a metric breaches — useful for a "circuit breaker" on error rate that shouldn't wait for the next step boundary.
 
+> **Saying it out loud.** A sane model ladder looks like: 1% for ten minutes with infra-only smoke checks, 5% for fifteen with cheap quality proxies, 25% for thirty with an online judge sample, 50% for an hour with a blocking full eval suite, then promote — and keep the old fleet warm for a bake period. Three design principles hold it together. Dwell long enough to actually see the signal, because gating a quality metric at 1% traffic on twelve samples is how you get flaky rollbacks. Rollback must be *cheaper* than roll-forward, which it is only because you never tore down stable — rollback is setting the canary weight to zero, instantaneous at the traffic layer. And automatic beats manual: humans can add an approval pause before 100%, but the failure path should never wait for a person.
+
 ### Statistical rigor: the peeking problem
 
 There's a subtler version of the "sample size" pitfall worth naming explicitly, because it's the kind of thing that separates a good answer from a great one in an interview. `count`/`interval`/`failureLimit` checks a metric *repeatedly* over the dwell window — which means you are, whether you call it that or not, running a sequential statistical test. Classic fixed-sample significance testing (the kind behind a simple "is 0.78 significantly worse than 0.91?" calculation) assumes you look at the data *once*. An `AnalysisRun` that queries a quality score every 5 minutes for an hour and aborts the instant one reading crosses a threshold is looking at the data repeatedly — this is the "peeking problem," and it inflates your false-rollback rate beyond what a naive confidence interval suggests, because with enough repeated looks, pure noise will eventually cross almost any fixed threshold by chance.
@@ -711,11 +757,15 @@ Practical mitigations, roughly in order of how much rigor they buy you:
 
 None of this changes the YAML in this chapter — `failureLimit`/`threshold` already exist specifically to blunt this problem — but understanding *why* they exist, rather than treating them as an arbitrary knob, is exactly the depth a senior interviewer is probing for when they ask "how do you know your threshold is right?"
 
+> **Saying it out loud.** Here's the subtlety that separates a good answer from a great one. When you configure a metric with an interval, a count, and a failure limit, you are running a sequential statistical test whether you call it that or not. Classic significance testing assumes you look at the data *once*. An analysis run that queries a quality score every five minutes for an hour and aborts the instant a reading crosses a threshold is looking twelve times — that's the peeking problem, and it inflates your false-rollback rate, because with enough looks pure noise will eventually cross almost any fixed threshold. The mitigations: require repeated breaches rather than one bad read, widen the per-check threshold as a function of how many looks you'll take, or use a properly sequential test. `failureLimit` exists specifically to blunt this — knowing *why* is the depth being probed.
+
 ---
 
 ## Shadow / mirror deployments
 
 Shadowing (a.k.a. mirroring, dark launch) sends the new version a **copy** of real requests and **throws away its responses**. Users are served *entirely* by stable; the canary sees production-distribution traffic with zero user risk. This is the safest possible way to evaluate a scary model change.
+
+> **Saying it out loud.** Shadowing sends the new version a *copy* of real requests and throws its responses away. Users are served entirely by stable; the canary sees production-distribution traffic — real prompt lengths, real adversarial inputs, real burstiness — with literally zero user risk. That makes it the safest possible way to evaluate a scary model change, and the strongest quality comparison available, because you can diff v1 and v2 outputs on *identical* live inputs rather than on statistically similar samples. The cost is that you're running a full second inference path, so you're doubling GPU spend for the duration. The mature pattern is shadow, then canary, then promote: shadow catches gross regressions at zero user risk, and only the survivors graduate to real users.
 
 ### Istio mirroring
 
@@ -748,6 +798,8 @@ Semantics that matter:
 
 Argo Rollouts expresses the same idea with a `setMirrorRoute` step (mirror by percentage/match), letting you shadow before you canary within one Rollout.
 
+> **Saying it out loud.** Istio expresses mirroring as a `mirror` destination on the route plus a `mirrorPercentage`, and the important semantics are that the mirrored request is fire-and-forget — the response is discarded and the mirror's latency doesn't affect the user's request at all. Two details that matter operationally. The mirror percentage lets you shadow ten or twenty percent rather than the full hundred, which for paired-diff quality comparison is usually plenty and costs a fraction of the GPU. And Istio adds a suffix to the mirrored request's Host header, which is your hook for making downstream services shadow-aware — because a mirrored request that reaches a real tool call or a real database write is a production incident, not a test.
+
 ### What shadow buys you, and what it can't
 
 Shadow gives you real prompts against the new model with no user exposure — perfect for:
@@ -763,13 +815,17 @@ What it cannot do:
 
 **The mature pattern: shadow → canary → promote.** Shadow the risky checkpoint to catch gross regressions with zero risk; the survivors graduate to a small canary with real users and outcome metrics; the ones that pass promote.
 
+> **Saying it out loud.** Shadow is great for three things: paired diffing of v1 versus v2 on identical live inputs, which is the strongest quality comparison you can get; soak testing on real traffic shape that synthetic tests never reproduce; and warming caches before real traffic arrives. Two hard limits. It cannot do anything with side effects — if the model call writes to a database, invokes a tool, or bills a token budget, the shadow does it *too* unless downstream services check the shadow header and no-op. A mirrored request triggering a real tool call is an incident, not a test. And it cannot measure user-facing outcomes at all: responses are discarded, so you get quality signals but never click-through, thumbs-up, or conversion. Those need a real canary with real users.
+
 ### Sizing the canary: a back-of-envelope cost model
 
 Every extra GPU-hour a canary or shadow deployment burns is a real line item, so it's worth being able to reason about the cost out loud rather than just asserting "small canary, cheap." A simple model: if your stable fleet is \(N\) replicas of a GPU class costing \(c\) per hour, a canary at replica count \(k\) held for \(h\) hours costs \(k \cdot c \cdot h\) — independent of its traffic *weight*, because the weight controls how much traffic it gets, not how many GPUs it occupies. This is precisely why pitfall 4 (cold-start skew from too few canary replicas) and cost containment pull in opposite directions: a 1-replica canary is cheap but structurally slower per-request than a 12-replica stable fleet, which can look like a latency regression that isn't one; a canary sized to match stable's per-replica load costs proportionally more.
 
-A worked example: stable is 12 replicas of an 8×H100 node-class instance at, say, \(c\) = \$28/hour effective cost, running continuously. A canary at 2 replicas (roughly matching per-replica load if canary traffic is capped around 15–20% during the early steps) for a 3-hour ladder (1%→5%→25%→50%→100% with the dwell times from Mechanism 3) costs \(2 \times 28 \times 3 = \$168\) — a small, bounded, one-time cost per rollout. Shadowing the same checkpoint first, mirroring 100% of traffic for a 1-hour soak at the same 2-replica canary size, adds another \(2 \times 28 \times 1 = \$56\). Compare that to the cost of *not* canarying: the "regressed on the 5%" case study above ran for four days at full production traffic before anyone noticed, on a fleet sized for 100% of load — orders of magnitude more expensive in both direct GPU cost and reputational cost than the canary that would have caught it. The point isn't the specific dollar figures — it's that the canary/shadow tax is a small, bounded, up-front cost, and the failure-to-canary tax is unbounded and paid in production.
+A worked example: stable is 12 replicas of an 8×H100 node-class instance at, say, \(c\) = $28/hour effective cost, running continuously. A canary at 2 replicas (roughly matching per-replica load if canary traffic is capped around 15–20% during the early steps) for a 3-hour ladder (1%→5%→25%→50%→100% with the dwell times from Mechanism 3) costs \(2 \times 28 \times 3 = \$168\) — a small, bounded, one-time cost per rollout. Shadowing the same checkpoint first, mirroring 100% of traffic for a 1-hour soak at the same 2-replica canary size, adds another \(2 \times 28 \times 1 = \$56\). Compare that to the cost of *not* canarying: the "regressed on the 5%" case study above ran for four days at full production traffic before anyone noticed, on a fleet sized for 100% of load — orders of magnitude more expensive in both direct GPU cost and reputational cost than the canary that would have caught it. The point isn't the specific dollar figures — it's that the canary/shadow tax is a small, bounded, up-front cost, and the failure-to-canary tax is unbounded and paid in production.
 
 Two knobs matter most for keeping the bounded side small: **dwell time** (don't let steps sit longer than needed to accumulate a statistically sound sample — see the peeking-problem discussion in Mechanism 3) and **mirror percentage** for shadow (mirroring 10–20% of traffic instead of 100% is usually enough for paired-diff quality comparison, at a fraction of the GPU cost of a full mirror).
+
+> **Saying it out loud.** The cost model is simple and the key insight is counterintuitive: a canary's cost depends on its *replica count*, not its traffic weight — weight controls how much traffic it gets, not how many GPUs it occupies. So a one-percent canary on two replicas costs exactly the same as a fifty-percent canary on two replicas. Concretely, two replicas of an 8xH100 node-class instance at roughly $28 an hour effective, held for a three-hour ladder, is about $168 per rollout, plus another $56 for a one-hour shadow soak — those are of-a-date figures and GPU pricing moves. Compare that to the alternative: the incident later in this chapter ran a regression at full production traffic for four days. The canary tax is small, bounded, and paid up front; the failure-to-canary tax is unbounded and paid in production.
 
 ---
 
@@ -796,6 +852,8 @@ Two knobs matter most for keeping the bounded side small: **dwell time** (don't 
 **10. Sampling proportional to traffic, not proportional to risk.** An online judge or eval-suite sample drawn in proportion to live traffic mix inherits the traffic distribution's blind spots — a rare-but-important query category (a 5% long-tail intent, a long-context conversation, an edge-case language) gets a proportionally thin slice of the analysis sample, so a regression confined to that category hides behind a healthy aggregate score. *Mitigation:* stratify the quality sample with a guaranteed minimum count per category that matters, not a fair share of the aggregate — see the "regressed on the 5% no one canaries" case study, next.
 
 **11. Engine-level state that doesn't carry across versions.** Modern serving engines (vLLM, SGLang, TensorRT-LLM) keep substantial engine-level state — paged KV-cache blocks, prefix/radix caches, continuous-batching scheduler queues — that is specific to a running engine instance and is **not portable across a version bump**, even a "minor" one. A new engine version with a different attention kernel, a different default block size, or a changed scheduler policy starts every canary pod with none of that warm state, which compounds Failure Mode 4: it's not just the *model weights* that are cold, the *serving engine* itself hasn't built up the request-shape-specific scheduling behavior (batch-size heuristics, cache eviction patterns) that steady-state stable has accumulated. *Mitigation:* when the canary is an engine/runtime upgrade rather than a pure checkpoint swap, budget extra warmup time proportional to how different the new engine's caching/batching behavior is, and consider shadowing specifically to pre-populate prefix caches with your production prompt-prefix distribution before any user traffic hits the canary.
+
+> **Saying it out loud.** The recurring ways model canaries go wrong. Quality regressions sailing through green infra gates — the headline one. Gating quality too early on too few samples, producing flaky rollbacks that teach people to ignore the gate. Cold-start and topology skew, where a one-replica canary against a twelve-replica stable fleet looks slower for structural reasons that have nothing to do with the model. Session splitting, where a multi-turn conversation gets served by two versions. Sampling that inherits your traffic distribution's blind spots. Decommissioning the old fleet immediately on promotion, which throws away your cheap rollback path. And the eval service becoming a single point of failure whose outage reads as a model regression. The pattern: most of these make the *canary* wrong, not the model.
 
 ---
 
@@ -830,11 +888,15 @@ It surfaced four days after full promotion, via a spike in support-escalation ti
 
 **The lesson, restated for interviews:** a quality gate that samples *proportionally to traffic* inherits your traffic distribution's blind spots. Rare-but-important query classes need guaranteed representation in the eval sample, not a fair share of it — and "the eval suite passed" is only meaningful to the extent the eval suite actually contains the failure mode you're worried about. This is a sharper, more specific version of the chapter's opening claim: it's not merely "infra gates miss quality regressions," it's "even a quality gate misses regressions the *eval data* doesn't represent."
 
+> **Saying it out loud.** A support assistant serving 70% general questions, 25% billing, and a 5% tail of multi-step troubleshooting. A new checkpoint went up the full ladder — 1%, 5%, 25% with a judge sample, 50% with the full eval suite — and passed every gate; p95 latency even improved 80 milliseconds. But the judge sampled *proportionally to traffic*, so it drew almost entirely general Q&A, the exact class the new model was good at. The regression was in multi-turn context preservation: after four-plus turns it started re-asking questions the user had already answered. It surfaced four days later through support tickets, and because the old fleet had been decommissioned on promotion, there was no instant rollback. The sharpened lesson: it's not just that infra gates miss quality regressions — even a quality gate misses regressions the *eval data* doesn't represent. Rare classes need guaranteed representation, not a fair share.
+
 ### Shorter incident notes worth knowing
 
 - **Cold-start latency masquerading as a real regression.** A team's canary at 5% weight failed the p95-latency gate every time, on every version, canary or not — because the canary ReplicaSet only had 1 replica against 12 stable replicas, so its per-pod queueing depth was structurally worse regardless of model quality, and its KV-cache was permanently cold (never warm enough between analysis windows to amortize). Not a model problem — a topology problem. Fix: size canary replica count so per-replica load is comparable to stable, and pre-warm before the first analysis window (see Failure Mode 4, above).
 - **The webhook quality gate became a single point of failure.** A `quality-eval-service` outage (unrelated to the model) caused every canary's `web`/webhook metric to fail, which correctly aborted rollouts — but on-call initially assumed the *model* was regressing, and wasted an hour bisecting a bad checkpoint. Fix: alert on and dashboard the eval service's own health distinctly from "canary failed," so a dependency outage reads as a dependency outage, not a false model regression.
 - **A quantized canary that "passed" on aggregate but not on long context.** A team shipped an INT4-quantized version of an existing checkpoint purely for cost savings, canaried it on latency/error/refusal-rate — all fine — and promoted. Weeks later, an analysis of downstream conversion showed a small but real drop confined to conversations over ~6k tokens of context, where quantization error compounded enough to nudge factual answers wrong more often. The team's eval sample, like most, skewed toward shorter interactions. Fix: when the change under canary is specifically a compression/quantization technique, add a context-length-stratified quality check (short/medium/long) rather than relying on an aggregate score, since compression artifacts are exactly the kind of regression that scales with sequence length.
+
+> **Saying it out loud.** Three shorter ones worth internalizing. A canary that failed the p95 latency gate on *every* version because it had one replica against twelve stable ones — structurally worse queueing and a permanently cold KV cache, so it was a topology problem masquerading as a model problem; the fix is sizing canary replicas so per-replica load is comparable, and pre-warming before the first analysis window. An eval-service outage that correctly aborted every rollout, while on-call spent an hour bisecting a checkpoint that was fine — so dashboard the eval service's health separately from "canary failed." And an INT4-quantized canary that passed on aggregate but had a real regression confined to conversations over about six thousand tokens, because quantization error compounds with sequence length and the eval sample skewed short.
 
 ---
 
@@ -949,6 +1011,8 @@ A sketch of a strong answer, roughly in the order an interviewer wants to hear i
 
 **What a strong candidate says that a weak one doesn't:** naming the sample-size/stratification problem unprompted, insisting quality gates are "and" not "or" with infra gates, and explaining *why* rollback is fast (stable never scales down until confirmed) rather than just asserting it is.
 
+> **Saying it out loud.** I'd narrate it as a funnel. Offline eval against a *stratified* prompt suite first, then a shadow soak on mirrored live traffic — zero user exposure, paired diffing against stable, and only survivors move on. Then a weighted canary ladder through Gateway API or a mesh: 1%, 5%, 25%, 50%, with dwell times long enough to accumulate a real sample at each. Every step gated on infra *and* a task-specific quality signal, both must pass, with automatic rollback that's just setting the weight to zero. Session-pinned routing so multi-turn conversations don't split across versions. And after promotion, keep the old fleet on warm standby for a defined bake period — 72 hours — because the regression that surfaces on day three needs an instant rollback, not a redeploy.
+
 ### Red flags vs. green flags
 
 | Signal in a candidate's (or a team's) design | Red flag | Green flag |
@@ -982,6 +1046,8 @@ Before you can gate on an expensive judge score (Pattern B/C), you need Pattern 
 | Tool-call malformation rate (agentic serving) | Broken function-calling / tool-use output that infra metrics never see (a 200 with unparseable JSON is still a 200) | Counter on JSON-schema/tool-call parse failures | fail if `> 0.5%` |
 
 None of these require you to change or slow down the response path — they're counters incremented next to logging, scraped by the same Prometheus that already backs your infra `AnalysisTemplate`. Wire two or three of these into the earliest canary steps (1–5% weight) as Pattern A, and reserve the expensive judge/eval-suite gate (Pattern B/C) for the steps with enough traffic volume to support it — this is exactly the ladder from Mechanism 3.
+
+> **Saying it out loud.** If you take one action from this chapter, it's this: instrument the cheap quality proxies before you build anything sophisticated. Refusal rate on valid prompts. Empty or near-empty completion rate. Mean and p95 output token count, as a proxy for truncation and degeneration. Guardrail-filter trigger rate. Mean token logprob, as a crude confidence signal. Every one of those is a Prometheus counter your server can emit today with no judge model, no eval service, and no extra GPU. They won't catch a subtle factuality regression — but they *would* have caught the 6.5% refusal-rate jump from the opening example, and a gate that catches gross regressions today is worth more than a perfect gate you're still designing next quarter.
 
 ---
 

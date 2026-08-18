@@ -13,6 +13,8 @@ Get autoscaling wrong and you fail in one of two expensive directions:
 
 This chapter is about threading that needle: scaling on the *right* signals, using the *right* mechanism (HPA, KEDA, Knative), and mitigating the cold-start tax that makes LLM autoscaling uniquely hard. For the metric definitions and the Prometheus/Grafana stack that feeds these controllers, see the [Monitoring chapter](../08_monitoring/README.md).
 
+> **Saying it out loud.** Autoscaling a web service is easy because pods are small, start in seconds, and CPU is a decent proxy for load. LLM inference breaks all three. One replica pins a GPU that costs more per hour than an entire fleet of CPU pods, a new replica has to pull tens of gigabytes of weights and warm CUDA before it serves a single token — so adding capacity is a multi-*minute* operation — and traffic is bursty enough that a Slack integration can 10x your rate in seconds. Get it wrong in either direction and it's expensive: under-provision and the queue backs up and requests time out before new capacity lands, over-provision and you're paying for idle H100s around the clock to hedge against a spike that comes twice a day.
+
 ---
 
 ## Core Intuition: Why CPU-Based HPA Is Wrong for LLMs
@@ -48,6 +50,8 @@ Every mechanism below is the same loop with different parts swapped in. Keep it 
 
 The controller polls a metric, compares it to a target, and nudges the replica count. Everything interesting — which metric, which target, how fast to react, whether zero is allowed — is a knob on that loop.
 
+> **Saying it out loud.** Every autoscaling mechanism in this chapter is the same loop with different pieces swapped in, and it's worth holding in your head. Requests hit your replicas, the replicas emit metrics, a controller polls one of those metrics, compares it to a target, and nudges the replica count on the Deployment. That's it. Everything interesting is a knob on that loop: which metric you trust, what target you set, how fast you're willing to react in each direction, and whether zero replicas is even legal. HPA, KEDA, and Knative's KPA differ in what plugs into which slot, not in the shape of the loop — which is why picking the mechanism is usually the *least* important decision you make here.
+
 ---
 
 ## The Right Scaling Signals
@@ -72,6 +76,8 @@ Rule of thumb: **lead with queue depth or concurrency, guard with a latency SLO,
 
 **A note on GPU sharing and MIG.** NVIDIA's Multi-Instance GPU (MIG) partitions a single physical GPU into several smaller, hardware-isolated instances, and time-slicing shares a GPU across pods without hardware partitioning. Either changes the unit this entire chapter has been scaling: "a replica" no longer maps 1:1 to "a physical GPU," so `nvidia.com/gpu: 1` in a pod spec might mean a full H100 or a fraction of one depending on the node's MIG configuration. Before applying any of this chapter's cost or headroom math to a MIG-partitioned fleet, confirm which of "replica," "GPU instance," and "physical GPU" your `maxReplicas`/quota numbers actually refer to — the three are easy to conflate and the resulting error compounds directly into the warm-pool sizing calculation above.
 
+> **Saying it out loud.** There's no single perfect signal, so good setups compose two: a fast demand signal as the trigger and a latency SLO as a guardrail, so a breach of either forces a scale-up. Queue depth — `num_requests_waiting` — is the best primary because it's a *leading* indicator: it moves before users feel anything. In-flight concurrency is the stable alternative. The trap worth naming explicitly is GPU utilization: it reads high whether you're efficiently batched or drowning, and it can read high while the model is actually memory-bandwidth-stalled, so it's a sanity cross-check, never a trigger. And latency is the SLO itself, which makes it *lagging* — by the time it breaches, users are already hurting. Scale on the length of the line, not on how busy the cashier's hands look.
+
 ---
 
 ### Signal composition patterns seen in production
@@ -84,6 +90,8 @@ Three combinations recur often enough to name:
 
 The unifying rule is the same one this chapter opened with: pick signals close to the actual bottleneck, use the fastest one as the trigger, and keep the SLO itself as a guardrail rather than the primary control variable.
 
+> **Saying it out loud.** Three combinations recur enough to be worth naming. The default is queue depth as the trigger plus a latency guardrail — queue depth reacts before anyone feels anything, latency confirms the SLO is genuinely being met. The second adds KV-cache utilization as an early warning in the middle, and you need that once long-context or highly variable-length requests are common, because KV pressure can spike faster than the queue does. The third is per-pool signals in disaggregated serving: KV-cache utilization for the decode pool, prefill-queue depth for the prefill pool, scaled independently. That last one is really just the first pattern applied twice. The unifying rule: pick signals close to the actual bottleneck, trigger on the fastest one, keep the SLO as a guardrail rather than the control variable.
+
 ## Mechanism 1 — HPA with Custom / External Metrics
 
 Kubernetes' HPA can scale on more than CPU. Since `autoscaling/v2` it supports three metric flavors:
@@ -93,6 +101,8 @@ Kubernetes' HPA can scale on more than CPU. Since `autoscaling/v2` it supports t
 - **Object / External** — a metric attached to another object or pulled from an external system (e.g. a Prometheus query).
 
 To feed HPA a Prometheus metric you install the **Prometheus Adapter** (`prometheus-adapter`), which registers the `custom.metrics.k8s.io` / `external.metrics.k8s.io` APIs and translates HPA's metric requests into PromQL. GPU utilization itself comes from NVIDIA's **`dcgm-exporter`** (metric `DCGM_FI_DEV_GPU_UTIL`), scraped by Prometheus.
+
+> **Saying it out loud.** Kubernetes' HPA can scale on more than CPU — since `autoscaling/v2` it takes resource metrics, per-pod custom metrics, and external metrics. But HPA doesn't speak PromQL, so you need the Prometheus Adapter in between, which registers the custom-metrics API and translates HPA's requests into queries. GPU utilization itself comes from NVIDIA's `dcgm-exporter`. So the pipeline is: engine emits `vllm:num_requests_waiting`, Prometheus scrapes it, the adapter exposes it under a Kubernetes-friendly name, HPA reads that and does its ratio math. Worth knowing because the single most common "HPA won't scale" incident isn't the HPA at all — it's a missing or misnamed metric one layer down in that chain.
 
 ### Wiring the metric pipeline
 
@@ -122,6 +132,8 @@ kubectl get --raw \
 
 If that returns `no metrics returned from custom metrics API`, the problem is the pipeline (labels, series name, scrape) — not the HPA.
 
+> **Saying it out loud.** The adapter config is one rule that maps a Prometheus series to a Kubernetes metric name plus the PromQL to compute it. One gotcha built right into the example: the metric name has a colon in it, `vllm:num_requests_waiting`, and HPA metric names can't contain colons — so you rename it in the `as:` field. Before you point an HPA at anything, verify the metric is actually being served with a `kubectl get --raw` call against the custom-metrics API. If that returns "no metrics returned," your problem is labels, series names, or scrape config — not the autoscaler. Doing that thirty-second check first is the difference between debugging one layer and debugging three.
+
 ### The HPA algorithm
 
 HPA computes desired replicas with a simple ratio:
@@ -139,6 +151,8 @@ With multiple metrics, HPA computes a target for each and **takes the maximum** 
 \]
 
 If, in the same cycle, the GPU-utilization metric only computes a desired count of 6, HPA takes the max of the two — 9 replicas, driven by queue depth — and that's the number that actually gets applied. This is the concrete mechanism behind "whichever signal is more stressed wins": it isn't a qualitative preference, it's this arithmetic, evaluated per metric, every sync.
+
+> **Saying it out loud.** HPA's math is a single ratio: desired replicas equals current replicas times current metric value over target metric value, rounded up. So three replicas averaging fifteen waiting requests against a target of five gives you nine. The important behavior with multiple metrics is that HPA computes a recommendation for each and takes the *maximum* — so whichever signal is most stressed drives the decision. That's not a qualitative preference, it's literally this arithmetic evaluated per metric every sync, and it's exactly why a fast demand signal plus a latency guardrail composes cleanly. It's also why a stale or misconfigured secondary metric pinned high can silently override a perfectly healthy primary.
 
 ### Worked HPA manifest — scale on GPU utilization + queue depth
 
@@ -201,6 +215,8 @@ spec:
 - **Asymmetric policies** — aggressive up, gentle down (one pod every two minutes). This is the opposite of a cost-first web-app config, and it's deliberate: for GPUs, *flapping is more expensive than a little idle*.
 - **Target values are per-pod averages** — `averageValue: "5"` means HPA aims for 5 waiting requests per replica, so the ratio math scales linearly with fleet size.
 
+> **Saying it out loud.** The shape of a correct GPU HPA is deliberately asymmetric, and that's the thing to say out loud. Scale-up gets a stabilization window of zero — react to the freshest reading, never hesitate, because cold starts already make you slow and hesitating on top of that is the costliest mistake available. Scale-down gets a five-minute window, so a brief lull doesn't tear down a replica you'll immediately re-pay a cold start to rebuild. And the step policies match: add up to four pods a minute, remove at most one every two minutes. This is the opposite of a cost-first web-app config and it's deliberate — for GPUs, flapping costs more than a little idle time does.
+
 ---
 
 ### Troubleshooting — "my HPA won't scale"
@@ -214,6 +230,8 @@ In rough order of how often each is actually the culprit:
 5. **The `behavior` block's stabilization window is masking a real signal** — during initial rollout, temporarily set `scaleDown.stabilizationWindowSeconds` low to confirm the underlying metric-to-replica math works at all, then restore the production value.
 6. **Multiple metrics disagree and the wrong one is winning** — remember HPA takes the *max* recommendation across metrics; if a stale or misconfigured secondary metric is pinned high, it can override a healthy primary signal.
 
+> **Saying it out loud.** In rough order of how often each is actually the culprit. One: the custom metric isn't being served at all — check with `kubectl get --raw` before touching the HPA object, because most "HPA is broken" reports are a missing metric one layer down. Two: an `AverageValue` versus `Value` mismatch, where a `sum()` query paired with a per-pod target makes the effective threshold drift as the fleet grows. Three: the target is set below anything the workload can physically achieve, so HPA recommends `maxReplicas` forever. Four: the min or max boundary is silently constraining it — `kubectl describe hpa` shows computed versus constrained. Five: the stabilization window is masking a real signal. Six: multiple metrics disagree and the wrong one is winning the max.
+
 ## Mechanism 2 — KEDA for Event-Driven & Queue-Based Scaling
 
 HPA + Prometheus Adapter works but is fiddly: you maintain adapter rules, and HPA alone **cannot scale to zero**. **KEDA** (Kubernetes Event-Driven Autoscaling) sits on top of HPA and fixes both. It ships 70+ **scalers** (Prometheus, Kafka, SQS, RabbitMQ, Redis, ...) and, crucially, can scale a deployment **from 0 → 1 and back to 0**.
@@ -223,9 +241,13 @@ KEDA introduces two ideas HPA lacks:
 - **`activationThreshold`** — the value that flips a workload *from zero to one*. This is separate from the scaling `threshold` (which governs 1→N). It exists precisely so a single stray request doesn't wake a cold GPU, and so a trickle doesn't keep one warm.
 - **`minReplicaCount: 0`** — legal in KEDA, impossible in raw HPA.
 
+> **Saying it out loud.** HPA plus the Prometheus Adapter works but is fiddly, and it has one hard limitation: it cannot scale to zero. KEDA sits on top of HPA and fixes both — it ships seventy-plus scalers so you're not maintaining adapter rules, and it can go from zero to one and back. The concept worth knowing by name is `activationThreshold`, which is separate from the scaling threshold: the scaling threshold governs one-to-N, and the activation threshold is what flips you from zero to one. It exists precisely so a single stray request doesn't wake a cold GPU, and so a trickle of traffic doesn't keep an expensive replica warm all night for nothing.
+
 ### `ScaledObject` vs `ScaledJob`
 
 Everything above uses KEDA's `ScaledObject`, which manages an HPA behind a `Deployment` — the right shape for a long-lived pool of replicas serving live requests. KEDA also ships `ScaledJob`, which creates a Kubernetes `Job` per unit of work instead of managing replica count on a `Deployment` — the right shape for the batch-summarization system-design prompt later in this chapter: each queued item becomes its own Job, scaled by the same queue-depth-style triggers (SQS/Kafka/Redis length), with no notion of a "replica count" to tune stabilization windows for at all. Picking between them is really a question of workload shape, not a scaling-signal question: **`ScaledObject` for a pool of servers accepting live requests, `ScaledJob` for a stream of discrete, run-to-completion units of work.**
+
+> **Saying it out loud.** KEDA has two primitives and picking between them is a question about workload shape, not about scaling signals. A `ScaledObject` manages an HPA behind a Deployment — that's the right shape for a long-lived pool of replicas accepting live requests, which is everything else in this chapter. A `ScaledJob` instead creates a Kubernetes Job per unit of work, so there's no replica count to tune stabilization windows for at all — each queued item becomes its own run-to-completion pod. That's the right shape for batch pipelines: a summarization queue, an eval sweep, an offline scoring job. The rule in one line: `ScaledObject` for a pool of servers, `ScaledJob` for a stream of discrete units of work.
 
 ### Worked KEDA ScaledObject — queue depth + latency guardrail
 
@@ -281,11 +303,15 @@ spec:
 - **`cooldownPeriod`** governs the final ramp toward `minReplicaCount` (including the drop to zero); the HPA `behavior` block governs the 1→N steps.
 - Prefer a **dedicated queue metric** (`num_requests_waiting`) over latency as the *primary* — latency lags, and by the time p95 breaches, the SLO is already violated. Latency is the seatbelt, not the accelerator.
 
+> **Saying it out loud.** The KEDA version of the same idea is a `ScaledObject` with two triggers: a Prometheus trigger on queue depth as the primary, and a second Prometheus trigger on p95 latency as the guardrail. KEDA scales to satisfy whichever trigger demands more replicas — same max-of-metrics behavior as HPA, because KEDA is generating an HPA underneath. The additions over raw HPA are the ones that matter operationally: `minReplicaCount` can be zero, there's an `activationThreshold` separate from the scaling threshold, and a `cooldownPeriod` governs how long you wait before going back to zero. And you get all of that without maintaining Prometheus Adapter rules by hand.
+
 ---
 
 ## Mechanism 3 — Scale-to-Zero, Cold Starts, and Serverless GPU
 
 Scale-to-zero is the dream: pay nothing when idle. For LLMs it collides head-on with the **cold-start problem**.
+
+> **Saying it out loud.** Scale-to-zero is the dream — pay nothing when idle — and for LLMs it collides head-on with cold starts. The honest framing is that scale-to-zero isn't a mechanism problem, it's a latency-budget problem: you can absolutely configure it in KEDA or Knative in about five lines, and the question is entirely whether your users can tolerate a multi-minute first response. For anything latency-tolerant — batch jobs, internal tools, dev environments — it's straightforwardly correct and saves a lot of money. For anything user-facing you keep a warm floor, and then spend your engineering effort on shrinking the cold start rather than on the autoscaler config.
 
 ### Anatomy of an LLM cold start
 
@@ -297,6 +323,8 @@ When a scaled-to-zero deployment gets a request, the clock runs through:
 4. **CUDA / engine warm-up** — initialize CUDA context, compile/capture CUDA graphs, allocate the KV cache.
 
 For a mid-size model this is routinely **1–5 minutes**, and can be far worse if the cluster autoscaler has to boot a fresh GPU node first. That is an eternity for an interactive request. So true scale-to-zero is only acceptable for **latency-tolerant** workloads (batch, internal tools, dev). For anything user-facing, you keep a warm floor.
+
+> **Saying it out loud.** Break a cold start into four phases and you know where to spend effort. Scheduling — finding a node with a free GPU, seconds if one's warm, minutes if the cluster autoscaler has to boot one. Image pull — the container is often five to fifteen gigabytes of CUDA and PyTorch. Weight load — reading tens of gigabytes into host RAM and then into VRAM, and this is the phase that dominates. And CUDA warm-up: context init, graph capture, KV-cache allocation. For a mid-size model that's routinely one to five minutes end to end, and far worse if a node has to be provisioned first. That's the number that makes LLM autoscaling structurally different from web-app autoscaling — everything else in this chapter is a response to it.
 
 ### Cold-start mitigation comparison
 
@@ -316,6 +344,8 @@ For a mid-size model this is routinely **1–5 minutes**, and can be far worse i
 - **Panic mode / target-burst-capacity** — when traffic spikes sharply, KPA enters a short "panic" window and scales on a much shorter horizon to react fast, then relaxes.
 
 Knative is elegant for bursty, latency-tolerant serving, but the activator's request buffering doesn't *erase* the cold start — it just prevents dropped requests. You still pay the minutes. Pair scale-to-zero with a snapshot/fast-load strategy, or keep `minScale ≥ 1` for interactive paths.
+
+> **Saying it out loud.** Six ways to attack the cold-start tax, roughly by cost. Provisioned minimum replicas eliminates it entirely for the first N requests but is the most expensive — you're paying for idle GPUs. A warm-pool buffer is the same idea sized to demand growth rather than to peak. Faster weight loading via streaming attacks the dominant phase and costs only engineering effort, which is why it's closest to a free lunch here. Pre-pulling images removes the pull phase cheaply. Snapshot and checkpoint-restore can approach near-zero by skipping load *and* warm-up, but it's the newest and most fragile. And a smaller or quantized model is proportionally faster to load, at an accuracy cost. The practical stance: start with weight streaming, because it stacks with everything else.
 
 ### Worked Knative Service — concurrency-driven with a warm floor
 
@@ -355,6 +385,8 @@ spec:
 - **`scale-down-delay`** is Knative's answer to flapping — the KPA equivalent of HPA's scale-down stabilization window.
 - Set **`min-scale: 0`** only when the workload tolerates the cold start; the activator will hold the request but the user still waits out the load.
 
+> **Saying it out loud.** Knative's KPA scales on concurrency or requests per second rather than CPU, which is a much better fit for LLMs than raw HPA out of the box. Three pieces to know. `containerConcurrency` is the per-replica in-flight target it scales to maintain. The activator buffers requests while a scaled-to-zero service spins up, so they're held rather than dropped. And panic mode kicks in on a sharp spike, temporarily scaling on a much shorter horizon before relaxing. The honest caveat: the activator prevents *dropped* requests, it doesn't erase the cold start — those users still wait the full minutes. Which is why the example sets `minScale: 1`, a warm floor that dodges the cold start on the interactive path while `maxScale` still caps cost.
+
 ### Snapshot and checkpoint-restore, in more depth
 
 The cold-start table above lists snapshot/checkpoint-restore as the mitigation that can approach near-zero cold starts by skipping *both* the weight-load and warm-up phases, not just one. Worth unpacking why: a "cold" replica pays for weight load (reading tens of GB into VRAM) and warm-up (CUDA context init, graph capture, KV-cache allocation) every single time it starts, even though both produce an *identical* end state for a given model and configuration. Snapshotting captures that end state once — a already-warmed process, weights resident in VRAM, CUDA context initialized — and restores it directly on subsequent starts, turning "redo the whole boot sequence" into "load a pre-made snapshot."
@@ -365,6 +397,8 @@ Two flavors show up in practice:
 - **Fast-load without full process snapshotting** (Run:ai Model Streamer and similar) — still runs a normal boot sequence, but makes the weight-load phase itself fast by streaming concurrently rather than sequentially. Less fragile than full snapshotting, and the mitigation with the clearest, most reproducible published numbers (the ~6–7.6x figures in the Landscape section above) — which is part of why it has become closer to a default than snapshotting has, as of this writing.
 
 A practical stance: reach for fast weight loading first — it's lower-risk, stacks with every other mitigation in this chapter, and is now natively supported by vLLM. Reach for full process/CUDA snapshotting only when the SLO genuinely requires sub-few-second cold starts and the engineering cost of maintaining a more fragile, version-pinned snapshot pipeline is worth it — which is exactly the tradeoff the fastest serverless GPU platforms in the Landscape section's cold-start comparison table have already made on your behalf, if you'd rather not build it yourself.
+
+> **Saying it out loud.** The insight behind snapshotting is that a cold replica pays for weight load and CUDA warm-up every single start, even though both produce an *identical* end state for a given model and config. So you capture that end state once — warmed process, weights resident in VRAM, CUDA context initialized — and restore it directly. Two flavors: full process and CUDA-context snapshotting, which is fastest in principle since nothing is recomputed but is newest, most fragile, and typically pinned to a specific engine and driver version; and fast-loading like Run:ai Model Streamer, which still boots normally but streams weights concurrently. My stance: reach for fast weight loading first because it's lower-risk, stacks with everything, and is natively supported in vLLM. Reach for full snapshotting only when the SLO genuinely demands sub-few-second cold starts.
 
 ### Which mechanism should I pick?
 
@@ -378,11 +412,15 @@ A practical stance: reach for fast weight loading first — it's lower-risk, sta
 
 These aren't mutually exclusive: a common production shape is **KEDA for the demand-driven scale (including 0→1) plus a provisioned floor for the interactive tier**, with all three fed by the same Prometheus pipeline.
 
+> **Saying it out loud.** Short version. If you need simple custom-metric scaling with a floor of at least one and you already run Prometheus, use HPA plus the adapter — fewest moving parts. If you need scale-to-zero or you're driving off a queue rather than an inference metric, use KEDA, because it wraps HPA cleanly and gives you the zero-to-one transition HPA structurally cannot do. If you want concurrency-driven serverless with built-in request buffering during spin-up, use Knative. And if you have a strict interactive latency SLO — honestly, the mechanism matters far less than never cold-starting the hot path. These aren't exclusive either: a very common production shape is KEDA for demand-driven scaling plus a provisioned floor for the interactive tier, all fed by one Prometheus pipeline.
+
 ---
 
 ## The 2025–2026 Landscape
 
 Autoscaling for LLM serving moved from "borrow the web-app playbook" to a purpose-built discipline in 2025–2026. Four threads matter if you're building or defending a design today.
+
+> **Saying it out loud.** Autoscaling for LLMs went from "borrow the web-app playbook" to a purpose-built discipline over 2025 and 2026, and four threads matter. KEDA's scaler set kept growing, especially the Cron scaler for genuinely calendar-shaped demand, with predictive forecasting layers appearing on top. Serverless GPU platforms converged on cold starts measured in seconds rather than minutes. Model-weight streaming became close to a default and directly attacks the phase that dominates cold start. And disaggregated serving broke the assumption that "a replica" is the atomic scaling unit, so purpose-built autoscalers now scale prefill and decode pools independently on phase-appropriate metrics. Underneath all of it, the same principle: pick the signal closest to the actual bottleneck.
 
 ### KEDA's LLM-relevant scalers keep expanding
 
@@ -391,6 +429,8 @@ Autoscaling for LLM serving moved from "borrow the web-app playbook" to a purpos
 - The KEDA community is actively debating going further. GitHub issue [kedacore/keda#6934](https://github.com/kedacore/keda/issues/6934) (opened 2026) proposes an "LLM Scaler" — nicknamed **Cognitive Scaling** — that would feed unstructured signals (news feeds, social sentiment, support-ticket volume) through an LLM to produce a scaling metric *before* the effect shows up in queue depth at all, e.g. scaling ahead of a product launch or a viral moment. KEDA maintainer JorTurFer's counter-proposal — "scaling modifiers" that blend an LLM's judgment with existing scaler outputs rather than shipping a bespoke scaler — is the more likely direction: augment reactive metrics with synthesized context, don't replace them. As of this writing it is a proposal under discussion, not a shipped feature — cite it as "where the conversation is going," not as production-ready.
 - **Kedify** ([kedify.io](https://kedify.io)), founded by core KEDA maintainers, layers a proprietary **predictive autoscaling** feature on top of open-source KEDA: a `MetricPredictor` CRD forecasts a metric using Facebook Prophet, retrains on a configurable cadence (e.g. every six hours), validates itself against a held-out window using Mean Absolute Percentage Error (MAPE), and automatically falls back to the raw, non-predicted metric when forecast confidence drops ([kedify.io/resources/blog/predictive-autoscaling](https://kedify.io/resources/blog/predictive-autoscaling/), published Oct 23 2025). This is the productionized version of "look at yesterday's shape, not just this second's queue depth" — it augments, rather than replaces, the reactive Prometheus trigger.
 - Azure's own AKS engineering team published a worked example of KEDA driving GPU inference autoscaling for KAITO-hosted models on AKS ([blog.aks.azure.com/2026/02/03/autoscale-inference-workloads-with-kaito](https://blog.aks.azure.com/2026/02/03/autoscale-inference-workloads-with-kaito), Feb 3 2026) — evidence that "KEDA + Prometheus + GPU inference" is now a documented, vendor-supported pattern, not just a DIY recipe.
+
+> **Saying it out loud.** The Prometheus scaler is still the workhorse, but two others matter. The Cron scaler lets you declare named start and end windows with a desired replica count and a timezone — and importantly it only activates inside the windows you give it, which makes it the right tool for genuinely calendar-shaped demand like business hours or a known nightly batch. You can carry a Cron trigger and a Prometheus trigger in the same `ScaledObject`, and KEDA satisfies whichever demands more, same max-of-metrics idea as HPA. Beyond that, predictive layers like Kedify's forecast a metric with Prophet, validate against a held-out window, and fall back to the raw metric when confidence drops. The pattern to notice: these all *augment* the reactive signal, they don't replace it.
 
 ### Serverless GPU platforms have converged on "seconds, not minutes"
 
@@ -406,6 +446,8 @@ An Aug 15 2025 comparison of serverless GPU inference platforms ranked them by c
 
 The common thread at the fast end is **not using a generic Docker-then-CUDA-init boot sequence** — Beam's and RunPod's fast paths both skip large parts of the standard sequence that a vanilla Kubernetes pod pays for, which is exactly the "snapshot/checkpoint-restore" row in this chapter's cold-start table. It's no longer a research curiosity; it's how the fastest commercial platforms hit single-digit-second cold starts today. If you're building on raw Kubernetes rather than adopting one of these platforms outright, treat their numbers as the bar your users will implicitly compare you against.
 
+> **Saying it out loud.** The interesting thing about the serverless GPU platform comparisons is that the differentiator is almost entirely cold-start latency, and the winners get there by doing the snapshot and streaming work described earlier on your behalf rather than by any autoscaling cleverness. That reframes the build-versus-buy question usefully: you're not really choosing an autoscaler, you're choosing whether to own a fragile, version-pinned snapshot pipeline yourself. If your cold-start SLO is genuinely sub-ten-seconds and you don't want to maintain that machinery, a managed platform has already paid that engineering cost. If your workload tolerates a warm floor, you're paying a premium for a problem you don't have.
+
 ### Model-weight streaming keeps shrinking the dominant cold-start phase
 
 NVIDIA's **Run:ai Model Streamer** — an open-source Python SDK with a multi-threaded C++ backend — concurrently reads weight shards from storage while overlapping the CPU→GPU copy, instead of the default "read fully into host RAM, then copy" path. Its own published benchmarks on a 15 GB Llama 3 8B checkpoint ([developer.nvidia.com/blog/reducing-cold-start-latency-for-llm-inference-with-nvidia-runai-model-streamer](https://developer.nvidia.com/blog/reducing-cold-start-latency-for-llm-inference-with-nvidia-runai-model-streamer), Sept 16 2025):
@@ -418,12 +460,16 @@ NVIDIA's **Run:ai Model Streamer** — an open-source Python SDK with a multi-th
 
 That "up to 6x" figure is the same one cited in Microsoft's Azure Blob Storage integration write-up ([devblogs.microsoft.com/azure-sdk/eliminate-llm-cold-starts-load-models-up-to-6x-faster-with-azure-blob-storage-and-runai-model-streamer](https://devblogs.microsoft.com/azure-sdk/eliminate-llm-cold-starts-load-models-up-to-6x-faster-with-azure-blob-storage-and-runai-model-streamer/)), and the mechanism is now wired natively into vLLM (`--load-format runai_streamer`, [docs.vllm.ai/en/stable/models/extensions/runai_model_streamer](https://docs.vllm.ai/en/stable/models/extensions/runai_model_streamer/)) and into GKE's model-loading path ([cloud.google.com/blog/products/containers-kubernetes/nvidia-runai-model-streamer-supports-cloud-storage](https://cloud.google.com/blog/products/containers-kubernetes/nvidia-runai-model-streamer-supports-cloud-storage)). Azure's AKS engineering blog (July 13 2026: [blog.aks.azure.com/2026/07/13/runai-streamer-vllm](https://blog.aks.azure.com/2026/07/13/runai-streamer-vllm)) walks through wiring the same streamer to Azure Blob for AKS-hosted vLLM. The practical takeaway for the cold-start table above: weight streaming is close to a default now, not a niche optimization — and it directly attacks the phase (weight load) that dominates the 1–5 minute cold-start estimate.
 
+> **Saying it out loud.** Weight streaming attacks the phase that dominates cold start, and the numbers are good enough to matter. Instead of the default "read the whole checkpoint into host RAM, then copy to GPU," a streamer reads shards concurrently while overlapping the CPU-to-GPU copy. NVIDIA's published benchmarks on a 15-gigabyte Llama 3 8B checkpoint show 47 seconds down to 7.5 from local SSD — about 6x — and 37 seconds down to under 5 from S3, about 7.6x. The reason to treat this as close to a default rather than a niche optimization: it's wired natively into vLLM behind a single `--load-format` flag, it stacks with every other mitigation in this chapter, and it costs you nothing but a config change.
+
 ### Predictive and scheduled scaling for known traffic patterns
 
 Two complementary tools have matured for demand that isn't a pure surprise:
 
 1. **KEDA's Cron scaler** for genuinely scheduled patterns (business hours, batch windows, known regional peaks) — deterministic, no ML required, composable with a Prometheus trigger in the same `ScaledObject` (worked example below).
 2. **Forecast-based predictive scaling** (Kedify's `MetricPredictor`, and the broader pattern described by observability vendors such as Sedai, [sedai.io/blog/predictive-autoscaling-in-kubernetes](https://sedai.io/blog/predictive-autoscaling-in-kubernetes)) for patterns that are *regular but not calendar-fixed* — a shape that correlates with a marketing calendar or a usage cadence that drifts week to week. These layer a forecast on top of, not instead of, the reactive queue-depth signal: the forecast pre-warms capacity, the reactive metric still governs the fine-grained ramp.
+
+> **Saying it out loud.** For demand that isn't a pure surprise there are two complementary tools, and the distinction between them is worth being precise about. Cron scaling is for genuinely calendar-fixed patterns — business hours, a nightly batch window, a known regional peak — and it's deterministic with no ML involved. Forecast-based predictive scaling is for patterns that are regular but *not* calendar-fixed, where the shape correlates with something that drifts week to week. And the important architectural point for both: they layer on top of the reactive queue-depth trigger, never instead of it. The forecast pre-warms capacity ahead of the ramp, the reactive metric still governs the fine-grained response — because a forecast that's wrong should degrade to "slightly early or late," not to "no autoscaling."
 
 ### Disaggregated serving and purpose-built LLM autoscalers
 
@@ -457,6 +503,8 @@ spec:
 
   Notice the target metric is `gpu_cache_usage_perc` — the same KV-cache-pressure signal this chapter's "Right Scaling Signals" table and War Story 1 recommend adding as an *earlier-than-queue-depth* warning — and the asymmetric-tolerance idea is the asymmetric-stabilization principle expressed through a different knob. The convergence is the point: whether you hand-roll HPA/KEDA `behavior` blocks or adopt a purpose-built controller like AIBrix's APA or Dynamo's Planner, the underlying lessons — lead with a signal close to the real bottleneck, dampen oscillation asymmetrically, and treat prefill/decode (or CPU/GPU) as distinct scaling domains when the architecture actually splits them — hold across all of them.
 
+> **Saying it out loud.** Disaggregated serving splits the compute-bound prefill phase and the memory-bandwidth-bound decode phase onto separate GPU pools, and that breaks the assumption that a replica is the atomic scaling unit. NVIDIA's Dynamo Planner is the clearest example of what falls out: it makes *independent* scaling decisions per pool using phase-appropriate metrics — average KV-cache block utilization across the decode GPUs, and separately the depth of a global pending-request queue for prefill — each against its own threshold. That's exactly this chapter's "compose signals close to the bottleneck" principle applied twice, once per pool. The practical takeaway if you adopt disaggregation: nothing here stops applying, you just apply all of it twice with different metrics.
+
 ### Node-level GPU autoscaling closes the gap HPA/KEDA can't
 
 Everything in this chapter so far scales **pods**. A new pod still needs a **node** with a free GPU, and if the cluster autoscaler can't provision one fast enough (or at all, against quota), `maxReplicas` is a wish, not a guarantee — exactly the "GPU quota / capacity ceilings" pitfall flagged earlier. AWS's EKS best-practices guide for AI/ML compute ([docs.aws.amazon.com/eks/latest/best-practices/aiml-compute](https://docs.aws.amazon.com/eks/latest/best-practices/aiml-compute.html)) makes the pairing explicit: **Karpenter** for just-in-time node-level provisioning, **KEDA** for pod-level scaling on model performance metrics, working together rather than either alone:
@@ -487,12 +535,16 @@ spec:
 
 **What this means for the rest of the chapter.** None of the above replaces HPA/KEDA/Knative — it sits on top of or beside them. A representative 2026 production stack for a serious LLM product looks like: KEDA (a Prometheus trigger for reactive queue-depth scaling, plus a Cron trigger for known daily patterns, optionally a predictive layer for irregular-but-forecastable demand) driving the HPA that actually moves replica counts, with weight streaming cutting the cold-start tax for whichever replicas still have to boot cold.
 
+> **Saying it out loud.** Everything so far scales *pods*, and a pod still needs a *node* with a free GPU. If the cluster autoscaler can't provision one fast enough — or at all, against quota — then `maxReplicas` is a wish rather than a guarantee. So the complete design pairs Karpenter or an equivalent for just-in-time node provisioning with KEDA for pod-level scaling. Two details worth keeping. AWS's own guidance is that node-level provisioning buys you a GPU to schedule onto and does nothing about image pull, weight load, or warm-up — two different problems, both needing solving. And On-Demand Capacity Reservations turn "HPA wants twelve replicas but there are no H100s available" from a Pending-pod incident into a capacity-planning line item.
+
 
 ---
 
 ## Build It in Practice — Extended
 
 The manifests above are correct but abstract. This section tunes them against an actual traffic *shape* and turns the "headroom sizing" one-liner from the Cost section into a full worked calculation — including the moment the math tells you your `maxReplicas` cap is wrong.
+
+> **Saying it out loud.** The manifests up to here are correct but abstract, and the thing that makes them real is tuning them against an actual traffic *shape* rather than a hypothetical rate. That means four exercises: replaying a realistic trace to pick stabilization windows, running the warm-pool sizing math against the observed burst rate rather than a made-up number, deriving your concurrency target from a load-test sweep instead of picking a round number, and then deliberately breaking the config before production does. The most valuable moment in that sequence is when the headroom math tells you your `maxReplicas` ceiling is wrong — because finding that on a whiteboard is a capacity conversation, and finding it during a spike is an incident.
 
 ### Worked walkthrough — tuning stabilization windows against a traffic trace
 
@@ -514,6 +566,8 @@ Minutes 8–10 model a real burst (a client retry storm, or a batch job landing)
 
 The lesson generalizes into a sizing rule: **pick the scale-down window long enough to absorb the noise you actually observe (a single-minute lull, in this trace), but short enough that you're not bankrolling peak capacity long after a burst has visibly ended.** A useful starting point is a scale-down window of roughly \( 3\text{–}5 \times T_{cold} \) — long enough that you won't immediately need to re-pay a cold start if the burst repeats, short enough that idle GPU-minutes don't pile up. With \( T_{cold} \approx 180\text{s} \), that lands squarely on the 300s (5-minute) window this chapter recommends by default — the trace above is the empirical argument for that number, not just a rule of thumb.
 
+> **Saying it out loud.** Take a twenty-minute trace with a steady baseline of five replicas' worth of demand, a real burst to twelve at minutes eight through ten, and a one-minute false-alarm dip at minute sixteen. Now compare configs. Symmetric zero-and-zero tracks the raw recommendation exactly, so the one-minute lull causes a genuine scale-down to two replicas that reverses the very next minute — a wasted cold start for something that was never a trend. The recommended asymmetric config, zero up and 300 seconds down, hits twelve immediately on the real burst but takes the max over the trailing five minutes on the way down, so it holds at six through the dip and settles correctly after. And an overly conservative ten-minute down-window stays pinned at twelve for three extra minutes after demand is clearly back at baseline. The sizing rule that falls out: scale-down window of roughly three to five times your cold-start time.
+
 ### Worked warm-pool / min-replica sizing calculation
 
 The Cost section's headroom formula is:
@@ -534,6 +588,8 @@ Added to a steady-state floor of 5, that's a **warm floor of 14 replicas** to fu
 2. **Accept bounded queueing** during the worst 1–2 minutes of a burst like this one, if your SLO has slack — quantify how much queue depth 12 replicas can absorb at the target of 5 per pod (60 requests) and compare against the observed peak.
 3. **Shed or degrade** the excess — request queueing with a hard timeout, or routing overflow to a smaller/cheaper model — rather than silently violating the SLO for every request past replica 12.
 
+> **Saying it out loud.** Run the headroom formula against the real burst instead of a hypothetical. Demand climbed from six replicas to twelve over two minutes — three replicas per minute — and with a three-minute cold start you'd need nine buffer replicas to absorb it without anyone waiting. On top of a steady-state floor of five, that's a warm floor of fourteen — which *exceeds* the `maxReplicas` of twelve used in every manifest earlier. That's not a contrived result, that's the math doing its job and surfacing, before an incident, that the assumed quota is undersized for the worst burst this traffic actually produces. Three honest responses, in order: raise the quota, accept bounded queueing during the worst minute or two if the SLO has slack, or explicitly shed and degrade — route overflow to a smaller model rather than silently violating the SLO.
+
 ### Little's Law: the theory behind the target values
 
 Every target value picked in this chapter — 5 waiting requests per pod, 8 concurrent requests per replica — is an application of queueing theory's most useful identity, **Little's Law**:
@@ -552,6 +608,8 @@ L_{replica} = \lambda_{replica} \times W_{SLO}
 
 That is precisely what the Knative example's `containerConcurrency`/`target` pair, and the HPA/KEDA `averageValue` targets, are estimating — a defensible target isn't a round number, it falls out of \(\lambda_{replica} \times W_{SLO}\) measured from a load test. Concretely: a replica sustaining 8 requests/second of throughput at roughly a 1-second average time-in-system is, by Little's Law, carrying an average population of about 8 requests at any instant — which is exactly why `target: 8` shows up as this chapter's Knative concurrency target earlier. The number was never arbitrary; it falls out of the throughput and latency actually measured for the model and hardware in question.
 
+> **Saying it out loud.** Every target in this chapter — five waiting requests per pod, eight concurrent per replica — is Little's Law applied. The law says the average population in the system equals arrival rate times average time in system, and rearranged it tells you directly what a concurrency target should be once you've fixed a latency SLO: max in-flight per replica equals that replica's sustainable throughput times your latency target. Concretely, a replica sustaining eight requests per second at roughly a one-second time-in-system is carrying about eight requests at any instant — which is exactly where the `target: 8` in the Knative example came from. The point to make in an interview: a defensible target isn't a round number you liked, it falls out of throughput times latency measured on your actual hardware.
+
 ### Deriving your threshold from a load test, not a guess
 
 Interviewers routinely ask "how did you pick that number?" — here is the derivation, worked. Sweep concurrency per replica in a load test (see the [Load Testing chapter](../04_load_testing/README.md) for harness details) and record p95 TTFT at each level:
@@ -561,6 +619,8 @@ Interviewers routinely ask "how did you pick that number?" — here is the deriv
 | p95 TTFT (s) | 0.4 | 0.5 | 0.6 | 0.8 | 1.1 | 1.6 | 2.4 | 3.8 |
 
 Against an SLO of p95 TTFT \( \le 1.5 \) s, concurrency 12 already breaches it (1.6 s) while concurrency 10 is still safe (1.1 s) — the curve's knee sits between the two, as it typically does once KV-cache pressure and batching contention start to dominate. Pick the target *below* the knee, not at it, to leave slack for the seconds between "queue starts growing" and "new replica is ready": a target of 8–10 gives roughly 20–35% headroom under the last safe measured point. This is the same derivation this chapter used to justify `target: 8` in the Knative manifest, and per Little's Law above, an 8-request target at roughly 0.8s average time-in-system corresponds to a sustained per-replica throughput of \(\lambda_{replica} = L / W \approx 8 / 0.8 = 10\) requests/second — a number you can now cross-check independently against the load test's own throughput measurement at that concurrency level, and treat any large mismatch as a sign the load test or the target needs a second look.
+
+> **Saying it out loud.** "How did you pick that number" is a routine interview question, and here's the derivation. Sweep concurrency per replica in a load test and record p95 TTFT at each level. Against a p95 TTFT SLO of 1.5 seconds, you'll typically find something like concurrency 10 still safe at 1.1 seconds and concurrency 12 already breaching at 1.6 — the knee sits between them, as it usually does once KV-cache pressure and batching contention take over. Then you pick your target *below* the knee, not at it: 8 to 10 gives roughly 20 to 35 percent headroom, which is the slack you need to cover the seconds between the queue growing and a new replica being ready. Setting the target at the knee means every scale-up starts from an already-breaching state.
 
 ### Combining Cron and Prometheus triggers for a scheduled warm-up
 
@@ -605,6 +665,8 @@ spec:
 - Outside the `start`/`end` window, the Cron trigger contributes nothing and the reactive Prometheus trigger governs alone — including scaling further above the scheduled floor if the day's actual traffic exceeds the historical baseline.
 - This is deterministic scheduling, not forecasting — it costs nothing to reason about and is the right first step before reaching for a forecasting layer like Kedify's `MetricPredictor` (see the Landscape section above), which is better suited to patterns that shift week to week rather than a fixed business-hours shape.
 
+> **Saying it out loud.** If your baseline repeats on a known daily cycle — an 8am ramp, say — pre-warm ahead of it rather than letting the reactive trigger catch up mid-ramp, because catching up mid-ramp means every user during the first cold-start window pays for it. A single `ScaledObject` carries both a Cron trigger with the scheduled floor and the Prometheus trigger for everything the schedule doesn't predict, and KEDA scales to satisfy whichever is currently higher. The nice property is that this degrades safely in both directions: if the schedule is wrong and traffic comes early, the reactive trigger still catches it, and if traffic doesn't come at all, you've paid for an hour of warm replicas rather than an outage.
+
 ---
 
 ### Validating the config before it meets production traffic
@@ -621,9 +683,13 @@ None of the manifests above should meet real users untested. A short, concrete p
 
 A config that has been through all seven steps once, deliberately, before its first real traffic spike is a materially different bet than one that has only been read and reasoned about.
 
+> **Saying it out loud.** Seven things I'd do before this config sees real users. Replay a *trace-shaped* load test with a baseline, a burst, and a lull, so you exercise scale-down as well as scale-up. Watch replica count over time, not just latency, because a config that keeps latency fine by scaling twenty times in ten minutes has a flapping problem the latency graph won't show. Deliberately kill the metrics pipeline mid-test and confirm the autoscaler holds its last known count rather than scaling to zero. Force a scale-up from a genuinely cold floor and measure real cold start on your own image. Trigger a simultaneous multi-replica scale-up to confirm your step cap actually staggers it. Verify a long generation survives a scale-down. And cap the node pool deliberately to confirm Pending pods are visible to on-call.
+
 ## The Cost vs Latency Tradeoff
 
 Every autoscaling decision is a bet on this tradeoff. Warm replicas cost money every second they're idle; cold replicas cost *latency* (and lost requests) every time you're caught short. You can make the tradeoff explicit.
+
+> **Saying it out loud.** Every autoscaling decision is a bet on one tradeoff: warm replicas cost money every second they're idle, and cold replicas cost latency and dropped requests every time you're caught short. The useful framing is that the three pieces do three different jobs — the provisioned floor covers your baseline, the headroom buffer covers whatever demand arrives *during* a cold start, and the autoscaler handles the sustained ramp after that. And you tune the floor and buffer to the cost of a missed SLO, not to a generic utilization target, because "70% GPU utilization" is a number borrowed from a world where capacity arrives in seconds. It doesn't mean anything when capacity takes three minutes.
 
 ### A worked calculation
 
@@ -653,6 +719,8 @@ The general shape: **provisioned floor covers the baseline, headroom buffer cove
 
 **Measuring it, not just modeling it.** The worked calculation above assumes you already know your per-replica cost and utilization; in production, that visibility has to come from somewhere. Standard Kubernetes cost tooling reports at the node level, which is close to useless for a GPU fleet where the interesting question is *which deployment* is paying for idle capacity. **OpenCost** ([opencost.io](https://www.opencost.io)) has extended pod-level cost allocation to GPUs specifically by collecting `dcgm-exporter` metrics (`nvidia_gpu_utilization`, `nvidia_gpu_memory_used`) and correlating them with pod resource requests and cloud instance pricing, attributing cost down to the pod rather than the node — the tool coverage matches a problem this chapter's cost math otherwise leaves as an exercise for the reader: real-time inference workloads commonly run at only 20–40% GPU utilization due to sparse, bursty request patterns, while the bill reflects 100% of provisioned capacity regardless. **Kubecost**, OpenCost's commercially-supported counterpart, layers dashboards and alerting on the same underlying allocation model. Neither tool changes the autoscaling decision by itself, but both turn "we think our warm floor is costing too much" into a number you can actually put in front of whoever owns the budget — and into a feedback signal for re-running the headroom and warm-pool calculations above against real, current utilization rather than a one-time estimate.
 
+> **Saying it out loud.** Put numbers on it. One H100 replica at roughly $3.50 an hour, serving 20 requests a second at your SLO, with traffic for 8 business hours and near-zero the other 16. Always-on costs 84 dollars a day. Autoscaling with a warm floor only during business hours costs 28 — a 67% saving. But that saving buys you a cold start on the first request each morning and after any midday lull. So if the SLO forbids a multi-minute first response, you either keep the floor 24/7 and land back near the always-on number, or you spend engineering time on snapshotting and fast loading so scale-to-zero becomes safe. Note that GPU hourly pricing moves a lot and varies by cloud and commitment — treat any figure like that as of-a-date and re-derive from your own contract.
+
 ---
 
 ## Failure Modes & Pitfalls
@@ -666,6 +734,8 @@ The general shape: **provisioned floor covers the baseline, headroom buffer cove
 - **Scale-down mid-generation.** Terminating a pod that's mid-stream kills in-flight long generations. **Fix:** graceful termination with a drain period longer than your max generation time, and `terminationGracePeriodSeconds` sized accordingly.
 - **MIG/GPU-sharing capacity confusion.** Sizing `maxReplicas` or warm-pool buffers against "physical GPUs" when the cluster is actually running MIG-partitioned or time-sliced GPUs (or vice versa) silently over- or under-provisions, since a "replica" no longer maps 1:1 to a full GPU. **Fix:** confirm what unit your quota numbers and `nvidia.com/gpu` requests actually refer to before reusing this chapter's cost/headroom formulas verbatim.
 - **Regional/multi-cluster quota blindness.** For a globally-deployed product, GPU quota is granted per region/account, not globally — a `maxReplicas` ceiling sized against total fleet capacity can still leave one region's cluster starved of `Pending` pods while another region has idle headroom. **Fix:** size `maxReplicas`/node-pool ceilings and alerting per region, and treat cross-region traffic shifting (if your architecture supports it) as a capacity release valve distinct from autoscaling within a single region.
+
+> **Saying it out loud.** The recurring failures here. Flapping, where twitchy symmetric thresholds scale up and down every few minutes and each cycle pays a cold start — fix with a long scale-down window and err toward stickiness. Scaling on a lagging metric, where p95 latency or GPU utilization is your *primary* trigger, so you always scale after users are already hurting and then stay behind for minutes. Thundering herds, where a spike triggers many replicas that all pull the same weights simultaneously and slow each other down. A metric pipeline that's a hidden single dependency and fails silently. And `maxReplicas` becoming aspirational because no node has a free GPU. The pattern: almost every one of these is invisible on a latency dashboard until it's already an incident.
 
 ---
 
@@ -692,6 +762,8 @@ histogram_quantile(0.95, rate(kube_pod_start_time_seconds_bucket[10m])) > 180
 
 Each rule maps directly to a pitfall or war story earlier in this chapter: a missing metric, replica churn, unschedulable pods, silent preemption, and a cold start running longer than the sizing math assumed. Alerting on the autoscaler's own health, not just the application's, is what turns "we found out during the incident" into "we found out before it mattered."
 
+> **Saying it out loud.** Every failure mode deserves an alert that fires before the incident, not during it, and there are five worth having. Absent custom metrics, meaning your autoscaler is flying blind. Replica churn rate over a window, as a direct proxy for flapping. GPU pods stuck Pending, which is the earliest clear evidence that `maxReplicas` has become aspirational. Preemption rate above zero, which catches the KV-pressure blind spot that queue depth misses entirely. And time-to-ready exceeding the cold-start budget your warm-pool sizing assumed. The framing that generalizes: alert on the *autoscaler's own health*, not just the application's — that's what turns "we found out during the incident" into "we found out before it mattered."
+
 ## Production Case Studies & War Stories
 
 ### War story 1 — the queue looked fine while p99 spiked 8x
@@ -703,6 +775,8 @@ Each rule maps directly to a pitfall or war story earlier in this chapter: a mis
 **Fix.** Add `vllm:gpu_cache_usage_perc` (KV-cache utilization) and vLLM's preemption-count metric as an **earlier warning signal** alongside queue depth — KV-cache pressure and preemptions rise before queue depth does when the bottleneck is memory rather than raw arrival rate. The same source also flags a closely related tuning trap: running `--gpu-memory-utilization 0.95` leaves no slack and OOMs under concurrent load, while `0.85` provides the headroom that keeps preemption a rare event instead of the default behavior under load.
 
 **Lesson.** A single "safe-looking" metric is a false sense of security if it isn't the metric closest to the actual failure mode. Queue depth is an excellent *arrival-rate* signal; it is not a *memory-pressure* signal. Compose signals that cover different failure modes rather than trusting one number to mean "everything is fine."
+
+> **Saying it out loud.** A team scaling purely on `num_requests_waiting` watched p99 latency spike about 8x during a traffic-mix change toward long-context requests — while the queue-depth metric driving HPA never crossed its threshold. The autoscaler saw no problem and did nothing. The reason is subtle and worth knowing: vLLM pre-allocates its KV cache, and when that cache fills, the engine doesn't reject new work, it silently *preempts* in-flight sequences to make room. Preempted requests restart. So the queue is short precisely *because* the engine is discarding progress on other requests rather than letting them wait. The fix was adding KV-cache utilization and the preemption counter as earlier signals. The lesson: queue depth is an excellent arrival-rate signal and is not a memory-pressure signal.
 
 ### War story 2 — a spike triggered a thundering herd of cold starts
 
@@ -724,6 +798,8 @@ When several replicas cold-start at once, the *download* phase is the one that g
 
 **Lesson.** Thundering-herd cold starts are a *shared-resource contention* problem as much as a per-replica speed problem. Fixing per-replica cold-start time (caching, graph capture tuning, weight streaming) and fixing the stampede shape (staggered scale-up steps) are complementary — the trace-driven walkthrough above shows a real burst of 6 replicas arriving inside 2 minutes; without a capped scale-up policy, all 6 would hit the weights store at once.
 
+> **Saying it out loud.** A spike caused several replicas to scale up at once, each took most of five minutes to become ready, and by the time the fleet caught up the spike had already caused timeouts. The autoscaler technically worked, just too slowly to matter. A published breakdown for Llama 3.1 8B on L40S puts the naive cold start at 294 seconds — 61 for model download, 33 for weight load, 42 for CUDA graph compilation, 54 for graph capture. And the download phase is the one that gets *worse* under contention, since every replica is pulling the same weights from the same bucket. They cut it to 82 seconds by caching artifacts on a persistent volume and restricting graph capture to the batch sizes actually used. The lesson: fix per-replica speed *and* stagger the stampede with a scale-up step cap — they're complementary.
+
 
 ---
 
@@ -736,6 +812,8 @@ When several replicas cold-start at once, the *download* phase is the one that g
 **Fix.** Pair pod-level scaling with a node-level autoscaler purpose-built for just-in-time GPU provisioning (Karpenter on AWS, or the equivalent cluster-autoscaler node pool on other clouds), sized with real headroom rather than a static count that only covers steady state. Where the SLO can't tolerate even a Karpenter-speed node bring-up, use an **On-Demand Capacity Reservation** so the GPUs are already allocated to the account and Karpenter only has to attach a node to reservation, not queue for scarce on-demand capacity. Alert on `Pending` GPU pods as a first-class signal — it is the earliest, clearest evidence that `maxReplicas` has become aspirational rather than real.
 
 **Lesson.** An autoscaling design isn't complete at the `Deployment`/`ScaledObject` layer. Ask, explicitly, "when HPA/KEDA asks for one more replica than the cluster currently has room for, what happens next, and how long does it take?" — and treat that answer as part of the SLO, not an infrastructure detail to hand-wave past. This is precisely the gap the Node-level GPU autoscaling subsection in the Landscape section above is describing.
+
+> **Saying it out loud.** During a launch spike, HPA correctly computed ten replicas, Kubernetes accepted all ten pods, and six of them sat Pending for twenty minutes. Users hitting the overflow got timeouts while `kubectl get hpa` showed the autoscaler doing exactly what it was told. The cause is a distinction that's easy to gloss over: `maxReplicas` describes what the autoscaler is *allowed to ask for*, and says nothing about whether a node with a free GPU exists to run the pod on. The node pool was statically sized, and provisioning a new GPU node took longer than the spike lasted. Pod-level and node-level scaling are two control loops with two different response times. The question to ask explicitly in any design: when the autoscaler asks for one more replica than the cluster has room for, what happens, and how long does it take?
 
 ### Quick reference — defaults to start from
 
@@ -760,6 +838,8 @@ A condensed version of every number this chapter derived, for when you're sketch
 This table is a starting point for a design discussion, not a substitute for measuring your own workload's cold-start time, throughput-latency curve, and traffic shape — every number above was derived from a specific worked example earlier in this chapter, and yours will differ.
 
 Use it as a checklist when reviewing someone else's config, too: for each row, ask "is this value here because it was measured, or because it was left at a default?" — the answer to that question is often the fastest way to find the next incident before it happens.
+
+> **Saying it out loud.** If I'm sketching a first config under time pressure: queue depth as primary, latency as guardrail. Scale-up stabilization zero, scale-down 300 seconds — roughly three to five times cold start. Scale-up capped at four pods a minute to avoid a herd on shared weight storage; scale-down at one pod every two minutes because GPUs are expensive to churn. Activation threshold of one. `minReplicas` at the real steady-state baseline. `maxReplicas` at your actual GPU quota, with an alert on Pending pods, because a cap you can't hit is worse than no cap — it fails silently. And concurrency target derived from throughput times latency SLO with 20 to 35 percent margin below the load-test knee. The useful way to use that list is as a review checklist: for each row, ask whether the value is there because it was measured or because it was left at a default.
 
 ## Interview Mastery
 
@@ -827,6 +907,8 @@ Talking points an interviewer wants to hear, in rough priority order:
 - **Asymmetric stabilization**: fast scale-up, slow scale-down, tuned against the cold-start time as shown in the trace walkthrough — not left at framework defaults.
 - Explicitly naming the **tradeoff being made** — e.g. "we accept N minutes of degraded latency once or twice a year during an unprecedented spike, in exchange for not paying for peak capacity 24/7" — because a design with no acknowledged tradeoff is a design that hasn't been pressure-tested.
 
+> **Saying it out loud.** For a bursty, cost-sensitive consumer chat product with a daily pattern and occasional viral spikes, the answer is tiered rather than one mechanism. A warm floor sized from real data — steady-state baseline plus a buffer covering demand growth over your cold-start window. A Cron trigger to pre-warm ahead of the known daily ramp, layered under a reactive Prometheus trigger for everything the calendar doesn't predict, with KEDA taking the max. Asymmetric behavior: instant scale-up with a step cap so the herd is staggered, slow scale-down so a lull doesn't cost you a cold start. Composite signals — queue depth as trigger, KV-cache pressure as early warning, latency as guardrail. And an explicit overflow story past `maxReplicas`: queue with a hard timeout or route to a smaller model, because the hard cost ceiling means the cap is real.
+
 ### A second system design prompt — the contrasting case
 
 > *"Now design autoscaling for an internal batch-summarization pipeline: latency-tolerant (minutes are fine), but cost is the dominant concern, and traffic is extremely spiky (idle most of the day, large bursts overnight)."*
@@ -841,6 +923,8 @@ This is deliberately the mirror image of the consumer-chat prompt above, and a s
 - **Spot/preemptible capacity becomes attractive** here in a way it wasn't for the interactive product — a batch job that gets preempted can simply be retried, so the cost savings (up to ~90% per AWS's own guidance cited in the Landscape section) are close to free.
 
 The point of asking this as a follow-up is to check whether a candidate memorized "warm floor + asymmetric stabilization + composite signals" as a single template, or actually understands *why* each piece was chosen for the first scenario — and can correctly invert the ones that no longer apply.
+
+> **Saying it out loud.** Now invert it: an internal batch-summarization pipeline, latency-tolerant, cost-dominant, idle most of the day with big overnight bursts. Almost every knob flips. Scale to zero is now the right default rather than a risk, because nobody's waiting on a first token. KEDA over HPA specifically for that zero-to-one transition. The trigger moves upstream entirely — queue length on SQS or Kafka, not an inference-engine metric, because the unit of work is a job, not an HTTP request. The latency guardrail becomes a *completion-time* SLO like "the batch finishes by 6am," which is a genuinely different metric: queue drain rate given current replicas. And spot capacity becomes attractive, since a preempted batch job just retries. The point of the follow-up is to check whether you memorized a template or understand why each piece was chosen.
 
 ### Common mistakes candidates make in this conversation
 

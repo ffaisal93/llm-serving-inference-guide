@@ -8,6 +8,17 @@ NVIDIA Triton Inference Server is the piece that does all of that in one process
 
 If you have exactly one LLM and nothing else, vLLM or TGI is often simpler. If you have a *fleet* of heterogeneous models, or you want NVIDIA's fastest LLM path with unified ops tooling, Triton is the standard answer. This chapter explains what it is, how the model repository and `config.pbtxt` work, the backend landscape, the two flavors of batching, how to build a real multi-model ensemble, how to benchmark it correctly, and how it stacks up against vLLM, SGLang, and TGI in 2026 — plus the production incidents that teach the lessons faster than any diagram.
 
+> **Saying it out loud.** The problem Triton solves is that production is
+> rarely one model with one framework. You've got a PyTorch embedder, an ONNX
+> classifier, maybe a TensorRT vision model, and an LLM, and all of them need
+> stable endpoints, shared GPUs, batching, metrics, and clean versioning.
+> Triton is a serving runtime rather than a model format — you point it at a
+> directory of models with small config files and it loads each one on
+> whatever backend it needs, all in one process behind one API. The honest
+> caveat I'd give up front is that it's NVIDIA-only, and if you have exactly
+> one LLM and nothing else, vLLM or SGLang gets you most of the throughput
+> with a fraction of the setup. Triton earns its keep when you have a fleet.
+
 ---
 
 ## Core intuition
@@ -25,6 +36,19 @@ Everything else is detail hanging off that sentence:
 
 The payoff of the runtime abstraction: your infra team learns *one* server, *one* metrics format, *one* deployment story — and every model, whatever framework trained it, fits into it.
 
+> **Saying it out loud.** If I had to compress it to one sentence: Triton is a
+> serving runtime that hosts many models across many backends, with request
+> batching and per-model concurrency built in. Everything else hangs off that.
+> Many models means a model repository — add a directory, Triton serves it,
+> and it can hot-load and hot-unload without a restart. Many backends means
+> each model declares which engine runs it: TensorRT-LLM, vLLM, Python, ONNX
+> Runtime, LibTorch, TensorRT. Batching means Triton groups small requests to
+> feed the GPU efficiently — dynamic batching for fixed-shape models,
+> in-flight batching for LLMs. And concurrency means instance groups, which
+> control how many copies of a model run at once. The payoff of the
+> abstraction is that your infra team learns one server, one metrics format,
+> one deployment story.
+
 ---
 
 ## Architecture and the model repository
@@ -38,6 +62,17 @@ A single `tritonserver` process contains:
 3. **Backends** — shared libraries that actually execute a model. Each backend adapts one framework to Triton's C API. Multiple backends coexist in one server.
 
 Requests arrive at a frontend, get routed to the named model, land in that model's scheduler queue, are (optionally) batched, dispatched to a model *instance* (a loaded copy on a specific device), and the response flows back out.
+
+> **Saying it out loud.** Architecturally it's one process with three layers.
+> Frontends: HTTP on 8000, gRPC on 8001, Prometheus metrics on 8002 — worth
+> memorizing, those three ports come up constantly. The core does request
+> routing, the scheduler that does the batching, model management for load,
+> unload and versioning, and the shared-memory machinery that passes tensors
+> between models without copying. And backends are shared libraries that
+> actually execute a model, each adapting one framework to Triton's C API, all
+> coexisting in the same process. A request lands on a frontend, gets routed
+> to a named model, sits in that model's scheduler queue, gets batched, and
+> dispatches to an instance on a specific device.
 
 ### The model repository
 
@@ -113,6 +148,18 @@ Key fields:
 | `dynamic_batching` | Enables server-side batching (see below). |
 | `version_policy` | `{ latest: { num_versions: 1 } }`, `{ all: {} }`, or `{ specific: { versions: [1,3] } }`. |
 
+> **Saying it out loud.** The repository layout is strict and load-bearing,
+> and it's where beginners lose an hour. The top-level directory name is the
+> model name clients use — not the filename inside. Version subdirectories
+> have to be integers; a folder called "v2" or "0" is silently ignored, and by
+> default Triton serves the highest-numbered one. The model filename is fixed
+> per backend: model.onnx, model.pt, model.plan, model.py. And then
+> config.pbtxt declares the backend, tensor shapes, batching, and concurrency.
+> Triton can auto-generate that config, which is fine on a laptop and
+> dangerous in CI — the war story later in this chapter is exactly a
+> regenerated config silently dropping the batching block and capping
+> throughput at one request at a time.
+
 ---
 
 ## Backends: pick the right engine
@@ -129,6 +176,18 @@ A **backend** is the plug-in that runs a model. Choosing the wrong one for LLMs 
 | **TensorRT** | `tensorrt` / `tensorrt_plan` | Vision/CNN/transformer engines compiled to a `.plan` | Dynamic | Extremely fast for non-generative models; needs a TensorRT build. |
 
 **The one rule to remember:** do **not** try to serve an LLM's token-by-token generation loop through a plain ONNX/PyTorch backend with `dynamic_batching`. Autoregressive decoding has variable-length outputs and per-request state; naive dynamic batching stalls the whole batch on the slowest sequence. LLMs need **in-flight batching**, which means the **TensorRT-LLM** or **vLLM** backend.
+
+> **Saying it out loud.** Picking the wrong backend for an LLM is the single
+> most common Triton mistake, so the rule I'd state is: never serve an
+> autoregressive generation loop through the plain ONNX or PyTorch backend
+> with dynamic batching. Those backends assume every request does the same
+> amount of work, and decoding doesn't — one request emits five tokens and
+> another emits five hundred, so the whole batch stalls on the slowest
+> sequence. LLMs need the TensorRT-LLM or vLLM backend, which do in-flight
+> batching with a paged KV cache. Everything else maps cleanly: ONNX Runtime
+> for classifiers and embedders, LibTorch for TorchScript, TensorRT for
+> compiled vision engines, and the Python backend as the universal escape
+> hatch for tokenization and glue.
 
 ---
 
@@ -153,6 +212,18 @@ dynamic_batching {
 
 The mental model: **one batch in, one batch out, everyone waits for the slowest member.** That is fine when all members do equal work. It is a disaster for generation, where one request might emit 5 tokens and another 500.
 
+> **Saying it out loud.** Dynamic batching is the classic mechanism and the
+> mental model is: one batch in, one batch out, everyone waits for the slowest
+> member. Triton waits a short bounded window, collects whatever requests
+> arrived, runs them as one batch, and splits the results back out. There are
+> two knobs. Preferred batch size, which should match what the engine was
+> actually tuned for or you waste time on padding. And max queue delay in
+> microseconds, which is the real latency-versus-throughput dial — longer
+> delay means fuller batches, more throughput, and a worse tail. A thousand
+> microseconds is one millisecond, and that's a reasonable place to start.
+> This works beautifully when every member does equal work, and it's a
+> disaster for generation.
+
 ### In-flight (continuous) batching (for LLMs)
 
 LLM decoding is iterative: each forward pass produces one token per active sequence, then loops. **In-flight batching** (a.k.a. continuous or iteration-level batching) exploits this. Instead of freezing a batch for its whole lifetime, the scheduler operates *per decoding iteration*:
@@ -172,6 +243,19 @@ parameters: { key: "kv_cache_free_gpu_mem_fraction" value: { string_value: "0.9"
 ```
 
 The engine itself must be built (or, on the newer PyTorch execution path, configured) with paged KV cache enabled. Get this wrong — build a static-batch engine, or leave `batching_strategy` as `v1` — and you have thrown away the entire point of using TensorRT-LLM.
+
+> **Saying it out loud.** In-flight batching — also called continuous or
+> iteration-level batching — is the thing that makes LLM serving work, and the
+> insight is that decoding is iterative. Instead of freezing a batch for its
+> whole lifetime, the scheduler makes decisions per decode iteration: finished
+> sequences leave the batch immediately and return to the client, new arrivals
+> join at the next iteration and fill the freed slots. The batch composition
+> changes every single step, so the GPU is never idle waiting on the longest
+> sequence. Pair that with a paged KV cache — attention state in fixed-size
+> blocks, like OS virtual memory pages — and you kill the fragmentation and
+> padding that ruin naive batching. The failure mode to name: if you leave the
+> batching strategy at v1, or build a static-batch engine, you paid the whole
+> conversion cost and got none of the benefit.
 
 ---
 
@@ -207,6 +291,17 @@ instance_group [
   { count: 2  kind: KIND_GPU  gpus: [ 1 ] }
 ]
 ```
+
+> **Saying it out loud.** Batching fills a single GPU pass; instance groups
+> decide how many passes are in flight at once and where. Two instances on one
+> GPU lets Triton overlap two requests on separate CUDA streams, which helps
+> when one request doesn't fill the device. Instances spread across GPUs give
+> you data-parallel scale-out of the same model. But here's the distinction
+> that matters: for LLMs you generally do not stack many small instances. One
+> instance owns the GPU, or several GPUs through tensor parallelism, and
+> in-flight batching handles concurrency internally — adding instances just
+> fragments your KV cache into smaller pools. Multiple LLM instances only make
+> sense across genuinely separate GPU sets.
 
 ---
 
@@ -252,6 +347,16 @@ This is exactly the canonical TensorRT-LLM layout: a `preprocessing` Python mode
 
 **Ensembles are static graphs.** They cannot express loops or data-dependent branching.
 
+> **Saying it out loud.** Real inference is a pipeline — tokenize, run the
+> model, detokenize, or embed, search, rerank — and an ensemble lets you
+> express that server-side so the client makes one call. An ensemble is a
+> model with no code at all: just a config describing how tensors flow between
+> other models, and Triton executes the graph internally, passing tensors
+> through shared or GPU memory with no network hops between steps. That's the
+> whole value proposition — one client call, three internal model hops, zero
+> round trips. The constraint to know is that an ensemble is a static DAG, so
+> it can't branch on runtime data or call an external service mid-graph.
+
 ### Business Logic Scripting (BLS)
 
 When you need conditionals, loops, or calling model B based on model A's *output*, use **BLS**: a Python-backend model that issues inference requests to *other* Triton models from inside its `execute()`:
@@ -277,6 +382,16 @@ class TritonPythonModel:
 ```
 
 For LLMs, the TensorRT-LLM backend ships a `tensorrt_llm_bls` model as an alternative to the ensemble — same pipeline, but expressed in Python so you can add guardrails, retries, or multi-model routing. Rule of thumb: **ensemble for a fixed DAG, BLS when logic depends on runtime data.**
+
+> **Saying it out loud.** BLS is the escape hatch for when the pipeline isn't
+> a static graph. It's a Python-backend model that issues inference requests
+> to other Triton models from inside its execute function, so you can branch
+> on model A's output before deciding whether to call model B, loop, add
+> guardrails, or call out to an external service over HTTP. The rule of thumb
+> I'd give is: ensemble for a fixed DAG, BLS when the logic depends on runtime
+> data. The tradeoff is real — BLS is arbitrary Python running in the serving
+> process, so it's slower and easier to get wrong than a declarative config,
+> and reaching for it on every pipeline is a red flag.
 
 ---
 
@@ -319,6 +434,17 @@ Two operational details that matter once real users are behind an LLM endpoint:
 - **Cancellation.** If a client disconnects (closes the browser tab, hits a client-side timeout) mid-generation, a decoupled streaming request can be cancelled so the GPU stops spending cycles on a response nobody will read — gRPC's native call cancellation propagates into Triton's core and, for the TensorRT-LLM and vLLM backends, into the in-flight batching scheduler, freeing that sequence's KV-cache blocks immediately rather than waiting for it to run to completion. Skipping this is a common source of wasted GPU-seconds under bursty, abandon-prone traffic (chat UIs where users retype a prompt mid-stream).
 - **Priority.** `dynamic_batching { priority_levels: N ... }` lets you declare multiple priority queues for fixed-shape models. For LLM in-flight batching, priority is typically handled one layer up — at the request-routing/gateway layer, or via backend-specific scheduling parameters — rather than through Triton's classic dynamic-batching priority mechanism, since the scheduling unit for an LLM is a decode iteration, not a whole batch.
 
+> **Saying it out loud.** Triton speaks the KServe v2 protocol, which is worth
+> knowing by name because it's the same API surface across every model type —
+> HTTP on 8000, gRPC on 8001, a standard infer endpoint, plus health and
+> readiness endpoints you wire straight to Kubernetes probes. For LLMs there's
+> a convenience generate endpoint and a streaming variant. The detail that
+> trips people is streaming: token-by-token output requires a decoupled model,
+> meaning one that returns many responses per request, and you have to declare
+> that explicitly in the config. Leave it off and you get one buffered blob at
+> the end instead of tokens — and it matters even for non-streaming pipelines,
+> because any BLS stage producing variable numbers of responses needs it too.
+
 
 ### Metrics
 
@@ -337,6 +463,18 @@ Triton exposes Prometheus metrics at `:8002/metrics` (`curl localhost:8002/metri
 The TensorRT-LLM and vLLM backends add custom metrics for **KV cache** block usage and **in-flight batching** (active/scheduled request counts) via Triton's custom-metrics API. Watch queue duration and KV-cache utilization together: rising queue time with KV cache near 100% means you are memory-bound and should raise `kv_cache_free_gpu_mem_fraction`, shorten max sequence length, or scale out.
 
 For LLM-aware benchmarking, use **GenAI-Perf** (part of Perf Analyzer), which reports LLM-specific numbers: **time to first token (TTFT)**, **inter-token latency (ITL)**, **output tokens/sec**, and request throughput — the metrics that actually matter for chat workloads. Section (B) below has a full walkthrough.
+
+> **Saying it out loud.** Two operational details that only matter once real
+> users are behind the endpoint. Cancellation: when someone closes the tab or
+> retypes their prompt mid-stream, gRPC call cancellation should propagate
+> down into the in-flight batching scheduler so the sequence is evicted and
+> its KV-cache blocks are freed immediately, rather than the GPU spending the
+> next twenty seconds generating tokens nobody will read. On a chat UI with
+> abandon-prone traffic that's real money, and it's the kind of thing that
+> stays unhandled until a cost review surfaces it. Priority is the other one:
+> Triton's classic priority levels attach to dynamic batching, so for LLMs you
+> generally handle priority a layer up at the router, because the scheduling
+> unit is a decode iteration, not a whole batch.
 
 ### Runtime model control — load/unload without a server restart
 
@@ -358,6 +496,17 @@ curl -X POST localhost:8000/v2/repository/index
 ```
 
 Three control modes exist: `none` (load everything at startup, no runtime changes), `poll` (periodically re-scan the repository directory and hot-reload changes — convenient, but easy to trigger an unintended reload by touching the wrong file), and `explicit` (nothing loads or unloads except via the API above — the recommended mode for production, since it makes every model change an auditable, deliberate action rather than a side effect of a filesystem write).
+
+> **Saying it out loud.** The two Triton metrics I'd watch first are queue
+> duration and compute duration, per model, because together they tell you
+> what kind of trouble you're in. Rising queue time with a full KV cache means
+> you're memory-bound — raise the cache fraction, shorten max sequence length,
+> or scale out. Rising queue time with an idle GPU means your batching window
+> is under-tuned. Recent releases also expose a first-response histogram,
+> which gives you TTFT straight out of Prometheus rather than having to
+> measure it at the client. And the LLM backends add custom metrics for
+> KV-cache block usage and in-flight batch composition, which is what turns
+> "the service feels slow" into a specific diagnosis.
 
 ---
 
@@ -445,6 +594,18 @@ curl -s localhost:8000/v2/models/sentiment/infer -d '{
   ]
 }'
 ```
+
+> **Saying it out loud.** Runtime model control is what makes Triton usable in
+> a CI/CD pipeline: you can add, update, or remove models from a running
+> server with no restart. There are three control modes and the choice is a
+> real one. None loads everything at startup and never changes. Poll re-scans
+> the repository directory periodically, which is convenient and also means
+> touching the wrong file triggers an unintended reload of a production model.
+> Explicit is the one I'd run in production, because nothing loads or unloads
+> except through an API call — every model change becomes a deliberate,
+> auditable action instead of a side effect of a filesystem write. That's also
+> the mode that makes a zero-downtime version swap possible: load the new
+> version alongside the old, shift traffic, then unload the old.
 
 ### Part 2 — the full LLM ensemble: tokenizer to TensorRT-LLM to detokenizer
 
@@ -663,6 +824,17 @@ curl -s -X POST localhost:8000/v2/models/ensemble/generate -d '{
 
 One client call, three internal model hops, zero network round trips between them — that is the entire value proposition of ensembles in one example.
 
+> **Saying it out loud.** The non-LLM case is the easy one and worth doing
+> first because it makes the abstractions concrete. A config file declaring
+> the ONNX backend, input and output tensor shapes, a max batch size, a
+> dynamic batching block with preferred batch sizes and a two-millisecond
+> queue delay, and an instance group with two GPU copies. That's a complete
+> production deployment. The one shape gotcha to remember: when max batch size
+> is greater than zero, the batch dimension is implicit, so you list only the
+> per-sample shape. Listing the batch dim explicitly double-counts it and
+> breaks shape validation in a way whose error message won't obviously tell
+> you that.
+
 ### Part 2b — multi-GPU launch: tensor parallel and pipeline parallel
 
 A single GPU cannot hold every model at every precision — a large dense model in FP16/BF16, or any model at long context with a large KV cache, needs to be split across GPUs. TensorRT-LLM (and the vLLM backend) support two orthogonal ways to split it:
@@ -681,6 +853,19 @@ python3 /app/scripts/launch_triton_server.py \
 ```
 
 Under the hood this is an `mpirun`-launched set of ranks, one per GPU, each running its shard of the model; Triton's frontend still presents a single model endpoint to clients — the parallelism is entirely invisible from the API. The config's `gpt_model_path`/checkpoint must have been built (or, on the PyTorch backend, configured) for that same `world_size`; you cannot load a 4-GPU checkpoint with `--world_size=2` or vice versa. If `instance_group { kind: KIND_MODEL }` is set (as in the example ensemble above), Triton delegates device placement entirely to the backend's own multi-GPU orchestration rather than trying to manage it itself — this is the correct setting whenever the backend is doing TP/PP internally.
+
+> **Saying it out loud.** When one GPU can't hold the model, there are two
+> orthogonal ways to split it and they have different costs. Tensor
+> parallelism shards each layer's weight matrices across GPUs with an
+> all-reduce after every sharded op — it keeps single-request latency low, but
+> it wants NVLink-class bandwidth between those GPUs, not PCIe. Pipeline
+> parallelism assigns whole layers to different GPUs and streams activations
+> forward — much less communication per step, but it only helps throughput if
+> you keep the pipeline full, and the first request through an empty pipeline
+> eats bubble latency. Big deployments combine both, where tensor size times
+> pipeline size equals world size. And the operational rule: a checkpoint
+> built for a four-GPU world size cannot be loaded with two — those numbers
+> are part of the artifact.
 
 ### Part 3 — benchmarking it correctly with GenAI-Perf
 
@@ -738,6 +923,18 @@ GenAI-Perf prints (and writes to CSV/JSON) a table with, at minimum:
 
 The workflow that actually matters in production: **run GenAI-Perf at a sweep of concurrencies (1, 4, 8, 16, 32, 64…) before and after any config change** — a new `kv_cache_free_gpu_mem_fraction`, a different `instance_group`, a Triton or TensorRT-LLM version bump — and diff the curves. A config that looks fine at concurrency 1 can fall off a cliff at 32 because the KV cache runs out of room; only the sweep shows you that. Treat a GenAI-Perf regression sweep as a release gate the same way you would a latency/throughput dashboard for a database migration.
 
+> **Saying it out loud.** Curl proves the pipeline works; it tells you nothing
+> about throughput or tail latency. GenAI-Perf is the benchmarking tool that
+> reports the numbers that actually matter for generation — time to first
+> token, inter-token latency, output tokens per second, and percentile
+> latencies — rather than generic requests per second. The workflow I'd insist
+> on is a concurrency sweep: run it at 1, 4, 8, 16, 32, 64 before and after
+> any config change, and diff the curves. A configuration that looks perfectly
+> healthy at concurrency 1 can fall off a cliff at 32 because the KV cache
+> runs out of room, and only the sweep shows you that. Treat a GenAI-Perf
+> regression sweep as a release gate, the same way you'd gate a database
+> migration.
+
 ---
 
 ## Triton + TensorRT-LLM vs vLLM vs TGI
@@ -757,6 +954,17 @@ The workflow that actually matters in production: **run GenAI-Perf at a sweep of
 
 Honest summary: **for a single LLM, vLLM or TGI is faster to stand up and gets you most of the throughput with a fraction of the effort.** Triton + TensorRT-LLM wins when you need a heterogeneous model fleet under one runtime, or when you have squeezed everything else and need the last increment of GPU efficiency and are willing to pay the setup tax. Note also that Triton can host the **vLLM backend**, giving you vLLM's ergonomics *inside* Triton's ops framework — a common middle ground, and increasingly the default recommendation for teams that want Triton's multi-model story without the TensorRT-LLM engine-build tax.
 
+> **Saying it out loud.** The honest summary is that for a single LLM, vLLM or
+> SGLang is faster to stand up and gets you most of the throughput for a
+> fraction of the effort. Triton wins on two specific axes: a heterogeneous
+> model fleet under one runtime with one metrics format and one deployment
+> story, or the last increment of NVIDIA-hardware efficiency through
+> TensorRT-LLM's tuned kernels and FP8 or FP4 quantization. What people miss
+> is that it isn't a binary — Triton can host the vLLM backend, and NVIDIA's
+> own numbers put that within about two percent of standalone vLLM. So the
+> real question isn't Triton versus vLLM, it's whether you need a multi-model
+> runtime, and if so, which engine you put inside it.
+
 ---
 
 ## (A) The 2025–2026 landscape
@@ -771,6 +979,18 @@ The Triton-specific glue code that used to live in its own `triton-inference-ser
 - The mental model in this chapter — engine build, then ensemble, then launch — still describes how the **request path** works (in-flight batching, paged KV cache, pre/post-processing via Python models); what changed is *how the model artifact itself gets produced*, not the serving architecture around it.
 - If you inherited a repo that still does `trtllm-build` by hand, it will keep working, but plan a migration; NVIDIA's own examples now lead with the PyTorch path.
 
+> **Saying it out loud.** The thing to know if you're interviewing in 2026 is
+> that the setup story changed. The classic path was compile a model with
+> trtllm-build into an engine file, then load that plan — and that's now the
+> legacy path. The PyTorch execution backend, the LLM API, is the default: you
+> point it at a Hugging Face checkpoint and it manages the runtime graph
+> itself with no offline compile step. The Triton glue code also moved into
+> the TensorRT-LLM repository, so the two version together rather than as
+> loosely-coupled siblings — part of a broader pattern where Triton has been
+> folded into NVIDIA's wider inference stack rather than standing alone. What
+> matters practically is that this removes the biggest setup-cost objection to
+> Triton; the serving architecture around it is unchanged.
+
 ### Quantization and precision: FP4/NVFP4 arrive alongside FP8
 
 TensorRT-LLM's quantization matrix has grown substantially on Blackwell-class GPUs (nvidia.github.io/TensorRT-LLM/latest/features/quantization.html):
@@ -783,6 +1003,19 @@ The practical takeaway for an interview or a design doc: **quantization choice i
 
 In practice, quantizing a checkpoint for the PyTorch/LLM-API backend is a config-driven step rather than a bespoke script — you point the build/serve tooling at the checkpoint and declare the target precision, and it handles calibration for the formats that need it (AWQ/GPTQ still require a calibration pass over representative data; FP8 and FP4/NVFP4 on validated model families can often run with vendor-provided or activation-aware scaling with a lighter calibration step). The engineering discipline that doesn't change: always re-run your task-specific eval suite (not just perplexity) after quantizing, since generative quality degradation from aggressive quantization is uneven across tasks — code and math are typically more sensitive than open-ended chat.
 
+> **Saying it out loud.** Quantization is now as much a GPU-generation
+> decision as an accuracy decision, and that framing is what scores. On
+> Blackwell, FP4 or NVFP4 roughly halves memory again versus FP8 and is
+> usually the throughput-per-dollar winner if your model family has been
+> validated at that precision. On Hopper and Ada, FP8 is the mainstream
+> default, and an FP8 KV cache shrinks your biggest memory line item. Older
+> cards without those tensor cores fall back to weight-only INT4 through AWQ
+> or GPTQ. The discipline that doesn't change with any of it: re-run your
+> task-specific eval suite after quantizing, not just perplexity, because
+> degradation is uneven — code and math break well before open-ended chat
+> does. And these figures are as of 2026 hardware; check the current support
+> matrix before quoting them.
+
 
 ### Disaggregated serving and speculative decoding are now first-class
 
@@ -793,6 +1026,18 @@ Two techniques that used to be research topics are now supported serving pattern
 
 Neither is "day one" complexity — start with a single-pool in-flight-batched deployment — but both are now the answer to "we've maxed out a single-pool deployment, what next," and are worth naming in a systems-design interview even if you have not implemented them yourself.
 
+> **Saying it out loud.** Two things that were research topics are now
+> supported serving patterns, and both are good "what would you do next"
+> answers. Disaggregated serving splits prefill and decode onto separate GPU
+> pools and ships the KV cache between them, because prefill is compute-bound
+> and decode is memory-bandwidth-bound and they contend badly for the same
+> hardware — NVIDIA's reference numbers put the gain somewhere in the 1.2 to
+> 2.5x range at scale. Speculative decoding drafts several tokens cheaply and
+> verifies them in one pass, and it's now integrated with in-flight batching
+> so you don't have to give one up for the other. Neither is day-one
+> complexity. Reach for them once a single-pool deployment is saturated and
+> profiling shows prefill and decode fighting each other.
+
 ### Where Triton sits next to vLLM and SGLang today
 
 vLLM and SGLang have both matured into serious standalone production servers with their own continuous batching, quantization, disaggregated-serving, and OpenAI-compatible APIs. That narrows — but does not eliminate — Triton's differentiation:
@@ -802,6 +1047,19 @@ vLLM and SGLang have both matured into serious standalone production servers wit
 - **Choose Triton when:** you are serving a fleet of heterogeneous models (LLM + embedding + reranker + a classic ONNX/PyTorch model) behind one runtime; you need enterprise support and a stable KServe v2 API across model types; or you specifically need TensorRT-LLM's peak NVIDIA-hardware throughput with FP4/FP8 and are willing to operate the extra moving part.
 - **Choose vLLM or SGLang directly when:** you have exactly one (or a small number of) LLMs, want the fastest path to a working OpenAI-compatible endpoint, and don't need a shared multi-framework serving runtime. Many teams now run vLLM/SGLang standalone for the LLM and only reach for Triton once a second or third *non-LLM* model shows up that needs to share the same ops story.
 - **The pragmatic middle ground** more teams land on in 2026: Triton hosting the **vLLM backend** rather than TensorRT-LLM — you get Triton's multi-model repository, metrics, and ensembles, without paying the TensorRT-LLM engine/PyTorch-backend conversion tax, and you upgrade to the TensorRT-LLM backend later only if profiling shows you actually need the extra throughput.
+
+> **Saying it out loud.** The competitive picture narrowed but didn't close.
+> vLLM and SGLang are both serious standalone production servers now with
+> their own continuous batching and OpenAI-compatible APIs, and SGLang in
+> particular has pulled ahead on prefix-heavy workloads through its radix
+> prefix cache — agents, few-shot prompting, RAG with a repeated system
+> prompt. So I'd choose Triton when I'm serving a genuinely heterogeneous
+> fleet, when I need a stable KServe v2 API across model types, or when I
+> specifically need TensorRT-LLM's peak throughput and can operate the extra
+> moving part. The middle ground more teams actually land on is Triton hosting
+> the vLLM backend — multi-model repository, metrics, ensembles, without the
+> engine-build tax — and upgrading the engine later only if profiling says you
+> need to.
 
 ---
 
@@ -816,6 +1074,18 @@ vLLM and SGLang have both matured into serious standalone production servers wit
 - **Model name / directory mismatch.** `name` in `config.pbtxt` disagreeing with the directory, or a non-integer version folder, makes the model silently not load. Read the startup READY/UNAVAILABLE table.
 - **Conversion complexity underestimated.** Even on the newer PyTorch/LLM-API path, wiring the ensemble (pre/post-processing, tokenizer directories, decoupled streaming) is genuinely involved and model-specific. Budget for it; do not promise a one-day LLM deploy.
 - **Forgetting `--shm-size` / decoupled streaming.** Python-backend ensembles need adequate shared memory; streaming needs `decoupled: true` or you get one blob at the end instead of tokens.
+
+> **Saying it out loud.** The pitfalls cluster into one theme: things that
+> load fine and run badly. Wrong backend for an LLM is number one — generation
+> through ONNX plus dynamic batching gets you head-of-line blocking and
+> terrible throughput. A static-batch engine, or leaving the batching strategy
+> at v1, silently disables continuous batching after you paid the whole
+> conversion cost. Version mismatches between the artifact, the backend build,
+> and the container tag can load and then quietly run on a degraded path. A
+> model name that disagrees with its directory just doesn't load, and you'll
+> only see it in the startup READY table. The unifying lesson is that Triton's
+> health checks tell you a model loaded, not that it's fast — which is why a
+> benchmark sweep has to be part of the deploy, not an afterthought.
 
 ---
 
@@ -851,6 +1121,18 @@ echo "All configs OK"
 
 It is a blunt instrument — it checks for the presence of a block, not that the values are well-tuned — but "present vs silently absent" is exactly the failure mode that bit this team, and a five-line grep script in CI is cheaper than a quarter of degraded throughput.
 
+> **Saying it out loud.** This is the one I'd tell if asked about a silent
+> regression. A CI pipeline regenerated config.pbtxt from a template that
+> predated the hand-tuned dynamic batching block. The model loaded, went
+> READY, health checks passed — and every request executed one at a time,
+> because the auto-generated config had no batching block at all. GPU
+> utilization dropped from about 70% to under 10% and nothing failed, so
+> nothing alerted. It took a concurrency sweep before a capacity review, a
+> quarter later, to notice throughput flatlining at concurrency 4. Two fixes:
+> run production with strict model config so a missing batching block is a
+> hard failure at load time, and treat config.pbtxt as reviewed, versioned
+> infrastructure code rather than a generated artifact.
+
 
 ### War story 2 — an upgrade that loaded fine and ran 3x slower
 
@@ -862,6 +1144,18 @@ It is a blunt instrument — it checks for the presence of a block, not that the
 
 **Lesson:** Pin the TensorRT-LLM/backend version, the model artifact, and the Triton container tag together as one versioned unit, and treat any change to *any one* of the three as a change to all three — rebuild and re-benchmark, don't assume compatibility because it loads. Bake a GenAI-Perf regression sweep into the deployment pipeline as an automated gate (fail the rollout if p50 tokens/s at a fixed concurrency drops more than some threshold, e.g. 10%, versus the current production baseline) rather than relying on a human noticing a "feels slower" complaint.
 
+> **Saying it out loud.** Same shape of failure, different trigger. A team
+> upgraded the Triton container for a security patch without rebuilding the
+> model artifact, on the reasonable-sounding logic that the model directory
+> hadn't changed. The new container loaded the old engine without erroring,
+> but the bundled backend version didn't match closely enough to run the
+> requested batching strategy at full speed, so it silently fell back to a
+> degraded path. Nothing crashed, nothing logged an error, and throughput per
+> GPU was down roughly 3x — discovered days later because users said it "felt
+> slower." The rule: the artifact, the backend build, and the container tag
+> are one versioned unit, and a change to any one is a change to all three.
+> Gate the rollout on an automated benchmark diff, not on whether it loads.
+
 ### War story 3 — KV cache sized for the demo, not for peak concurrency
 
 **Setup:** `kv_cache_free_gpu_mem_fraction` was set to `0.9` during initial rollout, validated against a demo workload of a handful of short prompts.
@@ -869,6 +1163,18 @@ It is a blunt instrument — it checks for the presence of a block, not that the
 **The incident:** Under real traffic — many concurrent long-context conversations — the KV cache filled up, and new requests began queueing behind an in-flight batch that could not make room for them, producing a sawtooth pattern of throughput collapsing to zero and recovering, visible in `nv_inference_queue_duration_us` spiking in lockstep with KV-cache utilization hitting 100%.
 
 **Lesson:** Load-test with a realistic input/output token-length distribution and concurrency — not a demo prompt — before shipping a `kv_cache_free_gpu_mem_fraction` value, and alert on KV-cache utilization directly rather than waiting for the downstream symptom (queue duration) to show up.
+
+> **Saying it out loud.** The last one is the simplest and the most common.
+> The KV cache memory fraction was set at 0.9 and validated against a demo
+> workload of a few short prompts. Under real traffic — many concurrent
+> long-context conversations — the cache filled, new requests queued behind an
+> in-flight batch that couldn't make room for them, and throughput collapsed
+> and recovered in a sawtooth, with queue duration spiking in lockstep with
+> cache utilization hitting 100%. The lesson is that you cannot size a KV
+> cache from a demo prompt; you load test with a realistic distribution of
+> input and output lengths at realistic concurrency. And alert on KV-cache
+> utilization directly rather than waiting for queue duration, which is the
+> downstream symptom.
 
 ---
 
@@ -882,6 +1188,18 @@ Triton itself doesn't manage a fleet of replicas or autoscale — that's Kuberne
 - **Readiness/liveness probes** wired to `GET /v2/health/ready` and `/v2/health/live` — a model still loading (e.g., a large LLM checkpoint) should fail readiness, not liveness, so Kubernetes doesn't kill a pod that's merely slow to start.
 - **Horizontal Pod Autoscaler** driven by a custom metric — GPU utilization alone is a poor autoscaling signal for LLM serving because a GPU running in-flight batching near KV-cache capacity can show high utilization while still queueing; `nv_inference_queue_duration_us` or a GenAI-Perf-derived tokens/s-per-replica target is a better trigger.
 - **KServe's `InferenceService` CRD** wraps this pattern with a standard interface across ONNX, PyTorch, and Triton-hosted models, and is a common choice when a platform team wants one custom resource across many serving runtimes rather than hand-rolled Deployments per model.
+
+> **Saying it out loud.** Triton doesn't manage replicas or autoscale — that's
+> Kubernetes' job, with Triton as the container inside each pod. Three details
+> make or break it. Wire readiness to the ready endpoint and liveness to the
+> live endpoint separately, because a large LLM checkpoint that's still
+> loading should fail readiness, not liveness — get that backwards and
+> Kubernetes kills pods for the crime of being slow to start. Autoscale on
+> queue duration or a tokens-per-second target rather than GPU utilization,
+> since a GPU running in-flight batching near KV-cache capacity reads as fully
+> utilized while it's queueing. And KServe's InferenceService wraps this
+> pattern if a platform team wants one custom resource across many serving
+> runtimes.
 
 ### Security
 
@@ -898,6 +1216,17 @@ Triton's model repository and instance groups give you the primitives for multi-
 - **Resource isolation** — pin different tenants' models to different `instance_group { gpus: [...] }` sets (or different node pools in Kubernetes) if noisy-neighbor GPU contention between tenants is a concern; Triton does not enforce per-tenant fairness within a shared GPU on its own.
 - **Namespacing** — prefixing model names by tenant (`tenantA_sentiment`, `tenantB_sentiment`) in a shared repository is simple but couples tenants to one repository's blast radius (a bad `--strict-model-config` change or a repository-wide restart affects everyone); separate model repositories per tenant, each behind its own Triton deployment, trade operational simplicity for stronger isolation.
 - **Quota/rate limiting** happens above Triton — at the gateway — since Triton's own priority levels and batching config are per-model scheduling knobs, not per-tenant quota enforcement.
+
+> **Saying it out loud.** The security answer is short and it's mostly about
+> what Triton doesn't do: there's no authentication or authorization in the
+> core, so you treat the HTTP, gRPC, and metrics ports as
+> internal-network-only and put a gateway in front — API keys or mTLS at Envoy
+> or a mesh sidecar, not at Triton. The one people forget is that the model
+> repository control API is an administrative capability: anyone who can reach
+> the load endpoint can load an arbitrary model from repository storage or
+> unload a production one, so it belongs on a management network, not the same
+> public path as inference. Same for the metrics port, which leaks model names
+> and request volumes.
 
 ---
 
@@ -955,6 +1284,19 @@ Key design points to say out loud:
 3. **Vector search is not a Triton model.** Whether to put retrieval inside a BLS step (calling out to an external vector DB from Python) or keep it as a separate service the client/orchestrator calls between the embed step and the rerank+generate step is a real design decision — BLS keeps it inside one server call at the cost of coupling Triton to the vector DB's availability; keeping it external keeps Triton stateless but adds a network hop and moves orchestration logic to the client.
 4. **One ensemble vs multiple client calls.** If retrieval must happen *between* embedding and reranking, and it's an external service, you likely cannot express the whole RAG flow as a single static `ensemble` (no external I/O mid-DAG) — you'd either do it as a BLS model that calls out over HTTP from Python, or split it into two client-visible calls: `embed_and_search` handled by the orchestrator, then `rerank_and_generate` as one ensemble.
 5. **Metrics and scaling story.** All three model types show up in the same Prometheus `/metrics` endpoint with per-model queue duration and compute duration — call this out as the payoff of the unified-runtime choice versus running three separate servers.
+
+> **Saying it out loud.** For the RAG design prompt, the answer that scores is
+> one server, one repository, different batching per model type. The embedder
+> and reranker are fixed-shape equal-work models, so dynamic batching is
+> correct. The LLM is autoregressive and variable-length, so it needs
+> in-flight batching on the TensorRT-LLM or vLLM backend. Using the same
+> batching strategy for all three is the red flag. Then size instance groups
+> to workload shape — the embedder is highest-QPS and cheapest per call so it
+> gets more instances, the reranker only sees the top fifty candidates so it
+> needs little concurrency, and the LLM owns its GPU outright because
+> in-flight batching manages concurrency internally. And I'd flag explicitly
+> that vector search is not a Triton model: putting it in a BLS step keeps it
+> to one client call but couples Triton's availability to the vector DB's.
 
 ### Red flags vs green flags
 

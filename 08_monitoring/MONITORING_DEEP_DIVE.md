@@ -50,6 +50,19 @@ Keep two mental models side by side:
   Good for the GPU and the KV cache. **Saturation** — the queue and the cache —
   is where LLM serving lives or dies, and it's the box most teams forget.
 
+> **Saying it out loud.** So the short version is that an LLM endpoint doesn't
+> have one latency, it has three, and users feel each one differently. There's
+> time to first token — how long you stare at a blank screen while the model
+> reads your prompt — then time per output token, which is basically the
+> typing speed of the stream, and then total wall clock, which is just the
+> first one plus the length of the answer times the second one. The other
+> thing that surprises people coming from web services is that the resource
+> you run out of isn't CPU or connections, it's a fixed pool of GPU memory
+> called the KV cache, which holds the attention state for every in-flight
+> request. So the signals that predict trouble are queue depth and how full
+> that cache is — GPU utilization can read 100% while the card is
+> memory-bandwidth-bound and doing almost no useful math.
+
 ---
 
 ## Metrics catalog — what to measure and why
@@ -72,7 +85,7 @@ Keep two mental models side by side:
 | **Spec-decode acceptance rate** | Fraction of speculatively drafted tokens the target model accepts | Tells you whether speculative decoding is actually buying throughput | < 50% acceptance usually means the draft model or config is miscalibrated for current traffic |
 | **Prefill vs. decode time** | Split of per-request time between prompt processing and generation | Separates "the prompt got longer" from "steady-state decode got slower" | Exposed directly as separate histograms in newer engine versions |
 | **Error rate** | Failed / total requests | Availability SLI; 5xx, OOM, timeouts, truncations | Alert on rate, not raw count |
-| **Cost per 1k tokens** | \$ per 1000 tokens served | Turns efficiency into money; the exec-facing number | Derived: GPU \$/hr ÷ (tokens/s × 3.6) |
+| **Cost per 1k tokens** | $ per 1000 tokens served | Turns efficiency into money; the exec-facing number | Derived: GPU $/hr ÷ (tokens/s × 3.6) |
 
 The rule of thumb: **latency metrics are the SLIs; queue, KV-cache, and
 preemptions are the leading indicators; GPU/memory are the resource ceiling;
@@ -80,6 +93,16 @@ cost is the business translation.** The newer rows above — prefix-cache hit
 rate, spec-decode acceptance, and the prefill/decode split — are recent
 additions to the major engines' metric surfaces; see "The 2025–2026 landscape"
 below for exactly what changed, when, and why it matters for your dashboards.
+
+> **Saying it out loud.** If someone asks what I'd measure, I'd give four
+> buckets rather than reciting a list. Latency percentiles are the SLIs — the
+> thing you actually promise users. Queue depth, KV-cache utilization, and
+> preemptions are the leading indicators, the stuff that moves before the SLI
+> does. GPU and HBM are the ceiling you're pushing against, and dollars per
+> thousand tokens is the translation for whoever pays the bill. The one people
+> forget is preemptions — any sustained rate of sequences being evicted and
+> recomputed means you're already past the cliff, you just haven't seen it in
+> latency yet.
 
 ---
 
@@ -92,6 +115,18 @@ engines and GPU exporters you already scrape grew new fields for prefix
 caching, speculative decoding, and profiling. This section is a dated snapshot
 of where things stand as of mid-2026 so you know which names are stable enough
 to build alerts on and which are still moving.
+
+> **Saying it out loud.** The honest framing here is that the metric names you
+> build dashboards on are still moving, so the useful skill is knowing which
+> ones are safe to alert on. Two things changed recently: OpenTelemetry
+> started standardizing GenAI metric names, not just trace attributes, and the
+> engines themselves grew new fields for prefix caching and speculative
+> decoding. My rule is that I alert on engine-native names like the vLLM
+> time-to-first-token histogram, because those are what actually get populated
+> today, and I treat the OpenTelemetry gen_ai names as the cross-vendor join
+> key I'll migrate to once they settle. As of mid-2026 nothing in that
+> dedicated GenAI conventions repo is marked Stable and no major engine emits
+> those names natively, so putting a page on them would be building on sand.
 
 ### OpenTelemetry GenAI semantic conventions reach the serving layer
 
@@ -141,6 +176,18 @@ Prometheus metrics over to `gen_ai.server.*` names, so you still scrape
 emerging cross-vendor join key to watch, not yet something to alert on
 directly.
 
+> **Saying it out loud.** The distinction that matters is server versus
+> client. The gen_ai.server metrics are emitted by the inference server itself
+> — is the model server healthy, what's its time to first token, its time per
+> output token. The gen_ai.client metrics are emitted by whatever application
+> calls a model API — is my RAG service's use of that server healthy, how many
+> tokens did it burn. Teams blend them onto one dashboard and then can't tell
+> whether the model server is slow or their own code is, which is a genuinely
+> painful thirty minutes during an incident. And one line of history is worth
+> knowing: the GenAI conventions were moved out of the core
+> semantic-conventions repo into their own project in mid-2026 and still have
+> no stable release, so treat them as direction, not dependency.
+
 ### vLLM's V1 metrics — what's new since the V0 engine
 
 vLLM's rewritten V1 engine kept the core metric names this chapter already
@@ -188,6 +235,19 @@ Grafana dashboard purpose-built for TGI on Kubernetes
 ([TGI dashboard, Grafana Labs](https://grafana.com/grafana/dashboards/20246-text-generation-inference/))
 that you can import rather than hand-build panels for `tgi_` metric names.
 
+> **Saying it out loud.** The V1 change I'd actually bring up in an interview
+> is the prefix-cache one, because it shows you understand Prometheus, not
+> just vLLM. The old gauge handed you a hit rate directly; V1 replaced it with
+> two counters — cache hits and cache queries — and you compute the ratio
+> yourself. That's strictly better, because a rate of two counters composes
+> correctly when you sum across replicas and it survives process restarts,
+> whereas averaging a pre-computed hit-rate gauge across five replicas is
+> arithmetically meaningless. The other additions worth naming are
+> speculative-decoding acceptance rate, where anything under about 50% usually
+> means the draft model is miscalibrated for your traffic, and the split of
+> prefill time from decode time, which lets you tell "the prompts got longer"
+> apart from "decode got slower" without guessing.
+
 ### DCGM exporter's current metric set — and a real gotcha
 
 The default DCGM exporter field set, as documented by NVIDIA
@@ -222,6 +282,18 @@ trusting a dashboard panel that depends on `PIPE_TENSOR_ACTIVE` or
 an error, and a panel that quietly goes blank is easy to miss until the exact
 moment you need it during an incident.
 
+> **Saying it out loud.** DCGM is NVIDIA's GPU telemetry daemon; the exporter
+> turns it into Prometheus metrics on port 9400, and it's how you see
+> temperature, power, HBM usage, and ECC errors. The gotcha worth knowing is
+> that the profiling group — the DCGM_FI_PROF fields like tensor-pipe-active —
+> is not guaranteed to be on; it depends on the DCGM profiling module being
+> enabled, and there are dated public reports of those fields disappearing
+> after a routine dcgm-exporter or GPU Operator upgrade. That failure mode is
+> nasty because a missing metric renders as "no data," not as an error, so the
+> panel just goes quietly blank and you discover it during exactly the
+> incident where you needed it. So after any exporter bump, curl the metrics
+> endpoint and grep for PROF before you trust the panel.
+
 ### Building unified dashboards across the serving stack
 
 The pattern that's emerged for tying engine metrics and GPU metrics into one
@@ -242,6 +314,17 @@ covers LMCache (vLLM's disaggregated KV-cache backend) separately. If you don't
 want to hand-roll the JSON in the next section, this repo — or the community
 [`kubeai-project/kubeai` vLLM Grafana dashboard](https://github.com/kubeai-project/kubeai/blob/main/examples/observability/vllm-grafana-dashboard.json) —
 is a reasonable starting point to fork.
+
+> **Saying it out loud.** The pattern that's settled out is boring, and that's
+> the point: one Prometheus with several scrape jobs — the engines, the DCGM
+> exporters, the router — feeding one Grafana dashboard templated on model,
+> engine, and GPU, so a single dashboard serves every replica. You don't have
+> to hand-roll it either; vLLM's own production-stack repo ships a router plus
+> a reference dashboard that already mixes engine series like TTFT
+> distributions with GPU-facing series like KV-cache utilization. If I were
+> asked to design this I'd say fork that and spend the saved time on alert
+> tiering instead. The thing to avoid is a dashboard per team — that's how you
+> end up with five different definitions of p95 in one org.
 
 ---
 
@@ -329,6 +412,17 @@ dashboard from scratch, the community-maintained
 [TGI Grafana dashboard (ID 20246)](https://grafana.com/grafana/dashboards/20246-text-generation-inference/)
 is a ready import for a Kubernetes deployment.
 
+> **Saying it out loud.** The key point is that you don't instrument the
+> model, you scrape the server — both vLLM and TGI already expose a Prometheus
+> endpoint, so this is configuration, not code. What bites people is that the
+> two engines don't agree on names. vLLM gives you a real time-to-first-token
+> histogram; TGI ships no metric literally called TTFT, so you either
+> approximate it from queue duration plus the prefill portion, or you capture
+> first-token timing at the gateway. So step one on any new stack is a mapping
+> table from engine-native names onto your canonical SLIs — otherwise p95
+> quietly means something different depending on which engine served the
+> request.
+
 ---
 
 ## Mechanism 2 — GPU metrics with DCGM
@@ -349,7 +443,7 @@ Key fields (all prefixed `DCGM_FI_`):
 | `DCGM_FI_DEV_FB_FREE` | Framebuffer memory free, MiB |
 | `DCGM_FI_DEV_FB_RESERVED` | Framebuffer memory reserved by the driver, MiB |
 | `DCGM_FI_DEV_POWER_USAGE` | Board power draw, watts |
-| `DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION` | Cumulative energy draw, useful for a \$/token energy view |
+| `DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION` | Cumulative energy draw, useful for a $/token energy view |
 | `DCGM_FI_DEV_GPU_TEMP` | GPU die temperature, °C |
 | `DCGM_FI_DEV_SM_CLOCK` | SM clock, MHz (watch for throttling) |
 | `DCGM_FI_DEV_MEM_COPY_UTIL` | Memory-copy engine utilization |
@@ -422,6 +516,17 @@ scrape_configs:
 > Shell tip: to sanity-check a target before wiring it up, just
 > `curl -s http://vllm-0:8000/metrics | grep vllm:` — the `$` you see in a
 > prompt is literal.
+
+> **Saying it out loud.** Prometheus pulls, it doesn't receive: you hand it a
+> list of targets and a scrape interval and it fetches slash-metrics on a
+> schedule. For LLM serving that's three kinds of target — the inference
+> engines on their API port, the DCGM exporter on 9400 on every GPU node, and
+> your gateway or router. In Kubernetes you'd swap the static target list for
+> service discovery so new replicas get scraped automatically instead of
+> someone editing YAML at 2am. And keep the scrape interval in your head as a
+> real limit: at 15 seconds, anything that spikes and resolves inside 15
+> seconds is invisible to you, which is why a KV-cache threshold needs
+> headroom rather than sitting at 100%.
 
 ### PromQL: the queries that earn their keep
 
@@ -500,6 +605,16 @@ recording rule holding the GPU hourly price, cost per 1k output tokens is:
 (The `3.6` converts tokens/second into thousands-of-tokens/hour:
 \( \text{tok/s} \times 3600\,\text{s/hr} \div 1000 = \text{tok/s} \times 3.6 \).)
 
+> **Saying it out loud.** The one piece of PromQL I'd want to be able to write
+> on a whiteboard is the percentile: histogram_quantile at 0.95 over a
+> sum-by-le of the rate of the bucket series. And I'd explain every piece —
+> rate because the buckets are counters, sum by le because that's how you
+> merge histograms from every replica into one distribution, and
+> histogram_quantile applied once at the very end. The mistake that shows up
+> constantly is computing p95 per host and then averaging those p95s. That's
+> arithmetically invalid — percentiles don't average — and it usually
+> understates the tail, which is the exact number you're being paged about.
+
 ### Grafana
 
 Build one dashboard per concern and template it with a `$model` /
@@ -511,7 +626,7 @@ Build one dashboard per concern and template it with a `$model` /
   preemption rate. This row is what tells you *why* latency moved.
 - **Resource row** — GPU util, tensor-active, HBM used %, power, temp, SM clock
   from DCGM.
-- **Cost row** — \$/1k tokens and \$/hr per replica.
+- **Cost row** — $/1k tokens and $/hr per replica.
 
 Always plot percentiles as separate series; never a single "avg latency" line.
 The next section, "Build it in practice — extended," turns this row list into
@@ -603,6 +718,16 @@ warnings (fix it before it pages). Advanced teams add **multi-window
 multi-burn-rate** error-budget alerts so a fast burn pages immediately and a
 slow burn opens a ticket.
 
+> **Saying it out loud.** The framing I'd use is: an SLI is what you measure,
+> an SLO is what you promised, and an alert should fire when the promise is at
+> risk — not when a number merely looks big. So I split alerts into two tiers.
+> Symptom alerts, like TTFT p95 over the SLO or error rate climbing, page a
+> human, because a user is feeling that right now. Leading indicators — queue
+> depth building, KV cache above 90% — open a ticket, because they say a cliff
+> is coming and buy you time to scale out. And everything gets a for-clause so
+> the condition has to hold for several minutes; without that you're paging on
+> one noisy scrape, which is how you train your on-call to ignore you.
+
 ---
 
 ## Build it in practice — extended
@@ -630,7 +755,7 @@ cache saturation.
 | 11 | Resource | GPU util vs. tensor-active, per GPU | Time series, two series overlaid | `avg by (gpu) (DCGM_FI_DEV_GPU_UTIL)` and `avg by (gpu) (DCGM_FI_PROF_PIPE_TENSOR_ACTIVE) * 100` |
 | 12 | Resource | HBM used % | Time series + threshold at 95 | `100 * DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)` |
 | 13 | Resource | GPU temp / power | Time series | `DCGM_FI_DEV_GPU_TEMP`, `DCGM_FI_DEV_POWER_USAGE` |
-| 14 | Cost | \$ per 1k tokens | Stat panel | `sum(price_per_gpu_hour) / (sum(rate(vllm:generation_tokens_total[5m])) * 3.6)` |
+| 14 | Cost | $ per 1k tokens | Stat panel | `sum(price_per_gpu_hour) / (sum(rate(vllm:generation_tokens_total[5m])) * 3.6)` |
 
 Rows 1–5 are RED; rows 6–10 are the LLM-specific USE-saturation row that most
 generic dashboards omit; rows 11–13 are USE-utilization/errors from DCGM; row
@@ -762,6 +887,20 @@ supports fast rebalancing; then, if it's a traffic-mix issue, adjust
 `max_num_seqs` / `max_model_len` or fix prefix-cache-aware routing rather than
 just adding hardware against a problem hardware won't solve.
 
+> **Saying it out loud.** If a KV-cache alert wakes me up I'm not immediately
+> scaling out — I want to know which of three things it is. First I check
+> whether queue depth and the preemption rate are rising too; if the cache is
+> full but nothing's queueing or getting evicted, it was a burst that already
+> passed. Second I check whether the prompt and output length distributions
+> moved, because one new customer with much longer prompts inflates cache
+> usage with zero change in request count — that's a traffic-mix problem and
+> adding replicas is the wrong fix. Third I check the prefix-cache hit ratio,
+> since a routing change that stops sending same-prefix traffic to the same
+> replica makes you recompute KV blocks you used to get for free. And the
+> reason the threshold is 90 rather than 100 is that the scheduler starts
+> preempting the moment it can't allocate blocks for the next step, so you
+> need a couple of average sequences' worth of headroom as a shock absorber.
+
 ---
 
 ## RED and USE, applied to inference
@@ -787,6 +926,15 @@ just adding hardware against a problem hardware won't solve.
 Run both: RED catches the user-facing symptom, USE tells you which resource
 caused it. The link between them is almost always the saturation row — queue and
 cache — which is exactly the pair that generic dashboards omit.
+
+> **Saying it out loud.** RED and USE are just two lenses and you want both on
+> the wall. RED — rate, errors, duration — is the request's point of view,
+> which is what users actually experience. USE — utilization, saturation,
+> errors — is the resource's point of view, which tells you why. The
+> LLM-specific twist lives in the saturation box: in a classic web service
+> that's the CPU run queue, but here it's sequences waiting for KV-cache
+> blocks. That's exactly the box generic dashboards leave empty, and it's the
+> one that connects "p95 got worse" to "because the cache filled up."
 
 ---
 
@@ -822,6 +970,17 @@ heading rather than something to depend on for today's alerting — keep
 alerting on the engine-native names (`vllm:...`, `tgi_...`) and treat
 `gen_ai.*` attributes on your trace spans as a bonus cross-vendor label for
 now.
+
+> **Saying it out loud.** Metrics tell you that p99 is bad; a trace tells you
+> where the time went for one specific slow request. So for a four-second
+> request, a trace splits it three ways: 3.8 seconds of queue wait means scale
+> out, a huge prefill means somebody sent an eight-thousand-token prompt, and
+> slow decode means a batching or memory-bandwidth problem. Those are three
+> completely different fixes and aggregate metrics can't tell them apart. The
+> practical requirements are propagating the traceparent header from your
+> gateway into the engine so the engine's spans nest under the user's request,
+> and sampling — one to five percent plus always-sample-on-error — because
+> full-rate tracing at scale becomes its own cost and cardinality problem.
 
 ---
 
@@ -864,6 +1023,16 @@ higher-severity symptom alert also exists), and reviewing "alerts that fired
 in the last 30 days with no action taken" on a regular cadence. Alert volume
 is itself a metric worth graphing.
 
+> **Saying it out loud.** The lesson here isn't a missing metric — the
+> KV-cache and queue alerts fired correctly, within two minutes of onset. The
+> failure was that they landed in a channel that also got two chronically
+> noisy inherited alerts most nights, so the on-call acked the whole group
+> without reading it and went back to sleep. Forty minutes of degraded service
+> happened after a correct page. So the fix wasn't a better alert, it was
+> deleting the noisy ones, splitting severities so only symptom alerts page,
+> and reviewing "alerts that fired in the last thirty days with no action
+> taken" on a regular cadence. Alert volume is itself a metric worth graphing.
+
 ### War story 2 — the metric that was already there, just not on a dashboard
 
 **Setup.** A team ran vLLM in production with a Grafana dashboard built early
@@ -894,6 +1063,16 @@ LLM-serving latency cliff. The postmortem action item was almost embarrassingly
 simple — add the KV-cache and queue-depth rows from Mechanism 3/"Build it in
 practice" above and wire the `KVCacheSaturated` alert — which is exactly why
 this chapter treats those two metrics as non-optional rather than nice-to-have.
+
+> **Saying it out loud.** This one is the opposite failure and it's more
+> common than people admit: the metric existed the whole time, the engine was
+> exporting it, nobody had put it on a dashboard. GPU utilization read a
+> comfortable sixty percent so everything looked fine, while KV cache sat at
+> 97% and TTFT crept from about 900 milliseconds to six seconds over three
+> hours. Nobody noticed until support tickets piled up. The remediation was
+> embarrassing in its simplicity — add the KV-cache and queue-depth panels,
+> wire the saturation alert — which is exactly why I treat those two as
+> non-optional rather than nice-to-have.
 
 ---
 
@@ -941,7 +1120,7 @@ this chapter treats those two metrics as non-optional rather than nice-to-have.
   p95s. Sum the `_bucket` series across replicas *first*, then take the
   quantile. Aggregating already-quantiled numbers gives a wrong answer.
 
-- **No cost visibility.** If nobody graphs \$/1k tokens, efficiency regressions
+- **No cost visibility.** If nobody graphs $/1k tokens, efficiency regressions
   (a bad batch-size change, an underutilized replica) go unnoticed until the
   cloud bill arrives. Cost is the metric leadership reads; derive it from
   tokens/s and GPU price.
@@ -955,6 +1134,17 @@ this chapter treats those two metrics as non-optional rather than nice-to-have.
   alert-fatigue failure in "War story 1" above — every alert rule you carry
   over should be re-justified against this workload, not assumed correct
   because it worked for a REST API.
+
+> **Saying it out loud.** If I had to name the three pitfalls that bite
+> hardest: alerting on averages, having no saturation metrics at all, and
+> trusting GPU utilization. A mean of 400 milliseconds can hide a p99 of
+> twelve seconds, and the tail is who churns. No queue or KV-cache metric
+> means zero warning before the latency cliff — everything looks fine right up
+> until TTFT triples. And GPU util says "a kernel was scheduled," not "the GPU
+> did useful work"; during decode it sits near 100% while the card is
+> memory-bandwidth-starved. There's a purely arithmetic one too: you cannot
+> average p95s across replicas, you have to merge the bucket series first and
+> take the quantile once.
 
 ---
 
@@ -997,7 +1187,7 @@ this chapter treats those two metrics as non-optional rather than nice-to-have.
    labels only; per-request detail goes to traces/logs.
 7. **"How do you debug one slow request?"** — OpenTelemetry tracing with
    propagated `traceparent`, sampled, to split queue vs prefill vs decode time.
-8. **"What's your cost metric?"** — \$/1k tokens derived from GPU \$/hr and
+8. **"What's your cost metric?"** — $/1k tokens derived from GPU $/hr and
    `rate(generation_tokens_total)`, tracked per model/replica.
 9. **"vLLM's V1 engine changed some metric names — what, and why should I
    care?"** — The prefix-cache hit-rate gauge was replaced by
@@ -1094,11 +1284,24 @@ Points a strong candidate hits, roughly in order:
 - **Tracing sampling strategy** — low fixed-rate sampling plus always-sample-on
   -error, propagated `traceparent` end to end, because at a few hundred GPUs
   100%-sampled traces are a cost and cardinality problem of their own.
-- **Cost as a first-class row**, not an afterthought — \$/1k tokens per model,
+- **Cost as a first-class row**, not an afterthought — $/1k tokens per model,
   visible to more than just the on-call engineer.
 - **A plan for engine-version drift** — new engine versions rename/deprecate
   metrics (see the vLLM V1 changes above); dashboards need an owner who updates
   them when that happens, not a "set it and forget it" assumption.
+
+> **Saying it out loud.** For a prompt like this I'd answer in layers rather
+> than naming tools. The gateway emits traces and its own request metrics;
+> engines and DCGM exporters get scraped by one Prometheus, or a federated
+> pair at a few hundred GPUs; Grafana templated on model, engine and GPU;
+> Alertmanager doing severity routing. Then I'd hit the two things that make
+> it a senior answer. Interactive and batch traffic need separate SLIs,
+> because batch tolerates queueing and chat doesn't, so a blended TTFT p95
+> tells you nothing. And multi-tenant labeling is a cardinality trap — tenant
+> identity goes into logs and traces, not into a Prometheus label, unless it's
+> bucketed down to a handful of tiers. I'd also name an owner for metric-name
+> drift, because engines rename metrics between versions and an unowned
+> dashboard quietly rots.
 
 ### Red flags vs. green flags
 
@@ -1110,7 +1313,7 @@ Points a strong candidate hits, roughly in order:
 | Alert design | Every alert pages, no `for:` debounce | Symptom alerts page, leading indicators ticket, `for:` on everything |
 | Alert provenance | Inherited wholesale from a generic web-service pack | Every rule re-justified for GPU-serving traffic patterns |
 | Percentile math | Averages pre-computed p95s across replicas | Sums `_bucket` series first, then takes the quantile |
-| Cost visibility | No \$/1k tokens metric anywhere | Cost row on the same dashboard as latency |
+| Cost visibility | No $/1k tokens metric anywhere | Cost row on the same dashboard as latency |
 | Engine-version hygiene | Dashboard built once, never revisited across engine upgrades | Someone owns re-mapping deprecated/renamed metrics (e.g. vLLM V1 changes) after upgrades |
 | Tracing | No propagated `traceparent`; traces (if any) don't nest under the user request | `traceparent` propagated gateway → engine; sampled + always-sample-on-error |
 | GenAI semantic conventions | Alerting depends on `gen_ai.server.*` names today | Treated as an emerging cross-vendor join key, not yet load-bearing |

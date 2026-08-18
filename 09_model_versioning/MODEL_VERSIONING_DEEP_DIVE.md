@@ -22,6 +22,17 @@ about making a served model version an **exact, immutable, auditable thing**: wh
 comprises, how a registry tracks and promotes it, how the server resolves "current
 prod," and how you roll back when it goes wrong.
 
+> **Saying it out loud.** The line I'd lead with is: an unpinned "same" model
+> is not the same model. Somebody re-runs the fine-tune and pushes to the same
+> repo, or the base image bumps transformers and the tokenizer splits emoji
+> differently, or latest starts pointing at different bytes — and the name in
+> your config never changed, so nothing looks like a deploy. The cost isn't
+> the regression itself, it's that you can't explain it or undo it, because
+> you don't actually know what you're running. So the whole goal of versioning
+> is to make a served model an exact, immutable, auditable thing, and the test
+> of whether you've got it is simple: can you say, for a request three weeks
+> ago, precisely which bytes answered it.
+
 ---
 
 ## Core Intuition
@@ -46,6 +57,19 @@ The server should resolve a mutable pointer **once, at load time**, and then pin
 resolved immutable identity for the life of the process — logging it on every request.
 Rollback then becomes "repoint the alias and reload," and provenance becomes "which
 exact version answered request `X`."
+
+> **Saying it out loud.** The mental model I use is container image tags
+> versus digests. A tag like latest is a mutable pointer — it's a name, not an
+> identity, and anyone can repoint it. A digest is content-addressed: it names
+> the bytes, so if the bytes change the digest changes, and two people pulling
+> the same digest get the same thing forever. Good model versioning keeps both
+> layers but keeps them separate — an immutable version id you log and
+> evaluate against, plus human-friendly aliases like @champion that point at
+> one immutable version and can be moved. And the discipline that makes it
+> work is that the server resolves the alias once, at load time, then pins and
+> logs the resolved id for the life of the process — otherwise a promotion
+> splits traffic mid-flight and your logs can't tell you which version
+> answered.
 
 ---
 
@@ -89,6 +113,17 @@ Reproducibility checklist — a version is not reproducible unless you can answe
 > [The 2025–2026 Landscape](#the-20252026-landscape) below for how modern registries
 > version prompts and tool schemas alongside the model itself.
 
+> **Saying it out loud.** The most common mistake is versioning only the
+> weights. A served model is a bundle: weights, config, tokenizer and chat
+> template, generation defaults, the serving code that wraps it, the inference
+> engine and its version, the quantization recipe, and the runtime
+> dependencies. Change any one of those and the outputs move. The one that
+> catches people most often is the tokenizer and chat template, because it
+> drifts through a dependency bump nobody associates with the model at all. My
+> shortcut is to bake weights plus tokenizer plus config plus engine into a
+> container image and register that image digest as the version's artifact —
+> one digest content-addresses most of the bundle in a single shot.
+
 ---
 
 ## Immutable, Content-Addressed Artifacts
@@ -124,6 +159,16 @@ Best practice: assign a monotonic registry version for humans, and record the co
 hash(es) as immutable metadata/tags on that version. Never reuse a version number for
 different bytes.
 
+> **Saying it out loud.** Content-addressed just means the identifier is a
+> hash of the bytes, and two useful things fall out for free. Integrity:
+> re-download, re-hash, and if it matches, nothing was corrupted or swapped.
+> And identity: you physically cannot overwrite version five with new content
+> and keep the same id, because different bytes give a different hash. What
+> I'd add is that you want both a content hash and a human version number,
+> because they do different jobs — the integer tells a person "newer than v2"
+> and carries release intent, the hash is machine truth. The rule that ties
+> them together is: never reuse a version number for different bytes.
+
 ---
 
 ## Artifact Storage
@@ -150,6 +195,17 @@ choices are shaped by size:
   artifact registries) push the same idea further — see
   [The 2025–2026 Landscape](#the-20252026-landscape).
 
+> **Saying it out loud.** The thing that shapes storage here is just size — a
+> 70B model in bf16 is roughly 140 gigabytes, and even a 7B is around 14. So
+> object storage is the default backing store, with object versioning or
+> object lock turned on so a write can't silently mutate an existing version's
+> bytes, and keys derived from the content hash so identical tokenizers and
+> base weights get stored once. The operational pain isn't storage cost, it's
+> cold start: pulling 140 gigabytes onto every new pod during an autoscale
+> event is slow enough to break your scaling behavior. So you add node-local
+> caches, a shared read-only volume, or pre-warmed images — but the version id
+> has to stay identical no matter where the bytes were cached from.
+
 ---
 
 ## Registries & the Promotion Workflow
@@ -169,6 +225,16 @@ exist; modern registries favor the second:
   many aliases; you can have `@champion` and `@shadow` simultaneously. Aliases decouple
   "what code loads" from "which version is behind it." MLflow, Vertex, and (effectively)
   HF branches all use this model.
+
+> **Saying it out loud.** Stages were the classic model: a version sits in
+> exactly one of None, Staging, Production, or Archived. It's simple but
+> coarse — you get one production slot. Aliases are the modern answer: named
+> pointers like @champion, @challenger, @shadow, each pointing at exactly one
+> version, and one version can carry several. That matters because in LLM
+> serving the normal case is having a champion, a canary, and a shadow all
+> live at once, which the single-slot model just can't express. MLflow
+> deprecated stages in favor of aliases for exactly this reason, and Vertex
+> and Hugging Face branches are effectively the same shape.
 
 ### Gated Promotion Workflow (dev → staging → prod)
 
@@ -200,6 +266,17 @@ The critical properties:
 - **Approvals are recorded** on the version (who, when, against which eval run).
 - **The previous prod version stays registered and warm-able**, so rollback is a
   pointer move back, not a rebuild-and-redeploy.
+
+> **Saying it out loud.** The one-sentence version is that a promotion is a
+> pointer move guarded by evidence — never a rebuild. You register an
+> immutable, content-hashed version once; you run evals and attach the results
+> to that exact version id; then a gate checks those results and moves the
+> alias. Two properties follow. Rollback is instant, because the previous
+> version was never destroyed and you're just moving the pointer back. And the
+> gate has to be enforced in CI rather than being tribal knowledge — including
+> failing closed when there are no eval results at all, because a gate that
+> treats "missing data" as "pass" will eventually promote something nobody
+> evaluated.
 
 ---
 
@@ -337,6 +414,16 @@ client.set_registered_model_alias(MODEL_NAME, "champion", "6")
 > `mlflow.transformers.load_model("models:/chatbot-llm/7")`. Use aliases for
 > operability; use explicit versions when you want the config file itself to be the pin.
 
+> **Saying it out loud.** Rolling back is the part people get wrong in
+> interviews, so I'd be concrete: it's one API call that repoints the alias to
+> the last known-good version, plus whatever makes the servers actually reload
+> — usually a rolling restart. The bad version stays registered, which you
+> want, because you need it for forensics. And the pointer move is the easy
+> half; the SLO you should quote is repoint plus drain plus serving the
+> previous version in a few minutes with zero rebuild. If reverting requires
+> re-running training, re-quantizing, or rebuilding an image, you don't have
+> rollback — you have a second forward deploy, and it'll take hours.
+
 ### 6. Build it in practice, extended — a full promotion pipeline
 
 The three-step gate above (`challenger` → check tags → `champion`) is correct but
@@ -431,6 +518,15 @@ Two details do the real work here:
   read from history after the fact. That single tag is what turns the rollback drill
   below from "grep the audit log" into "read one tag."
 
+> **Saying it out loud.** The detail worth stealing from this pipeline is
+> writing a previous_champion tag onto the incoming version at promotion time,
+> rather than reconstructing history afterwards. That turns rollback from
+> "grep the audit log and hope" into "read one tag," which matters at three in
+> the morning when the person on call didn't do the promotion. The other half
+> is the gate refusing to promote a version that has no eval tags at all.
+> Failing open on missing data is the quiet killer — the pipeline looks like
+> it's protecting you right up until the eval job silently didn't run.
+
 ### 7. Rollback drill — simulate a bad promotion and recover by alias
 
 Run this as an actual drill (quarterly, or after onboarding a new on-call) so the first
@@ -492,6 +588,16 @@ What the drill is meant to prove, and what to time when you run it for real:
   re-running training, re-quantizing, or rebuilding an image, the drill has found a gap
   — close it before you need it under pressure.
 
+> **Saying it out loud.** The reason I'd run this as a real drill, quarterly,
+> is that a rollback path you've never executed is a hypothesis. There are
+> three numbers to time: time to detect — how long until monitoring names the
+> bad version by id, not just "prod feels off"; time to roll back — from
+> decision to servers actually serving the old version, which is the pointer
+> move plus the reload; and whether any step in the path requires a rebuild.
+> That last one is pass/fail. And the drill only counts if you verify the
+> bytes behind the restored pointer, because a pointer move is only a rollback
+> if what's behind it is what you think it is.
+
 ---
 
 ## Registry Comparison
@@ -521,6 +627,17 @@ Key nuances:
 - **Hugging Face Hub** is git-native: every push is a commit, and `revision=` on
   `from_pretrained` pins a **commit hash, branch, or tag**. The commit hash is a true
   content address; a bare `main` is a *mutable* pointer — never rely on it in prod.
+
+> **Saying it out loud.** If someone asks me to pick a registry I'd say the
+> mechanics are the same everywhere and the choice follows your cloud. MLflow
+> gives you aliases plus tags with a pluggable artifact store — the right
+> default if you're self-hosting. SageMaker models it as approval status on a
+> model package, which is nice because flipping to Approved can trigger a
+> downstream deploy through EventBridge. Vertex uses version aliases including
+> a built-in default. And Hugging Face is git-native, where the commit hash is
+> a genuine content address. The trap is the same across all four: whatever
+> the tool calls its mutable pointer — main, latest, default — never let
+> production resolve it at runtime.
 
 ---
 
@@ -559,6 +676,18 @@ content-addressing guarantee at the chunk level, not just the file level (Huggin
 blog post). For versioning purposes the practical upshot is the same lesson, reinforced
 at finer grain: identity is a hash of bytes, and `main`/`latest` is not that.
 
+> **Saying it out loud.** For Hugging Face specifically the one thing to know
+> is the revision argument. from_pretrained takes a commit hash, a tag, or a
+> branch, and only the commit hash is a real content address — omit it and you
+> get main, which resolves to whatever main points at right now. That's the
+> mutable-pointer failure mode, but with an extra edge: if you're using
+> trust_remote_code you're executing arbitrary code from that repo, so an
+> unpinned revision is a supply-chain exposure, not just a reproducibility
+> one. Underneath, Hugging Face has been moving from Git LFS to Xet, which
+> chunks files with a rolling hash so an edit only invalidates the chunks that
+> changed and dedup works across repos, not just across commits. Same lesson
+> at finer grain: identity is a hash of bytes.
+
 ### MLflow's Prompt Registry: versioning the other half of an agent
 
 As of MLflow 3.x (the docs tree covers versions up to 3.15.0, released July 31, 2026),
@@ -594,6 +723,17 @@ max_tokens) alongside the prompt version, so a prompt version and the sampling c
 was tuned against travel together — closing exactly the "generation config" gap flagged
 in the versioning-together table earlier in this chapter.
 
+> **Saying it out loud.** The point of a prompt registry is that in an agentic
+> system the prompt is a first-class artifact that changes on its own schedule
+> — usually faster than the weights do. MLflow 3 ships one, and it
+> deliberately uses the same mental model as the model registry: each prompt
+> version is immutable once created, with a commit message, and named aliases
+> move between versions for promotion and rollback. There's a reserved @latest
+> alias for convenience in dev, and you should no more ship that to production
+> than you'd ship a model by latest. The nice extra is that MLflow lets you
+> log the generation parameters next to the prompt version, so a prompt and
+> the temperature it was tuned against travel together.
+
 ### Content-addressed, OCI-packaged models
 
 A second, independent trend treats a model bundle as **an OCI artifact** — the same
@@ -612,6 +752,18 @@ documented running **Harbor** — an existing OCI-compliant container registry �
 model registry on top of this, i.e., production teams are already reusing container
 infrastructure for model versioning rather than standing up a separate system
 ("Using Harbor as an AI Model Registry," blogs.vmware.com, March 2026).
+
+> **Saying it out loud.** The bet here is that instead of inventing a bespoke
+> model format, you package a model bundle as an OCI artifact — the same
+> content-addressed, layered, digest-referenced format container images
+> already use. You inherit the whole ecosystem for free: digest-based
+> integrity, sigstore signing, existing registries, Kubernetes volume sources,
+> multi-arch manifests. CNCF's ModelPack spec and its modctl CLI are the
+> standardization effort, and teams are already running Harbor as a model
+> registry on top of it. The tradeoff to name is that you give up ML-specific
+> metadata — run linkage, eval results, lineage graphs — that a purpose-built
+> registry like MLflow hands you natively, unless you layer it back on with
+> tags.
 
 ### Versioning the whole agentic bundle
 
@@ -653,6 +805,18 @@ as a whole, and roll back by repointing the manifest's alias — not by repointi
 model, prompt, and tool schema independently and hoping they land on compatible
 versions at the same time.
 
+> **Saying it out loud.** Once you wrap a model in an agent, behavior is a
+> function of at least four independently versioned things: the weights, the
+> system prompt, the tool schemas, and the engine. Each one has its own
+> release cadence and each can drift alone. So the fix is the same
+> content-hash-of-components idea, applied one level up — write an explicit
+> bundle manifest that names the model version, the prompt version, the
+> tool-schema hash, the engine version and the runtime image digest, then hash
+> that manifest and register it as the agent's version. You gate and roll back
+> the manifest as one unit. The failure to avoid is repointing the model alias
+> and the prompt alias in two separate uncoordinated steps and landing on a
+> combination nobody ever evaluated.
+
 ---
 
 ## Reproducibility & Rollback Mechanics
@@ -685,6 +849,17 @@ Rollback SLO worth stating out loud: *repoint + drain + serve previous version i
 a few minutes, with zero rebuild.* If your rollback requires re-running a training or
 build pipeline, you do not have rollback; you have a second forward deploy.
 
+> **Saying it out loud.** Reproducibility here means: give me a version id and
+> I can reconstruct the exact serving behavior on a fresh host. Mechanically
+> that's resolve the id to an immutable artifact reference, fetch the bytes
+> and re-hash them against the recorded digest, load with the pinned engine
+> and pinned runtime, apply the captured generation config rather than engine
+> defaults, then re-run that version's eval suite and confirm the numbers
+> match. That last step is the real test — if the evals come out different,
+> something in the bundle wasn't actually pinned, and you've just found which
+> layer you're missing. Rollback is the same machinery run backwards, and it's
+> cheap only because the old version was never destroyed.
+
 ---
 
 ## A/B and Shadow of Versions
@@ -705,6 +880,17 @@ that produced it, or the comparison is meaningless. Shadow is the safest way to 
 tokenizer/engine drift *before* promotion, because you diff the candidate against prod
 on identical inputs.
 
+> **Saying it out loud.** A/B and shadow are answering different questions and
+> I'd keep them separate. A/B, or canary, splits real traffic between champion
+> and challenger, so users see both and you compare online metrics — latency,
+> thumbs-up rate, task success — sliced by the version id stamped on each
+> request. Shadow mirrors a copy of production traffic to the candidate but
+> never returns its output, so you get real-input comparison at zero user
+> risk. Shadow is what I'd reach for before an engine upgrade or a
+> re-quantization, because those break in ways offline evals miss. Both are
+> worthless without one discipline: every log record carries the exact version
+> that produced it, or the comparison means nothing.
+
 ---
 
 ## Model Cards & Lineage
@@ -723,6 +909,15 @@ Why both matter for serving: when an incident, a compliance request, or a
 "which-data-did-this-see" question lands, the card answers *what and why*, and lineage
 answers *from what*. A version with neither is unauditable — you cannot prove what it is
 or where it came from, which is exactly the state the opening anecdote describes.
+
+> **Saying it out loud.** A model card is the human-readable half — intended
+> use, training data, evals, limitations, license — and lineage is the
+> machine-readable half: this version came from this training run, on this
+> data snapshot, from this base-model revision. You need both, and you need
+> them for a boring reason: when an incident or a compliance request lands,
+> the card answers what and why, and lineage answers from what. A version with
+> neither is unauditable — you can't prove what it is or where it came from,
+> which is exactly the situation this chapter opened with.
 
 ---
 
@@ -751,6 +946,18 @@ A startup self-check that encodes a fixed probe string (including every special 
 and compares the resulting ids against a recorded golden fingerprint would have caught
 this in a health check, not in production traffic.
 
+> **Saying it out loud.** This is my favorite example because nothing anyone
+> would call "the model" changed. A newer transformers auto-converted the
+> tokenizer to its fast backend, that backend compacts gaps in the
+> special-token id space, and a token the config had hardcoded by numeric id
+> moved by three. The engine went looking for a token that no longer existed
+> at that id and hard-crashed. Weights unchanged, registered version
+> unchanged; a loader-level auto-migration one layer below what the team
+> thought they'd pinned. The generalizable lesson: pinning the tokenizer files
+> is not the same as pinning tokenizer behavior — so encode a fixed probe
+> string, record the resulting token ids as a golden fingerprint, and check it
+> at startup.
+
 ### War story 2 — an unrelated dependency bump broke chat formatting
 
 In December 2025, a team deploying DeepSeek-V3.2 on vLLM 0.11.2 hit a `ValueError` at
@@ -765,6 +972,17 @@ this chapter's versioning-together table calls out. The practical guard this inc
 argues for: a deploy-time canary that sends one real, chat-formatted request through
 the new pod *before* it takes production traffic, so a broken template fails the
 rollout gate instead of a live user's request.
+
+> **Saying it out loud.** The nasty part of this one is the timing: the server
+> started cleanly and the model loaded fine, and the failure only appeared
+> when the first real chat-formatted request arrived. A transformers bump in
+> the base image removed an implicit default chat template the model had been
+> relying on. Nothing in the registered version changed — it was purely an
+> unpinned runtime dependency, which is why the versioning-together table has
+> a row for runtime deps. The guard it argues for is a deploy-time canary:
+> push one real, fully formatted request through the new pod before it takes
+> production traffic, so a broken template fails the rollout gate instead of a
+> live user's request.
 
 ### War story 3 — the mutable `latest` tag (a composite, illustrative pattern)
 
@@ -789,6 +1007,18 @@ through everyone's recent commits."
 model" — the name, the registered version, the config line — stayed put. The behavior
 changed because *something the bundle table lists as a separate row* moved
 underneath it. That is the whole argument for versioning the bundle, not the weights.
+
+> **Saying it out loud.** This one is a pattern rather than a single incident,
+> and it's the most common shape of the whole failure class. Your config
+> points at latest, or an S3 latest prefix, or the HF main branch with no
+> revision pinned. Someone in a different team and a different timezone pushes
+> something — a retrain, or honestly just a README update that touches the
+> pointer — and now latest resolves to different bytes. No deploy fired, no CI
+> ran. The next pod restart, which could be a routine autoscale event nobody
+> initiated, starts serving different behavior under a config line that hasn't
+> changed in months. With a resolved-once-and-logged version id, this becomes
+> "check the version in the logs"; without it, it's archaeology across
+> everyone's commit history.
 
 ---
 
@@ -826,6 +1056,18 @@ underneath it. That is the whole argument for versioning the bundle, not the wei
 - **A gate that fails open on missing data.** An eval-gated promotion pipeline that
   treats "no eval tags recorded yet" as "pass" will eventually promote something nobody
   evaluated. Fail closed: no eval on the version means no promotion.
+
+> **Saying it out loud.** If I'm naming the pitfalls that actually cause
+> incidents: mutable pointers in production, bytes that aren't
+> content-addressed so a bucket write can overwrite a version in place,
+> tokenizer or engine drift where the weights are pinned but the layer
+> underneath isn't, and eval results attached to a run instead of to the
+> version id — which means your promotion gate is guarding nothing. Two more
+> that are less obvious. Re-resolving an alias per request instead of once at
+> load, which splits traffic mid-promotion and makes logs ambiguous. And a
+> gate that fails open on missing eval data, which will eventually promote
+> something nobody evaluated. Rollback that requires a rebuild belongs on the
+> list too: that turns a five-minute incident into a multi-hour one.
 
 ---
 
@@ -959,6 +1201,20 @@ runs" — the questions below go from fundamentals to a full system-design promp
     get in the way the moment you want two things pointing at production-adjacent
     versions simultaneously (canary + shadow + champion), which is the normal case for
     LLM serving — hence MLflow's move to aliases.
+
+> **Saying it out loud.** For a design prompt like five models in production,
+> the shape of a good answer is: one registry, namespaced per model, not five
+> bespoke systems — metadata in Postgres, artifacts content-addressed in
+> object storage. Each model gets its own aliases, so promoting the ranker
+> can't accidentally touch the chatbot. One promotion pipeline as code,
+> parameterized by model name, so the eval thresholds and approval
+> requirements are consistent and reviewable rather than five diverging tribal
+> processes. Each server resolves its own alias once at startup, logs the
+> resolved version id on every request, and exposes a version endpoint for
+> on-call. And I'd state the rollback SLO explicitly and pay for it — keeping
+> N-1 warm roughly doubles that model's steady-state GPU footprint during a
+> promotion window, and that's the honest tradeoff: you're buying
+> minutes-not-hours rollback with GPU-hours.
 
 ### Red flags vs. green flags
 

@@ -16,6 +16,18 @@ The API layer authenticates, authorizes, meters, caches, queues, and degrades.
 Six verbs.
 This chapter is about all six, with the most time spent on the two that come up in every design review and every interview: metering, which people call rate limiting, and caching.
 
+> **Saying it out loud.** The framing I'd open with is that there's a service
+> in most architecture diagrams that nobody actually drew. You've got a load
+> balancer, a cluster, some GPU nodes running vLLM — and between the arrow
+> labelled "user" and the box labelled "inference" there's a gap that
+> something has to fill in production. The model server is not the front door.
+> vLLM doesn't know who your customers are, has no opinion about whether this
+> caller has spent their monthly allowance, won't notice the same question
+> arrived eleven times in a minute, and will happily accept requests right up
+> to the point where queue depth makes p99 worse than a timeout. It's a very
+> good engine; it isn't a car. The API layer authenticates, authorizes,
+> meters, caches, queues, and degrades.
+
 ## What breaks when this layer is missing
 
 Three failures, and you will see all three if you run long enough.
@@ -37,6 +49,19 @@ Every consumer-facing LLM product has a fat head in its query distribution — "
 Each is a fresh forward pass through a very large model, paying for a computation whose answer you already have from four minutes ago.
 
 All three have the same shape: a decision that must be made *before* the request reaches the model, using state the model server does not have.
+
+> **Saying it out loud.** Three things break without this layer and you'll hit
+> all three eventually. One customer with a retry loop and no backoff starves
+> everyone, because on an LLM API their requests occupy genuinely scarce GPU
+> slots and your other customers just experience everything getting slow. A
+> viral moment melts the fleet, because GPU autoscaling takes two to ten
+> minutes — a node, a multi-gigabyte image, then multi-gigabyte weights — and
+> none of that helps in the ninety seconds between someone popular linking
+> your demo and your pool being exhausted. And you answer the same question at
+> full price forever, because every consumer LLM product has a fat head in its
+> query distribution. All three have the same shape: a decision that has to be
+> made before the request reaches the model, using state the model server
+> doesn't have.
 
 ---
 
@@ -68,6 +93,18 @@ For a limit that exists mostly to catch runaway scripts, a 2× overshoot for one
 For a GPU fleet sized with 20% headroom, it is an incident.
 Assume LLM serving is the second case unless you have measured otherwise.
 
+> **Saying it out loud.** Fixed window is the simplest thing that works: one
+> integer per caller per minute, increment, reject over the limit, and the key
+> changes when the clock ticks. Essentially free in state. It has exactly one
+> flaw and it's real — the boundary burst. A caller limited to a hundred a
+> minute sends a hundred at 11:59:59 and another hundred at 12:00:00: two
+> hundred requests in two seconds, both windows individually legal, and your
+> backend seeing double the configured rate. Whether that matters depends
+> entirely on what you're protecting. For catching runaway scripts, a 2x
+> overshoot for one second is nothing. For a GPU fleet sized with twenty
+> percent headroom, it's an incident — and you should assume LLM serving is
+> the second case unless you've measured otherwise.
+
 ### Sliding window log
 
 Store a timestamp for every request the caller makes.
@@ -83,6 +120,17 @@ In Redis this is a sorted set, pruned with `ZREMRANGEBYSCORE` and counted with `
 Use it when limits are small and precision matters — expensive operations, per-account write limits, anything where "approximately 100" is not acceptable.
 Do not use it as the front-line limiter for high-volume traffic.
 
+> **Saying it out loud.** The sliding window log is the exactly-correct one:
+> store a timestamp per request, drop the ones older than the window, count
+> what's left. No boundary artifact because there's no boundary — the window
+> slides continuously. The cost is what rules it out at scale: one entry per
+> request per caller for the whole window, so a caller allowed ten thousand a
+> minute needs ten thousand timestamps held for a minute, simultaneously, for
+> every active caller. So I'd reach for it when limits are small and precision
+> genuinely matters — expensive operations, per-account write limits, anywhere
+> "approximately a hundred" isn't acceptable — and never as the front-line
+> limiter for high-volume traffic.
+
 ### Sliding window counter
 
 The compromise, and in practice the most common choice.
@@ -97,6 +145,17 @@ A quarter of the way into the current minute you count this minute's requests in
 The estimate assumes the previous window's requests were spread evenly through it, which is not true, so it is approximate.
 Cloudflare measured this across 400 million requests from 270,000 sources and found 0.003% of requests wrongly allowed or limited — approximate, but not by much.
 Two integers per caller, no boundary burst, and for most general-purpose API rate limiting this is the right default.
+
+> **Saying it out loud.** The sliding window counter is the practical
+> compromise and the most common general-purpose choice. You keep two
+> fixed-window counters, current and previous, and estimate the sliding rate
+> by blending them by how far into the current window you are — a quarter of
+> the way in, you count this minute's requests in full plus seventy-five
+> percent of last minute's. It's approximate, because it assumes the previous
+> window's traffic was spread evenly, which it wasn't. But Cloudflare measured
+> this across 400 million requests and found about three-thousandths of a
+> percent wrongly allowed or limited. Two integers per caller, no boundary
+> burst — that's a very good trade for general API limiting.
 
 ### Token bucket
 
@@ -122,6 +181,18 @@ Lazy refill, exact, two numbers per caller.
 
 Token bucket is the default for LLM APIs, and the reason is in the next section: it is the only one of these five that naturally handles requests with *different costs*.
 
+> **Saying it out loud.** Token bucket is the one you'll actually implement
+> for an LLM API. A bucket holds up to B tokens and refills at r per second;
+> each request removes tokens equal to its cost, and if there aren't enough,
+> you reject. The reason to pick it is that r and B are separate knobs meaning
+> different things — r is your sustained rate, B is your burst allowance, so a
+> caller who's been idle can spend the whole bucket at once. That matters
+> because real clients are bursty and their burstiness is usually legitimate:
+> a user opens the app and five parallel requests fire. And the implementation
+> detail that trips people up: you don't need a background refill process.
+> Store the token count and the last-update timestamp, and add elapsed time
+> times rate on the next request, capped at B.
+
 ### Leaky bucket and GCRA
 
 Leaky bucket inverts the picture.
@@ -144,6 +215,19 @@ As Brandur Leach puts it in the canonical write-up, removing the drip removes a 
 
 GCRA and token bucket are close cousins — a token bucket with a fractional count carries the same information as a TAT.
 Pick GCRA for minimum state and exact pacing; pick token bucket when costs vary per request, which for LLM traffic they emphatically do.
+
+> **Saying it out loud.** Leaky bucket inverts the picture — requests pour in,
+> the bucket drains at a fixed rate, and overflow gets rejected, so the output
+> rate is constant regardless of input. That makes it a shaper rather than
+> just a limiter, which is what NGINX's limit_req is doing. The elegant
+> version is GCRA, borrowed from ATM networking, which tracks one timestamp —
+> the theoretical arrival time, the earliest moment the next request would be
+> perfectly conforming — instead of a token count. One timestamp per caller,
+> no drip process, and that last part is the real argument: an offline or
+> overloaded drip worker limits incorrectly rather than merely late. GCRA and
+> token bucket are close cousins; pick GCRA for minimum state and exact
+> pacing, token bucket when per-request costs vary, which for LLM traffic they
+> emphatically do.
 
 ### The comparison, condensed
 
@@ -180,6 +264,21 @@ The second axis, and the one people forget. Tokens per minute does not bound how
 **Dollars.**
 The third axis, for anything with per-seat pricing or a free tier. Tokens are a proxy for cost, but the exchange rate differs by model: a thousand tokens on your largest model may cost fifteen times a thousand tokens on the small one. If you route between models, meter money, or callers will discover that routing to the expensive model is free.
 
+> **Saying it out loud.** This is where the generic rate-limiting article
+> stops being useful. Every one of those algorithms, as usually presented,
+> counts requests — and for an LLM API that's close to meaningless, because
+> one request is "hi" producing twelve tokens and another is a 180,000-token
+> document with "summarize this" on the end, roughly four orders of magnitude
+> more compute, holding a GPU slot for thirty seconds. Both are one request.
+> So you meter what's actually scarce, on three axes. Tokens is the primary
+> one, which is why commercial providers publish tokens-per-minute alongside
+> requests-per-minute — TPM is what you hit first. Concurrent in-flight
+> requests is the axis people forget, because a caller running fifty parallel
+> long generations can be inside their token budget while pinning your batch
+> scheduler right now. And dollars, if you route across models with different
+> prices, or callers will discover that routing to the expensive model is
+> free.
+
 ### Charging before you know the price
 
 There is a real difficulty here and it is worth naming clearly.
@@ -197,6 +296,19 @@ Reserving at `max_tokens` and never reconciling is the naive version, and it is 
 Reconciliation is maybe fifteen lines of code and it materially changes how the product feels.
 
 The worked example below implements exactly this.
+
+> **Saying it out loud.** There's a genuine difficulty worth naming: you can't
+> know a request's cost until it's finished. Input tokens you can count before
+> dispatch — that's just tokenization — but output tokens are unknown until
+> generation stops. The standard resolution is a two-phase charge. Reserve on
+> admission using input tokens plus an estimate of output, where the estimate
+> is either the caller's max_tokens, which is conservative and will make heavy
+> users feel over-limited, or better, a rolling percentile of that caller's
+> own history. Then reconcile on completion: charge the difference if you
+> underestimated, refund if you overestimated. Reserving at max_tokens and
+> never reconciling is the naive version, and it's why some providers feel far
+> stingier than their published numbers suggest. Reconciliation is about
+> fifteen lines of code and it materially changes how the product feels.
 
 ### Whose limit is it
 
@@ -216,6 +328,21 @@ Evaluate them cheapest-first and reject on the first failure, so a request that 
 
 Give new accounts a lower ceiling that grows with account age and payment history.
 Abuse is disproportionately from new accounts, and this costs nothing to implement.
+
+> **Saying it out loud.** One limit on one identity isn't enough, because
+> you're preventing several different failure modes with different scopes. Per
+> API key is your isolation boundary — one customer with three integrations
+> gets three keys, so when one misbehaves the other two are unaffected. Per
+> user matters in consumer products where identity is a person. Per
+> organization is where the commercial limit lives, capping the sum across all
+> their keys. And global is the one people leave out and then wish they
+> hadn't: a ceiling on total admitted load that protects the fleet from
+> everyone behaving legitimately at once. Evaluate them cheapest-first so a
+> request that's going to be denied on concurrency doesn't first burn a Redis
+> round trip against the token budget. And tiers are just different r and B —
+> raising the burst allowance alone makes a tier feel snappier without giving
+> away any sustained throughput, which is often the cheapest upgrade you can
+> ship.
 
 ### What to return
 
@@ -254,6 +381,19 @@ Two more things worth doing:
 
 **Distinguish "you are over quota" from "we are over capacity."** They look the same to the client and require different responses — the first is the caller's problem and backing off fixes it, the second is yours and the caller backing off merely spreads the pain. Different error codes in the body, even if both are 429.
 
+> **Saying it out loud.** When you reject, be useful about it. It's a 429 —
+> not a 503, which claims your server is broken, and not a 403, which says the
+> caller may never do this. And include a Retry-After computed honestly from
+> limiter state, because you know exactly when the bucket will hold enough
+> tokens. Returning a real number instead of a hardcoded sixty is the single
+> highest-leverage thing you can do for client behavior, since well-written
+> clients honor it and stop hammering you. Two more that get missed: emit the
+> limit headers on successful responses too, so a client can see it has 400
+> tokens left of 60,000 and slow down before being rejected. And distinguish
+> "you are over quota" from "we are over capacity" in the body — they look
+> identical to the client and require opposite responses, since backing off
+> fixes the first and merely spreads the pain in the second.
+
 ---
 
 ## Distributed rate limiting
@@ -266,6 +406,16 @@ You cannot fix this by dividing the limit by \\( N \\).
 Traffic is not evenly distributed across replicas — connection reuse and keep-alive see to that — so a caller whose connections happen to land on one replica gets \\( 1/N \\) of what you promised them, and you have turned an over-limit bug into an under-limit bug that generates support tickets.
 
 The state has to be shared.
+
+> **Saying it out loud.** The moment you run two replicas, an in-process
+> limiter is wrong, and it's wrong in a predictable direction: with N replicas
+> each enforcing the full limit locally, a caller can consume N times the
+> limit. And you cannot fix that by dividing by N, because traffic isn't
+> evenly distributed — connection reuse and keep-alive see to that — so a
+> caller whose connections land on one replica gets a fraction of what you
+> promised them. You've turned an over-limit bug into an under-limit bug that
+> generates support tickets, which is arguably worse because now it's visible
+> to customers. The state has to be shared, full stop.
 
 ### Doing it in Redis, correctly
 
@@ -292,6 +442,20 @@ Three practical notes.
 
 **Declare your keys in `KEYS`, not `ARGV`.** Redis Cluster routes by key, and a script that touches an undeclared key will break the day you shard. When one logical limit spans multiple keys, use a hash tag — `{user:42}:tokens` and `{user:42}:reqs` — to force them onto the same slot.
 
+> **Saying it out loud.** The trap with Redis is that every one of these
+> algorithms is a read-modify-write. Issued as separate commands, two
+> concurrent requests both read a bucket holding one token, both conclude
+> they're allowed, and both write back zero — two admitted, one spent. Under
+> load that isn't rare, it's the common case, and it scales with concurrency,
+> so the limiter fails hardest exactly when it matters most. INCR is atomic
+> and EXPIRE is atomic, but INCR-then-EXPIRE isn't, and that failure is worse:
+> die in between and you have a counter with no TTL that never resets,
+> permanently limiting that caller. The fix is one Lua script via EVAL so the
+> whole read-decide-write runs without interleaving. Keep it small since it
+> blocks the server, pass the timestamp in as an argument rather than calling
+> TIME inside, and declare every key in KEYS or you'll break the day you
+> shard.
+
 ### The accuracy-versus-latency tradeoff
 
 A Redis round trip is somewhere between 0.2 and 2 milliseconds.
@@ -317,6 +481,19 @@ And decide, explicitly and in advance, what happens when Redis is unreachable.
 
 Most LLM APIs should fail open on the abuse limiter and fail closed on the billing limiter.
 Whatever you choose, choose it deliberately and put it in a config flag, because you will want to flip it during an incident.
+
+> **Saying it out loud.** A Redis round trip is somewhere between two-tenths
+> of a millisecond and two milliseconds. Against an LLM request that takes
+> three seconds, that is genuinely free — don't think about it. The reason to
+> build two tiers anyway is that it's a hard dependency on a service that can
+> be down. So you put a generous in-memory token bucket in each process to
+> absorb obvious floods at zero cost, and a global limiter in Redis behind it
+> enforcing the real quota — which is exactly what Envoy does by design. You
+> accept some slop: a caller can exceed the global limit by roughly the sum of
+> local burst allowances, which is bounded and small if you configure it so.
+> And decide explicitly, in a config flag, what happens when Redis is
+> unreachable. Most LLM APIs should fail open on the abuse limiter and fail
+> closed on the billing limiter.
 
 ---
 
@@ -351,6 +528,19 @@ Three rules.
 
 **Watch depth, not just latency.** Queue depth is a leading indicator; latency is a lagging one. By the time p99 moves, the queue has been growing for a while. This is the signal to wire into the autoscaler, and the guide's monitoring chapters cover getting it out of the serving layer.
 
+> **Saying it out loud.** Rate limiting asks "is this caller allowed to spend
+> this?" Admission control asks something independent: "do we have capacity
+> right now?" A caller can be well inside quota while the fleet is saturated.
+> Queueing is more attractive here than for most workloads, because requests
+> are already long — someone waiting three seconds won't notice four. But an
+> unbounded queue is not a safety valve, it's a mechanism for converting a
+> fast failure into a slow one: arrivals exceed service, the queue grows,
+> everything still gets served eventually — by which time the client timed out
+> and retried, so you're burning GPU on answers nobody will read for clients
+> who already asked again. Three rules: bound the depth using Little's Law,
+> drop requests that have waited past the client's timeout, and watch queue
+> depth rather than latency, because depth leads and latency lags.
+
 ### Priority classes
 
 Not all requests deserve the same treatment, and under pressure you should say so.
@@ -363,6 +553,19 @@ Best-effort is dropped entirely, and if you have built it properly, nothing brea
 
 The failure mode to design against is starvation: a class that never gets served because a higher class is always full.
 Weighted fair queueing rather than strict priority — background gets 20% of slots even when interactive is saturated — avoids it, and the cost is a slightly worse tail for interactive traffic in exactly the conditions where the tail is already bad.
+
+> **Saying it out loud.** Under pressure, say out loud that not all requests
+> deserve the same treatment. A reasonable default set is interactive, where a
+> human is watching a cursor blink; background, like a nightly summarization
+> job; and best-effort, like speculative prefetch or cache warming.
+> Interactive goes to the front, background waits — which is correct, nobody's
+> watching — and best-effort gets dropped entirely, and if you built it
+> properly nothing breaks. The failure mode to design against is starvation,
+> where a lower class never gets served because a higher one is always full.
+> Weighted fair queueing rather than strict priority fixes that — background
+> gets twenty percent of slots even when interactive is saturated — and the
+> cost is a slightly worse interactive tail in exactly the conditions where
+> the tail is already bad.
 
 ### Load shedding
 
@@ -378,6 +581,17 @@ Shed by tier second — free before paid, best-effort before interactive.
 And shed *early*, at the edge, before you have spent anything on the request.
 A request rejected after tokenization, embedding, and a cache lookup has already cost you real work.
 
+> **Saying it out loud.** Shedding is deliberately dropping work you could
+> technically accept, because accepting it makes everything else worse. Shed
+> by cost first: a hundred-thousand-token summarization occupies a GPU for
+> thirty seconds, and ten short chats fit in that same window, so rejecting
+> the one expensive request preserves service for ten users instead of one.
+> That feels unfair, it's the right call, and you should write the policy down
+> so support can explain it. Shed by tier second — free before paid,
+> best-effort before interactive. And shed early, at the edge, before you've
+> spent anything: a request rejected after tokenization, embedding, and a
+> cache lookup has already cost you real work.
+
 ### Degradation
 
 The most under-used tool here.
@@ -392,6 +606,17 @@ Fall back to a non-generative path where one exists — a search results page in
 Degradation has to be designed in.
 You cannot add it during an incident.
 Decide the ladder now, put each rung behind a flag, and test that the flags work.
+
+> **Saying it out loud.** Degradation is the most under-used tool at this
+> layer, and the idea is simply: instead of rejecting, serve something
+> cheaper. Route overflow to a smaller model you keep warm alongside the large
+> one — that's a far better experience than a 429. Drop optional stages: skip
+> the reranker, skip the second retrieval pass, cut max_tokens. Serve a stale
+> cache entry rather than nothing. Fall back to a non-generative path where
+> one exists, like search results instead of a synthesized answer. The catch
+> is that degradation has to be designed in — you cannot add it during an
+> incident. So decide the ladder now, put each rung behind a flag, and
+> actually test that the flags work.
 
 ---
 
@@ -412,6 +637,18 @@ Conflating them is the source of most confused conversations about this topic, s
 
 **4. Provider-side prompt cache.** The model provider caches the *internal computation* for a repeated prompt prefix. Theirs, not yours, and it is not a response cache at all.
 
+> **Saying it out loud.** There are four distinct things people call "the
+> cache" and conflating them causes most of the confused conversations about
+> this topic. An exact-match response cache hashes the request and stores the
+> response — yours, in your infrastructure. A semantic cache embeds the query
+> and looks for a similar previous one — also yours, and much riskier. An
+> embedding cache stores the vectors themselves, because computing them is a
+> model call too — the least glamorous of the four and frequently the best
+> return. And provider-side prompt caching caches the model's internal
+> computation for a repeated prompt prefix — theirs, not yours, and not a
+> response cache at all. Different layers, different semantics, and the last
+> one composes with rather than competes with the first three.
+
 ### Exact-match
 
 The boring one, and the one to build first.
@@ -427,6 +664,18 @@ The subtlety is **normalization**: what counts as "the same request."
 Lowercase and strip whitespace, certainly.
 But `temperature` must be in the key — a request at temperature 1.2 is asking for variety, and serving it a cached answer defeats the point, which is a good argument for not caching non-zero-temperature requests at all unless you have thought about it.
 So must the model name, `max_tokens`, the system prompt, the tool definitions, and anything else that changes the output distribution.
+
+> **Saying it out loud.** Exact match is the boring one and the one to build
+> first: normalize, hash, look up, and on a miss call the model and store it.
+> It handles more traffic than people expect, because a lot of LLM traffic is
+> genuinely identical — the same system prompt over the same document, the
+> same UI button firing the same templated request. And the killer property is
+> that it cannot be wrong: if the key matched, the request matched. Everything
+> below trades some of that away. The subtlety is normalization — what counts
+> as the same request. Lowercase and strip whitespace, sure, but temperature
+> has to be in the key, because a request at temperature 1.2 is explicitly
+> asking for variety and serving it a cached answer defeats the point. Same
+> for model name, max_tokens, system prompt, and tool definitions.
 
 ### Semantic caching
 
@@ -474,6 +723,20 @@ The practical guidance:
 
 **Have a false-positive budget and measure against it.** If you cannot say what rate of wrong answers you will accept, you are not ready to run a semantic cache.
 
+> **Saying it out loud.** Semantic caching is where this gets interesting and
+> where it gets dangerous. "How do I reset my password" and "I forgot my
+> password, what do I do" are the same question, and an exact cache sees two
+> unrelated strings. So you embed, nearest-neighbor search the cached queries,
+> and serve the answer if similarity clears a threshold. Now the honest part:
+> a semantic cache can return a confidently wrong answer to a question nobody
+> asked. The example I'd give is refund window for annual plans versus monthly
+> plans — nearly identical vectors, completely different answers, both things
+> a customer will act on. Negation is nearly invisible to embeddings too. And
+> the research backs this up: the vCache work found the similarity
+> distributions of correct and incorrect hits overlap substantially, so no
+> single static threshold cleanly separates them. Set it from labelled pairs,
+> log every hit's score, and have a stated false-positive budget.
+
 ### Embedding cache
 
 Embeddings are model calls.
@@ -486,6 +749,19 @@ They are deterministic for a given model and input, so this is exact-match cachi
 Include the embedding model name and version in the key.
 Vectors from different models are not comparable, and mixing them silently produces a similarity metric that means nothing.
 When you upgrade the embedding model you must rebuild the whole index — treat it as a migration, not a config change.
+
+> **Saying it out loud.** The embedding cache is the unglamorous one with the
+> best return. Every incoming query to a semantic cache needs an embedding
+> before you can look anything up — so the thing that makes your cache fast is
+> itself a per-request model call, and if you don't cache it, your semantic
+> cache has a hard floor on both latency and cost. Cache by content hash:
+> embeddings are deterministic for a given model and input, so this is
+> exact-match caching with none of the semantic risk, and hit rates on
+> repetitive workloads are very high. One rule that will save you: put the
+> embedding model name and version in the key, because vectors from different
+> models aren't comparable, and mixing them silently produces a similarity
+> metric that means nothing. An embedding model upgrade is an index rebuild —
+> treat it as a migration, not a config change.
 
 ### Provider-side prompt caching
 
@@ -516,6 +792,21 @@ Structure your prompts prefix-stable and it costs you a code review.
 
 One more thing worth knowing: **KV cache** inside your own vLLM deployment is the same idea, applied locally. vLLM's automatic prefix caching reuses attention state across requests that share a prefix. If you self-host, that is your version of provider prompt caching, and this guide's vLLM chapters cover how to enable and size it.
 
+> **Saying it out loud.** Provider prompt caching is a different mechanism
+> from your response cache and the confusion is worth clearing up. Yours
+> stores outputs; theirs stores intermediate state — the attention key-value
+> tensors from processing a prompt prefix. It doesn't skip generation, it
+> skips re-processing input the model already saw. Four consequences. It's
+> prefix-based, so static content goes first and variable content last, and a
+> breakpoint after something that changes per request never hits. It has
+> minimum sizes, typically several hundred to a thousand-plus tokens, below
+> which nothing caches and no error is raised — a silent no-op worth checking
+> in your usage metrics. It has explicit pricing, roughly 1.25x base input for
+> a write and about a tenth for a read, so it pays off on the second hit. And
+> it composes with your cache rather than competing: it makes every request
+> that misses your cache cheaper. If you self-host, vLLM's automatic prefix
+> caching is your version of exactly this.
+
 ### Cache key design
 
 The most consequential fifteen lines in the whole system.
@@ -545,6 +836,21 @@ If the retrieval was scoped by `user_id`, then `user_id` is part of the input, a
 Where responses genuinely are not personalized — a public documentation bot — sharing across users is exactly the point, and you get much better hit rates.
 Make that a deliberate, per-surface, written-down decision.
 
+> **Saying it out loud.** This is the most consequential fifteen lines in the
+> whole system. The key has to include everything that changes the answer —
+> normalized prompt, model identifier including version, sampling parameters,
+> system prompt, tool definitions, and the prompt template version so a prompt
+> change invalidates the cache automatically. And then the one that matters
+> most: include the tenant, and include the user whenever the response is
+> personalized. If retrieval was scoped by permissions or the answer reads
+> account data, a key without user identity means user B can receive user A's
+> answer. That isn't a caching bug, it's a cross-user data leak, and it's the
+> single most common serious defect in hand-rolled LLM caches, because it
+> doesn't show up in testing with one test user, doesn't show up at low
+> traffic, and raises no error when it fires. The rule that makes it hard to
+> get wrong: derive the key from the same context object that produced the
+> prompt.
+
 ### TTL policies
 
 TTL is a bet about how long an answer stays correct.
@@ -563,6 +869,19 @@ Two refinements.
 
 **Consider adaptive TTLs.** Extend on hit — a popular entry stays warm — and expire cold entries fast. This approximates LFU eviction with much simpler bookkeeping.
 
+> **Saying it out loud.** A TTL is a bet about how long an answer stays
+> correct, so set it from the volatility of the underlying data rather than
+> habit. Static knowledge — explanations, definitions, code examples — can
+> live hours to days. Documentation-grounded answers should be tied to your
+> docs deploy cycle, or better, invalidated on deploy. Anything reading a live
+> database gets minutes at most, and you should ask whether it should be
+> cached at all. Anything with a timestamp in the answer: don't cache it, or
+> strip the timestamp. Two refinements worth naming. Jitter every TTL by about
+> ten percent, because entries written together expire together and a
+> synchronized expiry is a self-inflicted stampede. And consider extending TTL
+> on hit, which approximates least-frequently-used eviction with far simpler
+> bookkeeping.
+
 ### Invalidation
 
 TTL is invalidation by giving up.
@@ -575,6 +894,18 @@ It is fine, and it is what you should do by default, but sometimes you need to a
 **Event-driven invalidation** for data-grounded answers: your CMS publishes a change event, the cache layer drops the affected keys.
 
 **Do not scan for keys to delete.** `KEYS` blocks Redis, `SCAN` is a slow-motion version of the same problem. Design the namespace so that invalidation is a namespace change, not a search.
+
+> **Saying it out loud.** TTL is invalidation by giving up, and that's fine as
+> a default — but sometimes you need to actually invalidate. The pattern that
+> works is a version prefix in the key namespace: to invalidate everything,
+> bump the version, and old entries are orphaned and expire on their own.
+> Instant, no scanning, no deletes, and trivially reversible if you were
+> wrong. For finer control, tag entries with the source documents that
+> contributed to them and invalidate by tag when a document changes — which
+> requires provenance tracking you probably want for citations anyway. And the
+> anti-pattern to name explicitly: do not scan for keys to delete. KEYS blocks
+> Redis and SCAN is a slow-motion version of the same problem. Design the
+> namespace so invalidation is a namespace change, not a search.
 
 ### Cache stampede
 
@@ -606,6 +937,20 @@ It is elegant, it is a handful of lines, and it eliminates the synchronized-expi
 
 Locks need care. A lock holder that dies must not block everyone forever, so set a TTL on the lock; a waiter must not wait longer than the client's timeout. Bound both.
 
+> **Saying it out loud.** This is the failure that turns a cache from a
+> protection into an amplifier. A popular entry expires, a hundred concurrent
+> requests all miss at once, all hundred call the model, all hundred compute
+> the same answer. You've just sent a hundred times your steady-state load at
+> the GPU fleet at the exact moment the cache stopped helping. The primary
+> defence is single-flight coalescing: the first request to miss takes a lock
+> and computes, the rest wait on that same in-flight computation and share the
+> result — one model call instead of a hundred. Then probabilistic early
+> expiration, where requests near the TTL have a small growing chance of
+> refreshing early so one lucky request warms the entry while everyone else
+> still gets served. Then stale-while-revalidate, and pre-warming for
+> known-hot keys. And put a TTL on the lock, or one dead lock holder blocks
+> everyone forever.
+
 ### Measuring it
 
 A cache you do not measure is a cache you do not have.
@@ -628,6 +973,19 @@ Also track **cost avoided** — the token cost of the requests you served from c
 
 And track the semantic cache's **similarity distribution**.
 Watching where hits cluster relative to the threshold tells you whether you have headroom or are living on the edge of it.
+
+> **Saying it out loud.** A cache you don't measure is a cache you don't have,
+> and the number people want — the hit rate — should be split by tier, because
+> exact and semantic hits mean different things. As for what's good, refuse
+> the universal number: an open-ended assistant realistically gets five to
+> fifteen percent because the tail is genuinely long, a support bot with a fat
+> head of common questions can hit thirty to sixty, and an internal tool over
+> templated prompts should be above sixty. The diagnostics matter more than
+> the absolute figure. Near-zero means an over-specific key with something
+> varying in it — a timestamp, a request ID. Suspiciously high on personalized
+> content means an under-specific key, and you should go check for the
+> cross-user leak today. And a sudden drop means something changed the key
+> shape, which is one of the most useful alerts you can configure.
 
 ---
 
@@ -667,6 +1025,22 @@ Three related concerns live at this layer too.
 **Request and response logging.** You need it for debugging, billing, abuse investigation, and building evaluation sets from real traffic. You also have to reckon with the fact that prompts and completions frequently contain personal data. Log metadata always — token counts, latency, model, cache outcome, limiter decision. Log content selectively, with retention limits, redaction, and a per-customer opt-out. Sampling gives you most of the debugging value at a fraction of the exposure.
 
 **Multi-provider routing and failover.** Once you have a layer between your app and the model, you can route: cheap models for easy requests, a different provider when your primary is degraded, a self-hosted vLLM for the bulk of traffic with a commercial API as overflow. Circuit breakers so a failing provider is removed quickly rather than eating your timeout budget on every request. This is also where you notice that the layer is doing quite a lot and should probably be its own service.
+
+> **Saying it out loud.** The question of where this logic lives has a real
+> answer and it's a split. In your application is simplest to start and gives
+> you full context, but every service reimplements it and they drift. A
+> sidecar centralizes policy without touching application code, at the cost of
+> another container and another thing to debug at 3am. A gateway gives you one
+> place for auth, limiting, routing and logging, with rejection at the edge
+> before any application resource is spent — and a battle-tested
+> implementation you configure rather than write. But a gateway works on
+> request attributes: headers, path, source IP, a JWT claim. It does not know
+> this request will generate eight thousand tokens, and that is precisely what
+> an LLM API needs to limit on. So: coarse limits at the gateway — requests
+> per second, connections, body size, IP — and token-aware limits in your
+> service, because only your service can tokenize, estimate, and reconcile.
+> Don't contort the gateway into token accounting, and don't skip it because
+> it can't.
 
 ---
 
@@ -972,6 +1346,18 @@ On real traffic the distributions overlap, which is exactly the vCache finding: 
 Which is why the guidance above is to derive the number from labelled data, log every hit with its score, and know your false-positive budget.
 
 Anyone who tells you semantic caching is free has not measured the third section.
+
+> **Saying it out loud.** The thing this worked example actually proves is in
+> its third section, and it's the argument against casual semantic caching.
+> Two pairs of questions run through a toy embedder: a genuine paraphrase that
+> should hit scores 0.866, and a one-word change that flips the correct answer
+> scores 0.833. The usable margin between "serve this" and "absolutely do not"
+> is 0.033. At a threshold of 0.75 — which sounds cautious and which you'll
+> find recommended in blog posts — the cache confidently tells a customer the
+> wrong refund policy. At 0.95 it stops working at all. And that's on a toy
+> embedder with two hand-picked pairs; on real traffic the distributions
+> overlap, so there may be no threshold that gets every case right. Anyone who
+> tells you semantic caching is free hasn't measured that gap.
 
 ---
 

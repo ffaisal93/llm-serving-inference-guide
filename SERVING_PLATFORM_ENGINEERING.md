@@ -19,6 +19,17 @@ If you've read chapters 01-11, this chapter should feel like the moment the indi
 
 A note on scope: "platform" here means the inference-serving path — from a client request to a generated response, at production scale, with a rollout and observability story around it. It does not cover training, RLHF, or data pipelines; those are different systems with different failure modes.
 
+> **Saying it out loud.** The pitch for this chapter is that knowing eleven
+> pieces isn't the same as knowing the system. You can pass every
+> single-chapter checklist — the autoscaler is correct, the canary controller
+> is correct, the registry is correct — and still get paged at 3am, because
+> production incidents live in the seams between components, not inside any
+> one of them. So this is one complete build in the order you'd actually do
+> it: pick an engine, containerize, deploy, load test, then autoscale, then
+> monitor, then canary. And the scope is deliberately the inference path only
+> — client request to generated response — not training or data pipelines,
+> which are different systems with different failure modes.
+
 ## 1. The Reference Architecture
 
 Every production LLM platform — whether it's a two-person startup self-hosting one open-weight model or a hyperscaler running dozens — reduces to the same skeleton. What differs is scale, managed-vs-DIY choices, and how much of each box you build yourself. Here is the whole system in one picture.
@@ -117,6 +128,19 @@ Every production LLM platform — whether it's a two-person startup self-hosting
 
 The rest of this chapter is about the connective tissue: how to choose what goes in each box (Section 3), how to build the whole thing once for a concrete scenario (Section 4), what it costs (Section 5), how it breaks in ways no single chapter predicts (Section 6), and how to know you're ready to launch it (Section 7).
 
+> **Saying it out loud.** Every production LLM platform reduces to the same
+> seven or eight boxes, whether you're two people or a hyperscaler; what
+> differs is scale and how much of each box you build yourself. Clients hit a
+> gateway that never touches a GPU. A rollout controller decides second by
+> second what fraction of traffic each model version gets. Model server pods
+> are the GPU-bound heart. Kubernetes plus an autoscaler is the substrate and
+> its control loop. Observability is the nervous system — every other box
+> either emits into it or reads from it. And a model registry plus a drift
+> monitor decide what's allowed to ship and whether what shipped is still
+> behaving. The detail that's easy to miss and expensive later: a version
+> isn't a checkpoint, it's the tuple of weights, tokenizer, prompt template,
+> sampling defaults, and engine config.
+
 ## 2. Choosing Your Stack
 
 There is no single right stack. There is a right stack **for your traffic, your latency SLO, your team size, and your budget**. This section gives you the decision tree, then a table of real options as of 2026.
@@ -164,6 +188,19 @@ or are you calling someone else's hosted model (OpenAI, Anthropic, etc.)?
 
 **The honest heuristic:** if you're asking "vLLM or Triton," you've usually already answered it — vLLM if it's your own model(s) and you want the simplest path to production-grade throughput; Triton if multi-framework/multi-model flexibility or an existing NVIDIA Triton investment is the actual requirement. They are not mutually exclusive: Triton can run vLLM as a backend, giving you Triton's multi-model management with vLLM's scheduler underneath.
 
+> **Saying it out loud.** The engine decision is basically one question with
+> four answers. If you're calling someone else's hosted model, you don't need
+> most of this stack — but you still need canary, monitoring, and drift,
+> because the vendor can change the model under you. If you're self-hosting
+> and it's a prototype under a handful of requests per second, raw
+> Transformers behind FastAPI is fine and wrong for anything a user waits on.
+> If it's one or a few open-weight models and you want throughput per GPU
+> dollar, vLLM is the 2026 default — continuous batching and PagedAttention
+> get you roughly ten to twenty times naive generate at comparable latency.
+> Triton is the answer when the actual requirement is many models across many
+> frameworks behind one server. And they're not exclusive: Triton can run vLLM
+> as a backend.
+
 ### 2.2 Orchestration: Kubernetes vs simpler
 
 ```
@@ -184,6 +221,18 @@ Do you need to run this on more than one machine, or promise any uptime SLA?
 
 Managed alternatives exist between these two extremes — a managed inference endpoint (SageMaker, Vertex AI endpoints, Modal, Replicate/Baseten-style GPU-as-a-service) gives you most of the Kubernetes-cluster benefits without operating the control plane yourself, at a per-GPU-hour premium. That is often the right call for a small team; you are trading operational burden for margin, and the decision framework in 2.3 makes that trade explicit.
 
+> **Saying it out loud.** On orchestration I'd resist the reflex. If it's a
+> single GPU box for an internal tool that can tolerate a restart, Docker
+> Compose or a systemd-managed container is the right answer — you'll spend
+> more time operating a Kubernetes control plane than the workload. Kubernetes
+> earns itself the moment you need multiple replicas, autoscaling, canary
+> updates, or you're promising any uptime SLA. And there's a real middle
+> option people skip past: a managed inference endpoint gives you most of the
+> cluster benefits without operating the control plane, at a per-GPU-hour
+> premium. For a two-person team that's often the correct trade — you're
+> buying back operational burden with margin, and that's a defensible
+> decision, not a cop-out.
+
 ### 2.3 Single-region vs multi-region
 
 Start single-region unless you have a specific reason not to. Multi-region LLM serving adds real complexity that only pays for itself at real scale:
@@ -197,6 +246,18 @@ Start single-region unless you have a specific reason not to. Multi-region LLM s
 | Team size | Small team; one region is already a lot of surface area | Dedicated platform team that can own cross-region model registry sync, routing, and failover |
 
 Multi-region done wrong (e.g., model registry not replicated, so a canary promotes correctly in one region and never reaches another) is one of the failure modes in Section 6. If you do go multi-region, the model/prompt registry (Ch. 09) and the drift baseline (Ch. 10) both need to be global sources of truth, not per-region copies that can silently diverge.
+
+> **Saying it out loud.** Default to single region unless something specific
+> forces you out of it. The forcing functions are real but narrow: a genuinely
+> global user base with a TTFT budget that cross-ocean round trips would eat,
+> a contractual SLA a single region outage would breach, GPU capacity
+> constraints that make you spread across regions just to get quota, or
+> data-residency rules. What multi-region actually costs you is a new class of
+> failure: silent version divergence, where a canary promotes cleanly in one
+> region and another region quietly runs the old model for three weeks. So if
+> you do it, the model registry and the drift baseline have to be genuinely
+> global sources of truth, not per-region copies — and "promoted" has to be a
+> fact you verify per region, not an event you fire and assume propagates.
 
 ### 2.4 Real options, 2025-2026
 
@@ -213,6 +274,17 @@ Multi-region done wrong (e.g., model registry not replicated, so a canary promot
 | Model registry | A folder of checkpoints and a spreadsheet | MLflow Model Registry, or a Git-based registry (Ch. 09) | Whatever you pick, it must version the prompt template alongside the weights — see Section 6. |
 | Managed alternative to all of the above | — | SageMaker/Vertex AI endpoints, Modal, Baseten, Replicate | Right choice when the team is too small to operate Kubernetes + GPU Operator + Argo Rollouts themselves; you pay a per-GPU-hour premium for someone else operating boxes 2-6 of the reference architecture. |
 
+> **Saying it out loud.** A word on this options table: it's a snapshot, not a
+> constant. Engine versions, GPU pricing, and which projects are actively
+> maintained all move fast enough that anything more than a few months old
+> deserves a re-check against the project's own release notes before you pin
+> it. What ages slowly is the shape of the choice — lightweight option versus
+> production-scale option per layer, and why. The two picks I'd defend hardest
+> are KEDA over plain HPA, because CPU and memory metrics are close to useless
+> for judging GPU-bound load, and a registry that versions the prompt template
+> alongside the weights, because retrofitting that after a rollback incident
+> is far more painful than building it in.
+
 ## 3. Build It End-to-End — Full Worked Walkthrough
 
 ### 3.1 The scenario
@@ -225,6 +297,17 @@ You are the first infra engineer at a startup. Product wants to serve **openai/g
 - **Team:** two infra engineers, no dedicated MLOps platform team yet.
 
 We'll walk this scenario through choosing the engine, containerizing, deploying, load testing, autoscaling, monitoring, and canarying the next model update — in that order, because that's the order you actually do it in.
+
+> **Saying it out loud.** The scenario is worth stating precisely because
+> every downstream number depends on it: a 20-billion-parameter open-weight
+> mixture-of-experts model behind a chat product, 500 requests per second
+> sustained with bursts to 700, a P95 time-to-first-token SLO of two seconds,
+> two infra engineers and no MLOps team. Notice what that constrains. The SLO
+> is on TTFT specifically, not end-to-end, because it's a streaming chat UI
+> and TTFT is what users perceive as responsiveness. The team size rules out
+> anything with a large operational surface. And the budget line says start by
+> asking whether a cheaper card can do the job, rather than reaching for the
+> newest GPU because it's fastest.
 
 ### 3.2 Choosing the engine and quantization
 
@@ -239,6 +322,18 @@ Quantization is already decided for us in the useful sense: gpt-oss-20b ships wi
 | H100 80GB | 80 GB | Yes, with the most headroom and the fastest per-token decode | roughly \(\$1.49\)-\(\$6.98\)/hr across 15+ providers; \(\$2\)-\(\$3.29\)/hr is a common on-demand baseline |
 
 For a 2-second TTFT SLO at 500-700 req/s, the honest move is to **start on A100 80GB** (cheaper than H100, and the model doesn't need H100's extra compute headroom at this scale), measure the real ceiling with a load test, and only move to H100 if the load test shows you can't hit the SLO at a GPU count your budget tolerates. This is the "choose cheap, then measure, then upgrade only if the numbers force it" pattern — the opposite of defaulting to the newest GPU because it's fastest.
+
+> **Saying it out loud.** Following the decision tree this is vLLM, not Triton
+> — one open-weight model, a small team, no multi-framework requirement to
+> justify the extra operational surface. Quantization is mostly decided for us
+> since this model ships with native MXFP4 on its expert weights, so there's
+> no separate quantization step; the checkpoint needs about 16 gigabytes of
+> VRAM. That makes GPU choice the real lever, and the pattern I'd defend is:
+> start on the cheaper card, measure the actual ceiling with a load test, and
+> only move up if the numbers force it. As of 2026 an A100 80GB runs around
+> two dollars an hour and an H100 spans roughly one and a half to seven
+> dollars depending on provider and commitment — check a current quote before
+> putting any of that in a budget review.
 
 ### 3.3 Containerizing it
 
@@ -281,6 +376,17 @@ Notes worth calling out:
 - `--served-model-name gpt-oss-20b-v1` is deliberate: it's the version string that ties this container image to a specific entry in the model registry (Ch. 09), not just "gpt-oss-20b." This is the first of several places in this walkthrough where version identity gets threaded through deliberately — see Section 6 for what happens when a team skips this.
 
 Build and smoke-test locally exactly as Ch. 02 teaches — `docker build`, then `docker run --gpus all -p 8000:8000 <image>`, then a `curl` against `/v1/chat/completions` — before anything touches Kubernetes.
+
+> **Saying it out loud.** Containerizing a GPU server is mostly ordinary
+> Docker discipline with one twist. The ordinary parts: pin the base image to
+> an exact tag rather than latest, run as non-root, keep layers minimal,
+> inject secrets at runtime rather than baking them in. The twist is that the
+> image is huge and the process is slow to become useful — model load plus
+> CUDA graph capture can take a minute or more — so the health endpoint and
+> the probe timings you set here determine whether Kubernetes gives the pod a
+> chance to start or kills it for being slow. Since vLLM ships an official
+> image, the Dockerfile's real job is thin: pin a version, bake in org config,
+> and set the launch command.
 
 ### 3.4 Deploying to Kubernetes with correct GPU scheduling
 
@@ -389,6 +495,17 @@ spec:
 
 The GPU node pool itself (the `node-pool: gpu-a100` label, the `nvidia.com/gpu` resource becoming schedulable at all) is provided by the **NVIDIA GPU Operator**, which installs the driver, the `k8s-device-plugin`, and (if you need to share one physical GPU across multiple pods for cheaper dev/staging environments) MIG partitioning or time-slicing. For this scenario's production traffic, use whole GPUs, one per pod — MIG/time-slicing is a cost trick for lower-QPS environments, not for a 500 req/s SLO'd path, because it splits a card's memory and compute bandwidth, which directly works against your TTFT budget.
 
+> **Saying it out loud.** The Kubernetes details that matter for GPU workloads
+> are a short list, and getting any of them wrong shows up as a weird
+> production incident rather than a clear error. Set GPU resource requests and
+> limits on every pod so nothing silently oversubscribes a device. Use a
+> startup probe sized from an actual timed cold start rather than a guess, and
+> keep it separate from liveness, so a pod that's loading a large checkpoint
+> fails readiness instead of getting killed. Add a PodDisruptionBudget so a
+> node drain or a cluster upgrade can't take out every replica at once. And
+> use taints and node selectors so GPU workloads land on GPU nodes — and, just
+> as importantly, so everything else stays off them.
+
 ### 3.5 Load testing to find the real ceiling
 
 This is the step teams skip and regret. Before wiring autoscaling, you need to know: **how many requests per second can one replica actually sustain at a P95 TTFT under 2 seconds?** Everything downstream (replica count, autoscaling thresholds, cost model) depends on this number, and it is specific to your model, your hardware, your prompt lengths, and your `--max-model-len` — you cannot borrow it from a blog post.
@@ -462,6 +579,17 @@ Read that curve as: **one A100 replica sustains roughly 70-75 concurrent in-flig
 
 with a steady-state floor around \(\lceil 500 / 90 \rceil = 6\) replicas. Those two numbers — 6 and 8 — become the KEDA `minReplicaCount` and `maxReplicaCount` in the next section.
 
+> **Saying it out loud.** This is the step teams skip and regret, because
+> every downstream number depends on it: how many requests per second can one
+> replica actually sustain at P95 TTFT under two seconds? You cannot borrow
+> that from a blog post — it's specific to your model, your hardware, your
+> prompt length distribution, and your max model length. You ramp concurrency
+> and watch for the knee, the point where P95 suddenly outpaces P50. In this
+> walkthrough that's around 70 to 75 concurrent requests per replica, which
+> converts to roughly 90 requests per second at the SLO boundary. And that
+> single number sets everything after it — six replicas for steady state,
+> eight for burst, which become the autoscaler's floor and ceiling.
+
 ### 3.6 Wiring autoscaling
 
 Plain HPA scaling on CPU/memory is close to meaningless for a GPU-bound, batching server — the pod's CPU usage barely moves while the GPU is saturated. The practical default (Ch. 06) is **KEDA**, scaling on a Prometheus query against vLLM's own queue-depth metric, `vllm:num_requests_waiting` — the number of requests sitting in the scheduler queue because the running batch is full. A rising queue is the earliest true signal of saturation, well before GPU utilization alone would tell you.
@@ -498,6 +626,18 @@ Two details that matter more than the YAML suggests:
 
 - **`cooldownPeriod: 300`.** GPU pods are expensive to spin up (model load + CUDA graph capture can take a minute or more), so an autoscaler tuned like a web-tier HPA (scale down after 60 seconds of low load) will thrash — scaling a replica down right before the next traffic wave needs it back. Err toward a longer cooldown than you'd use for a stateless CPU service.
 - **The metric is a rate per replica, not a raw count.** Scaling on the raw `num_requests_waiting` sum without dividing by replica count creates a feedback loop: as you add replicas, the sum doesn't necessarily drop proportionally, so the trigger can either over- or under-react depending on how load actually distributes. Normalizing per replica keeps the signal comparable regardless of current replica count.
+
+> **Saying it out loud.** Scaling a GPU-bound batching server on CPU is close
+> to meaningless — the pod's CPU barely moves while the GPU saturates. So the
+> practical default is KEDA scaling on a Prometheus query against the engine's
+> own queue depth, the number of requests waiting because the running batch is
+> full. A rising queue is the earliest true saturation signal, well before GPU
+> utilization would tell you anything. Two details matter more than the YAML
+> suggests. Use a long cooldown — five minutes, not sixty seconds — because a
+> GPU pod takes a minute or more to warm up and a web-tier cooldown makes it
+> thrash. And normalize the metric per replica rather than scaling on the raw
+> queue sum, or you build a feedback loop where adding replicas doesn't
+> proportionally drop the number you're reacting to.
 
 ### 3.7 Monitoring dashboards and alerts
 
@@ -540,6 +680,17 @@ groups:
 ```
 
 Note the deliberate ordering: `QueueDepthRising` is a warning that fires *before* the SLO is actually breached, giving on-call a chance to notice the autoscaler is (or isn't) reacting before the paging alert fires. This two-tier pattern — an early leading-indicator warning plus a hard SLO page — is the pattern Ch. 08 recommends generally; here it's tied to the specific metric this platform exposes.
+
+> **Saying it out loud.** The good news on monitoring is that vLLM exposes
+> native Prometheus histograms — TTFT, queue time, end-to-end latency, running
+> and waiting request counts — so there's no custom instrumentation for the
+> fundamentals. The four panels I'd insist on for this scenario are TTFT
+> percentiles over time, queue depth per replica, GPU utilization from DCGM,
+> and requests per second broken out by version label, so a canary's traffic
+> is visually distinguishable from stable. The alert that actually protects
+> the SLO is a burn-rate alert on the TTFT histogram with a for-clause, paired
+> with a leading-indicator warning on queue depth — so on-call gets a heads-up
+> with reaction time before the page that says users are already hurting.
 
 ### 3.8 Canary/rollout process for the next model update
 
@@ -614,6 +765,18 @@ spec:
 
 This automatically halts and rolls back the canary if either the TTFT SLO or the error-rate threshold breaches during the pause windows, without a human needing to be watching a dashboard in real time. Two things this YAML deliberately does *not* solve, on purpose, so we can talk about them precisely in Section 6: it says nothing about whether the **prompt template** shipped with v2 is also versioned and rolled back together with the weights, and it says nothing about what the **autoscaler** does to pod counts while this rollout is in progress. Both are real incidents, not hypotheticals — covered next.
 
+> **Saying it out loud.** The rollout itself is standard staged-canary: five
+> percent of traffic first, automated analysis on TTFT and error rate at each
+> pause, and automatic halt-and-rollback if either breaches, so no human has
+> to be watching a dashboard at the moment it matters. What I'd point out
+> about this YAML is what it deliberately doesn't solve, because both gaps are
+> real incidents rather than hypotheticals. It says nothing about whether the
+> prompt template that shipped with the new version is versioned and rolled
+> back together with the weights. And it says nothing about what the
+> autoscaler does to pod counts while the rollout is in progress. Two
+> independent controllers with opinions about the same replica set is a race,
+> and it bites.
+
 ## 4. Cost Engineering
 
 This section builds a real cost model on top of the walkthrough in Section 3, tying together the GPU/quantization choices of Ch. 05, the autoscaling headroom of Ch. 06, and the versioning overhead of Ch. 09. The goal isn't a single number — it's a model you can re-run when any input changes (GPU price, traffic, SLO).
@@ -629,6 +792,17 @@ From the load test in 3.5, one replica sustains about 90 req/s at the SLO bounda
 \]
 
 That's the cost floor — the number you get if every replica runs pinned at exactly the SLO boundary, all day, every day. No real system runs there, which is exactly what the next section quantifies.
+
+> **Saying it out loud.** The cost floor is easy arithmetic and worth being
+> able to do live: GPU dollars per hour divided by requests per second times
+> 3600, times a thousand, gives you cost per thousand requests. At around two
+> dollars an hour and 90 requests per second, that's roughly six-tenths of a
+> cent per thousand requests. But I'd flag immediately that this is a floor,
+> not a forecast — it assumes every replica runs pinned at exactly the SLO
+> boundary all day, which no real system does. And the two-dollar figure is a
+> 2026 snapshot; real quotes span roughly one and a half to seven dollars an
+> hour depending on region, commitment, and spot versus on-demand, so always
+> re-quote before a budget review.
 
 ### 4.2 Utilization and autoscaling headroom
 
@@ -655,6 +829,18 @@ Blended average replica count across a day here is roughly \((6 \times 16 + 8 \t
 
 The `minReplicaCount: 6` floor is itself a cost decision, not just a latency one: it exists because GPU pods are slow to cold-start (model load + CUDA graph capture), so scaling below 6 to chase overnight-trough savings would mean the autoscaler can't react fast enough to the next demand ramp without a TTFT SLO breach during the scale-up window. That tradeoff — floor higher than the strict minimum traffic requires, in exchange for avoiding cold-start latency spikes — is a cost-vs-reliability decision every autoscaling config makes implicitly; make it explicitly and write down why.
 
+> **Saying it out loud.** The honest cost model integrates over the traffic
+> curve rather than pricing the peak or the trough. In this scenario the floor
+> is six replicas and the peak is eight, which blends to about 6.7 replicas
+> across a day, or roughly 160 replica-hours — versus 192 if you statically
+> provisioned eight for the burst case. That's about 17% fewer GPU-hours
+> purely from the autoscaling band matching the real traffic curve. The part
+> worth saying explicitly is that the six-replica floor is a cost decision as
+> much as a latency one: you could serve the overnight trough with two, but
+> GPU pods cold-start too slowly to ramp back up without breaching the SLO.
+> That's a cost-versus-reliability trade every autoscaler config makes
+> implicitly — make it explicitly and write down why.
+
 ### 4.3 Quantization tradeoffs
 
 gpt-oss-20b's native MXFP4 format is close to a free lunch here — it's how the model ships, not an extra step you're choosing to take on. The more general tradeoff, worth understanding for models that *don't* ship pre-quantized, is: quantizing further (e.g., additional INT4/AWQ on top of an already-BF16 checkpoint) trades a small, usually-recoverable quality loss for a real memory reduction, and that memory reduction converts directly into either (a) fitting on a cheaper/smaller GPU, or (b) fitting more KV cache on the same GPU, which raises the concurrency ceiling found in the load test and therefore lowers cost-per-request. Concretely:
@@ -664,6 +850,18 @@ gpt-oss-20b's native MXFP4 format is close to a free lunch here — it's how the
 \]
 
 Both terms move when you quantize further — the numerator can drop (cheaper GPU fits) and the denominator can rise (more concurrent requests fit in the freed-up memory) — which is why quantization is usually the single highest-leverage cost lever available, ahead of autoscaling tuning or GPU shopping. It's also the one with the least reversible risk if pushed too far: below a certain bit-width, quality regressions stop being subtle and start being visible to users, which is exactly the kind of thing the drift/quality monitor (Ch. 10) and the eval gate in CI need to catch before a more-quantized version ever becomes a canary.
+
+> **Saying it out loud.** Quantization is usually the single highest-leverage
+> cost lever, ahead of autoscaling tuning or GPU shopping, and the reason is
+> that it moves both sides of the fraction at once. Cost per request is
+> roughly GPU dollars per hour over the requests-per-second ceiling at that
+> precision. Quantize further and the numerator can drop, because a cheaper
+> card now fits the model, while the denominator rises, because the freed
+> memory holds more KV cache and raises the concurrency ceiling. It's also the
+> lever with the least reversible risk: below a certain bit width, quality
+> regressions stop being subtle and become visible to users. Which is exactly
+> why the eval gate in CI and the drift monitor have to catch it before a
+> more-quantized version ever becomes a canary.
 
 ### 4.4 Putting it together
 
@@ -681,6 +879,17 @@ against a naive fixed-8-replica baseline of:
 
 — roughly \(\$1{,}900\)/month saved purely from autoscaling headroom matching the traffic curve, on top of whatever the GPU-choice decision in 3.2 (A100 vs H100) already saved versus defaulting to the most expensive card. Neither number includes the model server's own overhead (registry storage, CI/eval compute, observability stack) — those are real but typically small (single-digit percentage) relative to the GPU line, and should be budgeted separately rather than folded into the per-request math, since they don't scale with request volume the same way.
 
+> **Saying it out loud.** Putting the numbers together: about 160
+> replica-hours a day at roughly two dollars an hour is on the order of nine
+> and a half thousand dollars a month, versus about eleven and a half thousand
+> for a naive fixed-eight-replica allocation — call it nineteen hundred
+> dollars a month saved from autoscaling alone, on top of whatever choosing
+> the cheaper GPU already saved. The honest caveat is that this excludes
+> registry storage, CI and eval compute, and the observability stack. Those
+> are real but typically single-digit percentages of the GPU line, and I'd
+> budget them separately rather than folding them into per-request math,
+> because they don't scale with request volume the same way.
+
 ## 5. Failure Modes That Only Show Up at the System Level
 
 Every chapter in this guide has its own failure-mode list, and those lists are correct — but they assume the rest of the system behaves. The incidents below all happened (in one form or another, across real teams) because two components, each individually correct and each passing its own chapter's checklist, interacted in a way neither owner anticipated. This is the section to reread before an incident retro, not just before a launch.
@@ -695,6 +904,19 @@ Every chapter in this guide has its own failure-mode list, and those lists are c
 
 **Fix:** Two independent controllers must not both have opinions about the same ReplicaSet's replica count during a rollout. In practice: let Argo Rollouts fully own replica count during an active rollout (its own canary/stable ReplicaSet management already does this correctly if you don't *also* point an HPA/KEDA ScaledObject directly at the same ReplicaSets) — point the ScaledObject at the Rollout resource itself, not at the underlying Deployment/ReplicaSet, so there is exactly one control loop deciding "how many pods, of which version" at any moment. Verify this by watching `kubectl get replicasets -w` through a full canary cycle in staging before trusting it in production — the race is timing-dependent and easy to miss in a quick test.
 
+> **Saying it out loud.** This is my favorite seam because both components
+> were individually correct. The canary controller owns traffic weight and a
+> replica count for its rollout. The autoscaler independently owns a replica
+> count for the underlying deployment. During the canary, traffic to stable
+> drops, so the autoscaler correctly reacts to falling queue depth and scales
+> stable down — and then the two control loops race on their own timers during
+> promotion, leaving stale pods still receiving traffic after the rollout
+> reports complete. Neither chapter's checklist catches it, because neither
+> one's model of the world includes the other controller. The fix is
+> structural, not a dashboard: exactly one control loop owns replica count at
+> any moment — point the scaler at the rollout resource, not at the underlying
+> replica sets.
+
 ### 5.2 The rollback that forgot the prompt template
 
 **Symptom:** v2's canary looks fine on every automated metric — latency, error rate, throughput. Days after full promotion, a slow-building wave of user complaints about "weird" or subtly wrong answers surfaces. The on-call engineer rolls back to v1's *weights* (redeploys the v1 image). The complaints don't stop.
@@ -704,6 +926,19 @@ Every chapter in this guide has its own failure-mode list, and those lists are c
 **Why no single chapter's checklist catches this:** Ch. 09 (Model Versioning) teaches you to version model artifacts rigorously — but if the prompt template lives in a separate system owned by a different team (product, or a "prompt ops" tool), it's outside that chapter's scope by construction, and nobody's checklist spans both systems. Ch. 07's canary checklist verifies the canary rollout mechanism, not what's inside the versioned unit it's rolling out.
 
 **Fix:** The prompt template, chat template, and sampling defaults must be **immutable artifacts of the same version bump** as the weights — stored in the same registry entry (Ch. 09), baked into the same container image or pulled by version-pinned reference at startup, never mutated independently via a config flag that isn't itself versioned and rolled back atomically with the model. If product needs to iterate on prompts faster than model releases, that's a legitimate need — but it must go through the same canary/registry/rollback machinery as a weights change, not around it. A useful audit question for any platform: "if I roll back the model version right now, what *doesn't* roll back with it?" If the honest answer is "the prompt," you have this bug waiting to happen.
+
+> **Saying it out loud.** The audit question I'd hand anyone running a
+> platform is: if I roll back the model version right now, what doesn't roll
+> back with it? If the honest answer is "the prompt," you have this bug queued
+> up. What happened here is that a new version shipped weights plus an updated
+> system prompt, but the prompt was deployed through a separate path — a
+> config service or a prompt-management tool outside the registry. Rolling
+> back the container reverted the weights and not the prompt, so production
+> ended up running old weights against the new prompt, a combination nobody
+> had ever tested. The fix is that prompt, chat template, and sampling
+> defaults are immutable artifacts of the same version bump. If product needs
+> to iterate on prompts faster than model releases, fine — but through the
+> same canary and rollback machinery, not around it.
 
 ### 5.3 Monitoring blind spots between layers
 
@@ -719,6 +954,19 @@ Every chapter in this guide has its own failure-mode list, and those lists are c
 
 **Fix:** Maintain at least one **cross-layer** latency measurement (synthetic canary requests sent from outside the cluster, measuring true end-to-end time including the gateway) in addition to the model server's own histograms, and make sure every per-component alert and every drift check is labeled and filterable by `version`, so a canary's behavior is visible in isolation before it becomes the whole system's behavior.
 
+> **Saying it out loud.** Every per-component dashboard green while users are
+> timing out is the shape to recognize, and there are three common causes.
+> One: the gateway's timeout is shorter than the model server's, so requests
+> the gateway already gave up on never enter the server's latency histogram at
+> all — the server's dashboard is perfect because it's only measuring the
+> survivors. Two: uneven load balancing means individual pods each stay under
+> their own thresholds while the client-side P95 across all replicas breaches.
+> Three: the drift monitor is watching aggregate production traffic, so a
+> canary's distribution is never compared to baseline until it's already at
+> 100%. The fix for all three is the same pair — at least one client-side
+> synthetic check measuring true end-to-end time, and a version label on every
+> metric and every drift check.
+
 ### 5.4 Multi-region registry divergence
 
 **Symptom:** A canary promotes cleanly in `us-east`, the team calls the rollout done, and three weeks later a `eu-west` on-call engineer discovers the region has been silently running the old version the entire time.
@@ -726,6 +974,17 @@ Every chapter in this guide has its own failure-mode list, and those lists are c
 **Root cause:** The model registry (Ch. 09) was treated as a per-region resource — each region's cluster pulled from its own local registry mirror or config, and the promotion pipeline only pushed the "promote to v2" event to the region where the on-call engineer happened to run it. Nothing in the system enforced that "promoted" means the same thing in every region simultaneously.
 
 **Fix:** Per Section 2.3, if you operate multi-region at all, the model registry must be a genuinely global source of truth (or have an explicit, monitored, alerting-backed replication/sync step) — "promoted" needs to be a single fact checked against every region's actual running version, not an event fired once and assumed to propagate.
+
+> **Saying it out loud.** This one is short and it stings: a canary promotes
+> cleanly in one region, the team calls the rollout done, and three weeks
+> later someone in another region discovers it's been running the old version
+> the whole time. The cause is that the registry was treated as a per-region
+> resource, and the promotion pipeline only fired the event in the region the
+> engineer happened to be working in. Nothing in the system enforced that
+> "promoted" means the same thing everywhere. So if you run multi-region at
+> all, promotion has to be a global fact verified against every region's
+> actually-running version, with alerting on divergence — not an event fired
+> once and assumed to propagate.
 
 ## 6. Pre-Launch Checklist
 
@@ -788,6 +1047,19 @@ A consolidated checklist across all eleven chapters, ordered roughly the way you
 **Organizational**
 - [ ] On-call has run at least one game-day: trigger a canary rollback, kill a pod mid-request, and simulate a GPU node failure, and confirm the system (and the humans) behave as expected.
 - [ ] The pre-launch checklist itself is versioned somewhere and gets revisited after the first real incident — the failure modes in Section 5 were all discovered this way, not designed for up front.
+
+> **Saying it out loud.** The way to use a checklist like this is that a "no"
+> on any item is a launch blocker unless you can name the specific risk you're
+> accepting instead. The items I'd flag as most commonly missed: a startup
+> probe timed against a real cold start rather than guessed, a
+> PodDisruptionBudget so a cluster upgrade can't drain every replica at once,
+> load tests that use realistic prompt length distributions rather than short
+> synthetic prompts, exactly one control loop owning replica count during a
+> rollout, and a rollback verified in staging to actually revert weights,
+> prompt, and engine config together. And one organizational item that matters
+> as much as any technical one: on-call has actually run a game day, so the
+> first canary rollback isn't happening for the first time during a real
+> incident.
 
 ## 7. Interview Mastery
 
@@ -892,6 +1164,18 @@ A: (Use any of Section 5's incidents as source material — the autoscaler-undoe
 | Biggest new risk introduced | — | Silent state/version divergence across regions (Section 5.4) |
 | Right default | Yes, unless a specific forcing function exists | Only with a dedicated owner for cross-region consistency |
 
+> **Saying it out loud.** If I'm compressing the tradeoffs: on engines, raw
+> Transformers is fastest to a demo and wrong for anything real; vLLM is the
+> throughput-per-dollar default for a few self-hosted models; Triton adds a
+> server layer that only pays for itself with a genuine multi-model
+> requirement; and a managed API has the lowest ops burden and no control over
+> the weights. On rollouts, big-bang exposes 100% of traffic instantly,
+> blue-green does too but with instant rollback and 2x capacity during the
+> switch, and canary is the only one that bounds the blast radius before the
+> gates pass — at slightly more than 1x cost. On topology, single region is
+> the right default and the biggest risk multi-region introduces isn't
+> latency, it's silent version divergence.
+
 ### 7.4 Red flags vs green flags
 
 | Signal | Red flag | Green flag |
@@ -937,6 +1221,20 @@ Month 0-1        Month 1-3           Month 3-6              Month 6-9           
 
 The framing an interviewer is checking for: did the answer sequence things in the order risk actually justifies (prove correctness before optimizing speed, optimize speed before adding autoscaling complexity, add rollout safety before adding drift monitoring, and defer multi-region/Triton until an actual forcing function shows up) — versus building every box in the reference architecture on day one because "that's what production looks like." A team of two cannot operate all eleven chapters' worth of machinery simultaneously from a cold start, and pretending otherwise is itself a red flag in a system-design interview.
 
+> **Saying it out loud.** For the twelve-month system-design prompt, the thing
+> being tested is whether you sequence by risk rather than building every box
+> on day one. Months zero to one: prove it works — Docker Compose on one GPU
+> box, validate quality, get a rough latency picture. Months one to three:
+> make it fast and put it on real infra — vLLM, Kubernetes, and the first real
+> load test, which is the single most load-bearing artifact for everything
+> after it. Months three to six: stop being one deploy away from an outage —
+> KEDA autoscaling sized from that curve, monitoring split by version, and a
+> real registry. Months six to nine: ship updates without fear — canary with
+> automated gates, plus per-version drift. Months nine to twelve: cost
+> discipline and game days. A team of two cannot operate eleven chapters'
+> worth of machinery from a cold start, and pretending otherwise is itself the
+> red flag.
+
 ## 8. Operational Deep Dives
 
 The core narrative (Sections 1-7) is the complete story for most teams. This section collects a few additional pieces of the system that come up once you're operating the platform for real — GPU node-level autoscaling (as distinct from pod-level autoscaling), two more system-level failure modes that surface after the ones in Section 5, and a command cheat sheet worth keeping next to the runbook.
@@ -954,11 +1252,36 @@ Two mitigations, both worth having simultaneously:
 
 On the cost side, this is also where spot/preemptible GPU capacity earns its keep — for the *steady-state floor* of replicas (the `minReplicaCount` from Section 3.6), running on-demand/reserved capacity is worth the latency-safety of guaranteed availability; for the *burst headroom* above that floor, spot capacity is often an acceptable risk, since a preempted spot node during a burst just means falling back toward the SLO boundary rather than losing the floor's worth of guaranteed serving capacity entirely. Reserved/committed-use discounts (available from most major cloud GPU providers for 1-3 year commitments) are worth layering under the steady-state floor once traffic has been stable long enough to trust the number — locking in a discount on a `minReplicaCount` you later have to shrink is its own kind of cost mistake, so this is deliberately a months-9-12 decision (Section 7.5's timeline), not a launch-day one.
 
+> **Saying it out loud.** There's a second autoscaler one layer down that
+> people forget: the cluster autoscaler, which adds GPU nodes when pods can't
+> be scheduled. And GPU nodes are slow to provision — driver install, device
+> plugin registration, MIG partitioning all stack on top of normal VM boot, so
+> three to five minutes is normal. That gap is exactly where a burst breaches
+> your SLO: the pod autoscaler did its job perfectly and the platform still
+> failed, because the node autoscaler was the real bottleneck. Two mitigations
+> worth having together: keep a small pre-warmed buffer, either a node-pool
+> minimum above steady state or low-priority placeholder pods that get
+> preempted when real work arrives, and prefer absorbing part of a burst on
+> existing nodes through time-slicing while new nodes come online in parallel.
+
 ### 8.2 Two more failure modes worth knowing before they happen to you
 
 **GPU silent degradation past health checks.** A GPU can develop ECC memory errors, thermal throttling, or Xid errors that degrade performance without crashing the process — the vLLM server's `/health` endpoint (used by the readiness/liveness probes in Section 3.4) keeps returning healthy because the process is, technically, alive and responsive; it's just running 3x slower per token than a healthy replica. Kubernetes has no reason to reschedule it, and the autoscaler has no reason to add capacity, because from the outside the replica count looks sufficient — it's the *quality* of one replica's throughput that degraded, not its count. The fix is monitoring GPU health signals directly (DCGM exporter metrics — ECC error counts, thermal state, Xid error codes — installed alongside the GPU Operator) as a first-class input to alerting, separate from and in addition to the application-level health check, and routing per-replica latency metrics (not just the fleet-wide aggregate) into the dashboard so one visibly slow replica doesn't get averaged away by nine healthy ones.
 
 **Cost runaway from an autoscaler ceiling raised during an incident and never lowered.** During the incident-response pattern described in Q15 of Section 7.2 — raising `maxReplicaCount` mid-incident to absorb an unprecedented spike — it's common, and understandable, for the temporary change to quietly become permanent, because nobody owns reverting it once the incident is resolved and the on-call engineer has moved on. Weeks later, a routine (not even unusually large) traffic bump now scales to the emergency ceiling instead of the originally-sized one, at real and recurring GPU cost, with no incident and no alert to flag it — the system is behaving exactly as configured, which is precisely why nothing catches it. The fix is procedural, not technical: every incident-time config change (autoscaler bounds, probe thresholds, alert silences) gets a tracked follow-up ticket to review and, if appropriate, revert within a fixed window, and periodic (e.g., monthly) audits diff the running autoscaler config against the last deliberately-reviewed baseline.
+
+> **Saying it out loud.** Two more that only show up once you're operating for
+> real. First, GPU silent degradation: a card develops ECC errors or thermal
+> throttling and runs three times slower per token without crashing, so the
+> health endpoint keeps returning healthy, Kubernetes has no reason to
+> reschedule, and the autoscaler has no reason to add capacity — the replica
+> count is fine, the quality of one replica's throughput isn't. That's why
+> DCGM health signals need to be a first-class alerting input separate from
+> the application health check, and why per-replica latency has to be visible
+> so one slow pod doesn't get averaged away by nine healthy ones. Second, cost
+> runaway from an incident-time autoscaler ceiling that nobody ever lowered —
+> the fix there is procedural: every incident-time config change gets a
+> tracked follow-up ticket with a review window.
 
 ### 8.3 Quick reference: commands you'll actually run
 
@@ -1034,6 +1357,19 @@ The reference architecture's gateway box (Section 1) does more than route reques
 - **Prompt-length limits protect the KV-cache budget, not just the gateway.** A client sending a request near your `--max-model-len` ceiling consumes proportionally more KV-cache memory per request, directly reducing the concurrency ceiling the load test in Section 3.5 measured. Enforcing a sane per-request prompt-length limit at the gateway (well below the hard `--max-model-len`) keeps one large request from degrading everyone else's latency.
 - **Multi-tenant isolation for GPU workloads is coarser than for typical multi-tenant CPU services.** Unlike a CPU service where cgroups give reasonably strong per-tenant resource isolation, a shared GPU model-server pod serves all tenants' requests through the same continuous batch — there is no per-tenant GPU-memory or compute isolation *within* a replica. If strict tenant isolation is a hard requirement (e.g., contractual or regulatory), the practical answer is dedicating replicas (or MIG partitions, Ch. 03) per tenant rather than assuming batching-level isolation exists, because it doesn't.
 - **Basic input hardening still matters even though "prompt injection" is a model-behavior problem, not an infra problem.** The gateway is a reasonable place to enforce request-size limits, strip or flag obviously malformed input (e.g., attempts to smuggle control tokens the tokenizer would otherwise interpret specially), and log full request/response pairs for the security and drift-monitoring teams (Ch. 10) to review — the infra platform's job is making sure that data exists and is queryable, not solving prompt injection itself.
+
+> **Saying it out loud.** Gateway security for LLM serving has three wrinkles
+> that generic API advice misses. Rate limiting by request count is close to
+> meaningless when one request generates five tokens and another generates
+> four thousand — you need limits or at least cost attribution keyed on
+> tokens. Prompt-length limits aren't just gateway hygiene: a request near
+> your max model length eats proportionally more KV cache and directly lowers
+> the concurrency ceiling your load test measured, so cap it well below the
+> hard limit. And multi-tenant isolation is coarser than people assume — all
+> tenants' requests flow through the same continuous batch inside a replica,
+> so there is no per-tenant GPU isolation within a pod. If isolation is
+> contractual, you dedicate replicas or MIG partitions; batching-level
+> isolation does not exist.
 
 ## 9. Further Reading
 
@@ -1192,6 +1528,16 @@ spec:
 
 This closes the loop described in Section 1's diagram: the drift/quality monitor doesn't just watch production and report separately — its output becomes a real promote/abort input, with the same automatic, no-human-watching-a-dashboard guarantee the latency and error-rate gates already have.
 
+> **Saying it out loud.** The gap this appendix closes is that latency and
+> error rate gates catch a canary that's broken, not one that's subtly wrong.
+> A quantization change can pass every operational check while quietly
+> degrading answers on a class of prompts your golden set didn't cover
+> densely. So the drift and quality monitor has to expose its own Prometheus
+> gauge, scored per version, and the canary's analysis template reads it as a
+> third metric alongside latency and errors. That's the whole connective
+> piece, and it's small — but without it the quality signal lives on a
+> dashboard nobody is watching during the fifteen minutes it actually matters.
+
 ## Appendix D: Cost Comparison Across Quantization Choices
 
 Extending Section 4.3's quantization discussion with concrete illustrative numbers, for a case where a model does *not* ship natively pre-quantized (unlike gpt-oss-20b in the main walkthrough) and the team is choosing how far to quantize a BF16 checkpoint:
@@ -1205,6 +1551,18 @@ Extending Section 4.3's quantization discussion with concrete illustrative numbe
 (Illustrative ranges reflecting commonly reported directional effects, not a benchmark run for this chapter — always validate the specific ceiling and quality delta for your model, hardware, and golden set before committing a capacity plan to a quantization choice; see Ch. 05 and the FP8 quantization docs in Section 9 for engine-specific specifics.)
 
 The practical decision rule from Section 4.3 holds here in sharper relief: FP8 is close to a default-safe choice on modern hardware (H100-class GPUs have native FP8 tensor cores, so the throughput win is closer to "free" than the INT4 row's more dramatic — and riskier — VRAM savings). INT4-class quantization is the higher-risk, higher-reward lever, worth reaching for only after the golden-set validation in Section 6 has specifically cleared it for your model and task mix, not adopted by default purely for the cost savings.
+
+> **Saying it out loud.** On how far to quantize a model that doesn't ship
+> pre-quantized: FP8 roughly halves the memory footprint and buys somewhere in
+> the range of 1.6 to 1.9 times the throughput ceiling, with a quality delta
+> that's typically small and often within noise on general benchmarks. INT4
+> through AWQ or GPTQ quarters the footprint and can push the ceiling two and
+> a half to three and a half times, but the quality gap is larger and much
+> more task-dependent — long-context and reasoning tasks degrade visibly
+> before open-ended chat does. So FP8 is close to default-safe on hardware
+> with native FP8 tensor cores, and INT4 is the higher-risk, higher-reward
+> lever you reach for only after golden-set validation clears it. These are
+> illustrative directional ranges, not a benchmark — measure your own model.
 
 ## Appendix E: The Same Scenario, Through Triton Instead
 
@@ -1249,6 +1607,17 @@ instance_group [
 Everything **above** the model-server layer in the reference architecture (Section 1) is unaffected: the same Kubernetes Deployment pattern from Section 3.4 applies (Triton's container image replaces vLLM's, GPU resource requests and probes stay conceptually identical — Triton exposes its own `/v2/health/ready` endpoint for the readiness probe instead of vLLM's `/health`), the same KEDA scaling pattern from Section 3.6 applies against Triton's own Prometheus metrics endpoint, and the same Argo Rollouts canary pattern from Section 3.8 applies unchanged — a canary controller shifting traffic weight doesn't care whether the pods behind each weight are running vLLM or Triton. This is the practical payoff of the reference architecture in Section 1 being drawn as boxes rather than as a single tool: swapping the model-server box's implementation doesn't require redesigning the gateway, autoscaler, canary controller, or observability stack around it.
 
 The tradeoff is exactly what Section 2.1 named: Triton's model-repository/config.pbtxt layer is genuine extra operational surface (a second configuration system, on top of Kubernetes YAML, that has to stay in sync with it) that buys you the ability to add that second, non-LLM model to the same server later without standing up an entirely separate serving stack for it.
+
+> **Saying it out loud.** It's worth knowing what changes if the same workload
+> has to go through Triton — say because a re-ranker or an embedding model now
+> needs to share the server. The serving unit stops being a single serve
+> command and becomes a model repository: a directory tree Triton scans at
+> startup, one folder per model, each with its own config declaring backend,
+> batching, and instance placement. The request path concepts carry over
+> unchanged — continuous batching, paged KV cache, the same Prometheus story —
+> but you've added a server layer and a config surface. Which is exactly the
+> point of the earlier decision tree: you take that on when a genuine
+> multi-model requirement appears, not preemptively.
 
 ## Appendix F: A Sample On-Call Runbook Entry
 
@@ -1311,6 +1680,19 @@ A short list of design smells that show up repeatedly across real platforms, dis
 - **"We'll add monitoring for that after launch."** Said about GPU-health metrics (Section 8.2), client-side synthetic checks (Section 5.3), or drift monitoring (Section 1's drift box) — these are cheap to add before launch and expensive to retrofit after the first incident they would have caught.
 - **Treating the load test as a one-time launch artifact.** The saturation curve from Section 3.5 is only valid for the model, hardware, and prompt distribution it was measured against; a model swap, a prompt-length shift from a new product feature, or a hardware change (even a "just as fast" GPU generation swap) invalidates it silently until the next incident reveals the assumption was stale.
 
+> **Saying it out loud.** The anti-patterns are chronic rather than acute —
+> they accumulate quietly instead of paging you. The autoscaler config nobody
+> has looked at since launch, sized from a load test on a model and prompt
+> distribution that no longer exist. Alerts with no runbook, which train
+> on-call to snooze rather than act, so by the time one matters it's been
+> ignored for months. A registry that's a source of truth in name only,
+> because a feature flag can still change sampling behavior around it.
+> Dashboards that only show the aggregate and were never updated to split by
+> version, quietly useless at exactly the moment a canary is rolling. And
+> treating the load test as a one-time launch artifact, when a model swap or a
+> prompt-length shift silently invalidates it until an incident reveals the
+> assumption was stale.
+
 ## Closing: How to Use This Chapter
 
 This capstone is meant to be read twice, in two different modes.
@@ -1320,6 +1702,17 @@ The first read is linear, before you build anything — Sections 1-2 to internal
 The second read is as a reference, after you're operating something like this for real — Section 5 and Appendix G's failure modes and anti-patterns are worth rereading after your first real incident, not just before launch, because most of them are far more legible in hindsight than in a pre-launch review; Appendix F's runbook pattern is worth adapting for every SLO-protecting alert you add, not just the one shown; and Appendix B's chapter cross-reference map is the fastest way back into the numbered chapters when a specific piece (autoscaling tuning, drift statistics, Triton backend configuration) needs to go deeper than this chapter goes.
 
 The single idea worth carrying forward past every specific YAML snippet and PromQL query in this chapter: a production LLM serving platform is not eleven separate problems that happen to share a GPU. It's one system, and the seams between the eleven pieces — where a canary controller and an autoscaler both think they own the same ReplicaSet, where a rollback reverts weights but not the prompt template that shipped alongside them, where a per-component dashboard is green while the actual user experience isn't — are where the interesting failures live. Chapters 01 through 11 teach you to build each piece correctly. This chapter is the argument for why that isn't the same thing as building the system correctly, and a worked example of closing that gap.
+
+> **Saying it out loud.** The single idea worth carrying out of this chapter
+> is that a production LLM serving platform is not eleven separate problems
+> that happen to share a GPU. It's one system, and the interesting failures
+> live in the seams — a canary controller and an autoscaler both thinking they
+> own the same replica set, a rollback that reverts weights but not the prompt
+> template that shipped with them, a per-component dashboard that's green
+> while the actual user experience isn't. Individual chapters teach you to
+> build each piece correctly. That is genuinely not the same thing as building
+> the system correctly, and the gap between those two is where most production
+> incidents come from.
 
 ## Appendix H: A Concrete Game-Day Test Plan
 
@@ -1336,6 +1729,19 @@ Section 6's checklist and Section 7.5's twelve-month plan both mention "run a ga
 | 7 | Feed a batch of known-bad outputs into the drift/quality gauge (Appendix C) and confirm an in-flight canary halts | The drift/quality signal is a real gate, not a metric nobody's canary configuration actually reads | Canary's `AnalysisTemplate` fails the `golden-set-quality` check and halts/rolls back automatically |
 
 Running this list once doesn't make it done — the honest cadence is re-running it whenever a component in the chain changes (a new autoscaler version, a new canary controller version, a change to the PDB or probe configuration), since each of these tests is validating an *interaction*, and interactions are exactly what silently break when one side of them changes without the other side being retested.
+
+> **Saying it out loud.** A game day is worth specifying rather than gesturing
+> at, because "run a game day" without a list means nobody runs one. The tests
+> I'd insist on: kill a pod mid-request and confirm readiness pulls it from
+> the service before it dies; abort a canary mid-step and then diff the
+> running config, not just the image tag, to prove the prompt template
+> reverted too; drain a GPU node and confirm the disruption budget actually
+> blocks; fill the node pool and trigger a scale-up to see whether your
+> pre-warmed buffer really closes the node-provisioning gap; and feed
+> known-bad outputs into the quality gauge to prove the canary gate actually
+> reads it. And running the list once doesn't make it done — every one of
+> these validates an interaction, and interactions break silently when one
+> side changes.
 
 ## Appendix I: Managed API Options, for Comparison
 
@@ -1364,6 +1770,19 @@ Concretely, before reusing this chapter's specifics in a real build:
 - **Re-validate quantization quality deltas (Section 4.3, Appendix D) per model.** Quantization tooling and technique quality has been improving quickly; a quality gap that was noticeable eighteen months ago on one model family may be smaller (or larger, for a different architecture) on whatever you're actually deploying — the golden-set validation step in Section 6 exists precisely so you never have to trust a general claim about quantization quality instead of measuring your own.
 
 None of this diminishes the chapter's core teaching content — the reference architecture's shape (Section 1), the decision framework's structure (Section 2), the order operations happen in during a real build (Section 3's walkthrough sequence), and the failure modes living in the seams between components (Section 5) all age far more slowly than any specific price or version number, because they're about how the pieces of the system relate to each other, not about which specific tool or GPU generation currently fills a given box. That distinction — what ages fast versus what doesn't — is itself worth teaching to anyone using this chapter as a reference months or years after it was written.
+
+> **Saying it out loud.** I'd say this out loud in any interview where I quote
+> a number from a book: every concrete figure here is a snapshot, not a
+> constant. The engine version, the GPU pricing, the load-test curve, the
+> quantization ranges — all of them age, and treating a snapshot as a constant
+> is a smaller version of exactly the mistake this whole chapter is about,
+> trusting a number without checking whether what it measured has moved
+> underneath you. So re-check engine versions against release notes, re-run
+> the load test on your own model and hardware, re-quote GPU pricing, and
+> re-validate quantization quality per model. What ages slowly is the
+> architecture's shape, the decision framework, the order of operations, and
+> the failure modes in the seams — because those are about how pieces relate,
+> not which tool currently fills a box.
 
 ## Appendix K: A Postmortem, Written the Way Section 5's Incidents Actually Read
 
@@ -1426,3 +1845,14 @@ which is precisely the category Section 5 of this chapter exists to name.
 ```
 
 This is the format worth adopting for real incidents against this platform: specific and timestamped in the timeline, but the root-cause and fix sections stay at the level of "which control loop owned what," which is exactly the level Section 5's abstractions operate at — so that a postmortem doesn't just document one incident, it feeds back into the general failure-mode catalog the next engineer reads before their own launch.
+
+> **Saying it out loud.** The reason to write a postmortem this way is the
+> contrast in register. Section 5 describes failures analytically so they
+> generalize; a real postmortem is specific and timestamped — severity,
+> duration, roughly four percent of requests receiving stale model behavior
+> for twenty-three minutes after the rollout UI said complete. But notice that
+> the root cause and fix sections still sit at the level of which control loop
+> owned what. That's deliberate: it keeps the document blameless about people
+> while being precise about systems, and it means the postmortem doesn't just
+> document one incident, it feeds back into the general failure-mode catalog
+> the next engineer reads before their own launch.
