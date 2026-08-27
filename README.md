@@ -43,7 +43,7 @@ mlops_serving/
 
 ## 🚀 Quick Start
 
-**👉 START HERE**: Read `HOW_TO_START.md` for a complete step-by-step guide!
+**👉 START HERE**: Read [`HOW_TO_START.md`](HOW_TO_START.md) for a complete step-by-step guide!
 
 ### Quick Commands
 
@@ -163,20 +163,20 @@ MIT License - Feel free to use this for learning and teaching.
 
 ## 📖 Getting Started
 
-1. **New to this?** → Read `HOW_TO_START.md` for step-by-step instructions
-2. **Want overview?** → Read `LEARNING_PATH.md` to see all topics
+1. **New to this?** → Read [`HOW_TO_START.md`](HOW_TO_START.md) for step-by-step instructions
+2. **Want overview?** → Read [`LEARNING_PATH.md`](LEARNING_PATH.md) to see all topics
 3. **Ready to code?** → Start with `01_basic_serving/`
-4. **Need help?** → Check `EXERCISE_SOLUTIONS.md` for exercise answers
-5. **Interview prep?** → Review `INTERVIEW_QA.md` for common questions
+4. **Need help?** → Check [`EXERCISE_SOLUTIONS.md`](EXERCISE_SOLUTIONS.md) for exercise answers
+5. **Interview prep?** → Review [`INTERVIEW_QA.md`](INTERVIEW_QA.md) for common questions
 
-**Ready to start?** Open `HOW_TO_START.md` and begin your journey! 🚀
+**Ready to start?** Open [`HOW_TO_START.md`](HOW_TO_START.md) and begin your journey! 🚀
 
 ## 📚 Additional Resources
 
-- **Exercise Solutions**: `EXERCISE_SOLUTIONS.md` - Answers to all exercises
-- **Interview Q&A**: `INTERVIEW_QA.md` - 23+ interview questions with detailed answers
-- **Quick Reference**: `QUICK_REFERENCE.md` - Quick commands and tips
-- **Complete Topics**: `COMPLETE_TOPICS.md` - Overview of all 12 topics
+- **Exercise Solutions**: [`EXERCISE_SOLUTIONS.md`](EXERCISE_SOLUTIONS.md) - Answers to all exercises
+- **Interview Q&A**: [`INTERVIEW_QA.md`](INTERVIEW_QA.md) - 23+ interview questions with detailed answers
+- **Quick Reference**: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md) - Quick commands and tips
+- **Complete Topics**: [`COMPLETE_TOPICS.md`](COMPLETE_TOPICS.md) - Overview of all 12 topics
 - **Industry Boilerplate**: Each topic README includes industry-standard code and use cases
 
 ## 🏭 Industry Focus

@@ -457,7 +457,7 @@ docker-compose up -d
 1. Open Grafana
 2. Add Prometheus data source
 3. Create new dashboard
-4. Add panels with queries from `08_monitoring/README.md`
+4. Add panels with queries from [`08_monitoring/README.md`](08_monitoring/README.md)
 
 ### Exercise 3: Set Up Alerts
 **Solution:**

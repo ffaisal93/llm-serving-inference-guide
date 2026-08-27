@@ -23,9 +23,9 @@ You'll learn how to:
 
 | File | Purpose |
 |------|---------|
-| `HOW_TO_START.md` | **👉 START HERE** - Step-by-step guide to begin learning |
-| `LEARNING_PATH.md` | Overview of all topics and learning approach |
-| `README.md` | Repository overview and quick reference |
+| [`HOW_TO_START.md`](HOW_TO_START.md) | **👉 START HERE** - Step-by-step guide to begin learning |
+| [`LEARNING_PATH.md`](LEARNING_PATH.md) | Overview of all topics and learning approach |
+| [`README.md`](README.md) | Repository overview and quick reference |
 | `docs/` | Detailed concept explanations |
 | `01_basic_serving/` | Your first serving example |
 | `02_docker/` | Containerization |
@@ -93,7 +93,7 @@ python test_api.py
 
 ## 🎓 Ready to Start?
 
-**👉 Open `HOW_TO_START.md` and follow the step-by-step guide!**
+**👉 Open [`HOW_TO_START.md`](HOW_TO_START.md) and follow the step-by-step guide!**
 
 ---
 

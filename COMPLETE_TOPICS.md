@@ -68,7 +68,7 @@ All 12 learning topics are now complete! Here's what you have:
 
 Follow this order for best learning experience:
 
-1. **Start**: Read `HOW_TO_START.md`
+1. **Start**: Read [`HOW_TO_START.md`](HOW_TO_START.md)
 2. **Fundamentals**: Read `docs/llm_inference_fundamentals.md`
 3. **Basic Serving**: Work through `01_basic_serving/`
 4. **Containerize**: Learn Docker in `02_docker/`
@@ -84,10 +84,10 @@ Follow this order for best learning experience:
 
 ## 🎯 Quick Reference
 
-- **Quick Start**: `HOW_TO_START.md`
-- **Learning Path**: `LEARNING_PATH.md`
-- **Quick Commands**: `QUICK_REFERENCE.md`
-- **Overview**: `README.md`
+- **Quick Start**: [`HOW_TO_START.md`](HOW_TO_START.md)
+- **Learning Path**: [`LEARNING_PATH.md`](LEARNING_PATH.md)
+- **Quick Commands**: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md)
+- **Overview**: [`README.md`](README.md)
 
 ## 📖 Each Topic Includes
 
@@ -98,7 +98,7 @@ Follow this order for best learning experience:
 
 ## 🚀 Ready to Learn!
 
-Everything is set up and ready. Start with `HOW_TO_START.md` and work through each topic at your own pace.
+Everything is set up and ready. Start with [`HOW_TO_START.md`](HOW_TO_START.md) and work through each topic at your own pace.
 
 Happy learning! 🎓
 

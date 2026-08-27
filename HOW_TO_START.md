@@ -117,7 +117,7 @@ Open http://localhost:8000/docs in your browser - FastAPI provides an interactiv
 
 ### Step 5: Understand What Just Happened (15 minutes)
 
-**Read**: `01_basic_serving/README.md`
+**Read**: [`01_basic_serving/README.md`](01_basic_serving/README.md)
 
 This explains:
 - What each file does
@@ -241,7 +241,7 @@ By the end of this journey, you'll understand:
 ## 🎯 Next Steps
 
 1. **Right now**: Complete Steps 1-5 above
-2. **Today**: Read through `01_basic_serving/README.md` and understand the code
+2. **Today**: Read through [`01_basic_serving/README.md`](01_basic_serving/README.md) and understand the code
 3. **This week**: Work through topics 2-4 (Docker, K8s, Load Testing)
 4. **This month**: Complete topics 5-8 (vLLM, Scaling, Monitoring)
 5. **Ongoing**: Topics 9-11 (Advanced production topics)

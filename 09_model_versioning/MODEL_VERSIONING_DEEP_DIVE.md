@@ -609,7 +609,7 @@ What the drill is meant to prove, and what to time when you run it for real:
 | Immutable id | Version number + logged artifact hash | Model Package ARN | Version id (immutable) | **Commit hash** (content-addressed via Git/LFS) |
 | Gated promotion | Alias move + tag gates in CI | Approval status flip (EventBridge-triggerable) | Alias reassignment | PR/branch merge; manual convention |
 | Artifact store | Pluggable (S3/GCS/Azure/local) | S3 (+ ECR image) | Google Cloud Storage | Git LFS on the Hub |
-| Lineage/metadata | Runs, params, metrics, tags | Metrics, data lineage, source pipeline | Metadata, eval, dataset links | Model card (`README.md` + YAML) |
+| Lineage/metadata | Runs, params, metrics, tags | Metrics, data lineage, source pipeline | Metadata, eval, dataset links | Model card ([`README.md`](README.md) + YAML) |
 | Approval/audit | Tags + external gate | Native approval workflow + audit | IAM + Cloud Audit Logs | Repo history / commits |
 | Best when | Open-source, self-hosted MLOps | Deep AWS + Pipelines/EventBridge | Deep GCP + Vertex Endpoints | Public/OSS models, git-native pinning |
 
@@ -897,7 +897,7 @@ on identical inputs.
 
 A **model card** is the human-readable documentation of a version: intended use, training
 data, eval results, limitations, biases, and license (Mitchell et al., 2019, *Model
-Cards for Model Reporting*). On the Hugging Face Hub the card is the repo's `README.md`
+Cards for Model Reporting*). On the Hugging Face Hub the card is the repo's [`README.md`](README.md)
 with a YAML metadata header; it renders on the model page and is machine-parsable.
 
 **Lineage** is the machine-readable provenance graph: this version came from *this
@@ -991,7 +991,7 @@ because it is the single most commonly reported shape of this failure across tea
 is worth naming precisely: a serving config points at `chatbot-llm:latest` (or an S3
 prefix like `s3://models/chatbot-llm/latest/`, or an HF `main` branch with no
 `revision=`). A teammate — in a different repo, a different team, a different
-timezone — pushes a retrain, a quick fix, or even just a `README.md` metadata update
+timezone — pushes a retrain, a quick fix, or even just a [`README.md`](README.md) metadata update
 that happens to also touch the pointer. `latest` now resolves to different bytes. No
 deploy fired. No CI ran. The next pod restart (an autoscale event, a node drain, a
 routine rolling update — not even the same team's action) picks up the new bytes and

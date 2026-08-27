@@ -264,9 +264,9 @@ llm_gpu_memory_used_bytes / llm_gpu_memory_total_bytes * 100
 
 ## 📚 Learn More
 
-- **vLLM**: `05_vllm_serving/README.md`
-- **Latency**: `04_load_testing/README.md`
-- **Monitoring**: `08_monitoring/README.md`
+- **vLLM**: [`05_vllm_serving/README.md`](05_vllm_serving/README.md)
+- **Latency**: [`04_load_testing/README.md`](04_load_testing/README.md)
+- **Monitoring**: [`08_monitoring/README.md`](08_monitoring/README.md)
 
 ---
 
