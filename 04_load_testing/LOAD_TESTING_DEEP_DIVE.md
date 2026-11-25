@@ -62,17 +62,17 @@ The engineering goal is to **find the knee** and operate just below it: that's w
 
 ## Metrics, Defined Precisely
 
-Let a single streaming request produce output tokens at wall-clock times \( t_1 < t_2 < \dots < t_N \), with the request sent at \( t_0 \). Over a whole test, let \( R \) requests complete in wall-clock window \( T \) seconds, producing \( O \) total output tokens.
+Let a single streaming request produce output tokens at wall-clock times \\( t_1 < t_2 < \dots < t_N \\), with the request sent at \\( t_0 \\). Over a whole test, let \\( R \\) requests complete in wall-clock window \\( T \\) seconds, producing \\( O \\) total output tokens.
 
 > **Saying it out loud.** There are really six numbers and you should be able to define each precisely. Time to first token is when the cursor starts moving — prefill plus any queueing wait. Time per output token is the average gap between tokens after the first, which is your perceived typing speed. End-to-end is the sum of those, and it scales with output length, so it's only comparable across runs whose output distributions match. Request throughput is completed requests per second; output-token throughput is generated tokens per second across everyone, and that's the money metric. And every latency number gets reported at p50, p95, and p99, never as a mean. The subtlety worth naming: a "latency regression" is very often just longer outputs, not a slower system.
 
 ### Time To First Token (TTFT)
 
-\[ \text{TTFT} = t_1 - t_0 \]
+\\[ \text{TTFT} = t_1 - t_0 \\]
 
-The latency until the first token appears. Dominated by **prefill** (processing the prompt) plus any **queueing wait** for a scheduler slot. This is what a user perceives as "responsiveness" — the cursor starting to move. TTFT is the metric most sensitive to load, because a queued request pays its wait entirely before \( t_1 \).
+The latency until the first token appears. Dominated by **prefill** (processing the prompt) plus any **queueing wait** for a scheduler slot. This is what a user perceives as "responsiveness" — the cursor starting to move. TTFT is the metric most sensitive to load, because a queued request pays its wait entirely before \\( t_1 \\).
 
-*Micro-example:* prompt sent at \( t_0 = 0 \), first token at \( t_1 = 0.18\text{ s} \) → TTFT = 180 ms.
+*Micro-example:* prompt sent at \\( t_0 = 0 \\), first token at \\( t_1 = 0.18\text{ s} \\) → TTFT = 180 ms.
 
 > **Saying it out loud.** TTFT is simply the time from sending the request to the first token arriving, and it's what a user experiences as responsiveness — the cursor starting to move. Two things go into it: prefill, meaning the model processing the whole prompt in one compute-bound pass, plus however long the request sat in a queue waiting for a scheduler slot. That second term is why TTFT is the metric most sensitive to load — a queued request pays its entire wait before the first token ever appears, so TTFT p95 is usually the first thing to blow up as you approach saturation. Concretely, if you send at time zero and the first token lands at 180 milliseconds, that's your TTFT, and under load that same request might see 2 seconds without anything about the model changing.
 
@@ -80,17 +80,17 @@ The latency until the first token appears. Dominated by **prefill** (processing 
 
 **TPOT** is the average gap between output tokens after the first, for one request:
 
-\[ \text{TPOT} = \frac{t_N - t_1}{N - 1} \]
+\\[ \text{TPOT} = \frac{t_N - t_1}{N - 1} \\]
 
-**ITL** is the per-gap version — the distribution of individual \( t_{i+1} - t_i \) values. TPOT is the mean of a request's ITLs. (Tools differ: vLLM reports both TPOT and ITL; some tools call TPOT "inter-token latency." Know which your tool means.) TPOT is governed by the **decode** phase; \( 1/\text{TPOT} \) is the per-user tokens/second — the perceived "typing speed."
+**ITL** is the per-gap version — the distribution of individual \\( t_{i+1} - t_i \\) values. TPOT is the mean of a request's ITLs. (Tools differ: vLLM reports both TPOT and ITL; some tools call TPOT "inter-token latency." Know which your tool means.) TPOT is governed by the **decode** phase; \\( 1/\text{TPOT} \\) is the per-user tokens/second — the perceived "typing speed."
 
-*Micro-example:* a request emits 201 tokens, \( t_1 = 0.18 \), \( t_{201} = 4.18 \). TPOT \( = (4.18 - 0.18)/200 = 20\text{ ms} \) → each user sees ~50 tokens/s.
+*Micro-example:* a request emits 201 tokens, \\( t_1 = 0.18 \\), \\( t_{201} = 4.18 \\). TPOT \\( = (4.18 - 0.18)/200 = 20\text{ ms} \\) → each user sees ~50 tokens/s.
 
 > **Saying it out loud.** TPOT is the average gap between output tokens after the first — total generation time divided by the number of gaps — and one over TPOT is the per-user tokens per second, the perceived typing speed. ITL is the same thing but as a distribution rather than an average, so TPOT is really the mean of a request's ITLs. Where TTFT is governed by prefill, TPOT is governed by decode, which is the memory-bandwidth-bound phase. Concretely: a request emitting 201 tokens with a 20-millisecond TPOT gives the user about 50 tokens per second. One practical warning — tools disagree on naming, and some call TPOT "inter-token latency," so check which your tool means before comparing numbers across tools.
 
 ### End-to-End (E2E) Request Latency
 
-\[ \text{E2E} = t_N - t_0 = \text{TTFT} + (N-1)\cdot\text{TPOT} \]
+\\[ \text{E2E} = t_N - t_0 = \text{TTFT} + (N-1)\cdot\text{TPOT} \\]
 
 Total time from send to last token. **This is the number that scales with output length**, so it is only comparable across runs if output-length distributions match. A "latency regression" is often just longer outputs.
 
@@ -98,33 +98,33 @@ Total time from send to last token. **This is the number that scales with output
 
 ### Normalized latency (per-token E2E)
 
-\[ \text{normalized latency} = \frac{\text{E2E}}{N} \]
+\\[ \text{normalized latency} = \frac{\text{E2E}}{N} \\]
 
 Divides out output length, making runs with different output distributions comparable. vLLM's benchmark historically reported this.
 
 ### Request throughput
 
-\[ \lambda_{\text{out}} = \frac{R}{T} \quad [\text{req/s}] \]
+\\[ \lambda_{\text{out}} = \frac{R}{T} \quad [\text{req/s}] \\]
 
 Completed requests per second across the whole run. The right top-line number when your unit of work is "a request" (e.g., classification).
 
 ### Output-token throughput
 
-\[ X = \frac{O}{T} \quad [\text{tok/s}] \]
+\\[ X = \frac{O}{T} \quad [\text{tok/s}] \\]
 
 Generated tokens per second across all concurrent requests. **This is the money metric for generative workloads** and the one that goes up with better batching. Report **output** tokens (excludes the prompt); also report **total token throughput** (prompt + output) if prefill cost matters to you. Divide by GPU count for tok/s/GPU.
 
-*Micro-example:* 64 concurrent requests each streaming at 50 tok/s → aggregate \( X \approx 3200 \) tok/s, even though each *user* still sees only 50 tok/s. Per-user speed and aggregate throughput are different axes.
+*Micro-example:* 64 concurrent requests each streaming at 50 tok/s → aggregate \\( X \approx 3200 \\) tok/s, even though each *user* still sees only 50 tok/s. Per-user speed and aggregate throughput are different axes.
 
 > **Saying it out loud.** Output-token throughput is total generated tokens divided by wall-clock time, aggregated across every concurrent request — and for generative workloads it's the money metric, because it's what improves when batching improves and it's what your cost per token divides into. The distinction that trips people up: per-user speed and aggregate throughput are different axes entirely. Sixty-four concurrent requests each streaming at a modest 50 tokens per second is 3,200 tokens per second aggregate, even though no individual user sees anything faster than 50. Report output tokens separately from prompt tokens, since prefill and decode cost differently, and divide by GPU count so you get tokens per second per GPU — that's the number that actually compares across hardware.
 
 ### Percentiles
 
-For a metric with sorted samples, the p-th percentile \( P_p \) is the smallest value \( \geq p\% \) of samples:
+For a metric with sorted samples, the p-th percentile \\( P_p \\) is the smallest value \\( \geq p\\% \\) of samples:
 
-\[ P_p = \text{value at rank } \lceil \tfrac{p}{100} \cdot n \rceil \text{ in sorted order} \]
+\\[ P_p = \text{value at rank } \lceil \tfrac{p}{100} \cdot n \rceil \text{ in sorted order} \\]
 
-Report **p50 (median), p95, p99** for TTFT, TPOT, and E2E. p99 matters more than it looks: if a page makes 10 backend calls, the chance all 10 beat p99 is \( 0.99^{10} \approx 0.90 \) — so ~10% of *page loads* hit a p99 tail. Tail latency compounds.
+Report **p50 (median), p95, p99** for TTFT, TPOT, and E2E. p99 matters more than it looks: if a page makes 10 backend calls, the chance all 10 beat p99 is \\( 0.99^{10} \approx 0.90 \\) — so ~10% of *page loads* hit a p99 tail. Tail latency compounds.
 
 A practical note on computing these from a live stream of samples rather than a saved-then-sorted list: naive percentile computation needs the full sorted sample set in memory, which is fine for a single sweep level (thousands of samples) but awkward for a long-running soak test. If you need percentiles over an unbounded stream, use a streaming quantile sketch (e.g. t-digest or HDRHistogram) instead of re-sorting on every report — both are available as Python/Go/JS libraries and are what k6 and Gatling use internally to report percentiles without buffering every sample.
 
@@ -140,11 +140,11 @@ This is the single most important methodology decision, and the one most benchma
 
 ### Closed-loop
 
-A fixed pool of \( C \) "virtual users." Each sends a request, **waits for the full response**, then immediately sends the next. Concurrency is capped at \( C \) by construction. This models a fixed number of clients in a tight loop (e.g., a batch job, or exactly \( C \) synchronous callers).
+A fixed pool of \\( C \\) "virtual users." Each sends a request, **waits for the full response**, then immediately sends the next. Concurrency is capped at \\( C \\) by construction. This models a fixed number of clients in a tight loop (e.g., a batch job, or exactly \\( C \\) synchronous callers).
 
 ### Open-loop
 
-Requests are launched on an **arrival schedule** (e.g., Poisson at rate \( \lambda \)) **independent of whether prior requests have finished**. In-flight concurrency is an *emergent property*, free to grow if the server slows down. This models real traffic: users arrive whether or not your server is keeping up.
+Requests are launched on an **arrival schedule** (e.g., Poisson at rate \\( \lambda \\)) **independent of whether prior requests have finished**. In-flight concurrency is an *emergent property*, free to grow if the server slows down. This models real traffic: users arrive whether or not your server is keeping up.
 
 ### Coordinated omission — why closed-loop hides overload
 
@@ -175,19 +175,19 @@ Use both: a concurrency sweep to find the knee, then an open-loop test at your c
 
 Little's Law relates the three quantities you care about, for any stable system in steady state:
 
-\[ L = \lambda \, W \]
+\\[ L = \lambda \\, W \\]
 
-- \( L \) = average number of requests **in the system** (concurrency / in-flight).
-- \( \lambda \) = average **arrival = completion rate** (req/s), in steady state.
-- \( W \) = average **time in system** (E2E latency, seconds).
+- \\( L \\) = average number of requests **in the system** (concurrency / in-flight).
+- \\( \lambda \\) = average **arrival = completion rate** (req/s), in steady state.
+- \\( W \\) = average **time in system** (E2E latency, seconds).
 
 It is an identity — no assumptions about distributions. Uses:
 
-**Sanity-check a benchmark.** If your open-loop test offers \( \lambda = 20 \) req/s and you measure mean E2E \( W = 4 \) s, then average in-flight concurrency is \( L = 20 \times 4 = 80 \). If your engine's `--max-num-seqs` is 64, you are **oversubscribed**: requests are queuing, latency will keep rising, and the system is not in steady state. The law just told you the offered load exceeds capacity *before* you stare at a climbing latency graph.
+**Sanity-check a benchmark.** If your open-loop test offers \\( \lambda = 20 \\) req/s and you measure mean E2E \\( W = 4 \\) s, then average in-flight concurrency is \\( L = 20 \times 4 = 80 \\). If your engine's `--max-num-seqs` is 64, you are **oversubscribed**: requests are queuing, latency will keep rising, and the system is not in steady state. The law just told you the offered load exceeds capacity *before* you stare at a climbing latency graph.
 
-**Convert closed-loop to a rate.** A closed-loop test with \( C = 100 \) virtual users measuring \( W = 2.5 \) s achieves \( \lambda = L/W = 100/2.5 = 40 \) req/s. That's how you translate a concurrency-sweep point into "requests per second this config sustains."
+**Convert closed-loop to a rate.** A closed-loop test with \\( C = 100 \\) virtual users measuring \\( W = 2.5 \\) s achieves \\( \lambda = L/W = 100/2.5 = 40 \\) req/s. That's how you translate a concurrency-sweep point into "requests per second this config sustains."
 
-**Token form.** Apply it to tokens: aggregate output throughput \( X \) (tok/s) with \( n \) requests in flight each of length \( N \) tokens taking \( W \) seconds gives \( X = nN/W \) — decompose regressions into "fewer concurrent" vs "slower per request."
+**Token form.** Apply it to tokens: aggregate output throughput \\( X \\) (tok/s) with \\( n \\) requests in flight each of length \\( N \\) tokens taking \\( W \\) seconds gives \\( X = nN/W \\) — decompose regressions into "fewer concurrent" vs "slower per request."
 
 Caveat: Little's Law holds **in steady state**. During warmup, ramp, or overload it does not, which is one more reason to discard warmup and to hold each sweep point long enough to stabilize.
 
@@ -340,7 +340,7 @@ Two design points that matter:
 
 Run the client at increasing rates against one A100 serving an 8B model, fixed input ≈512 / output ≈200 tokens:
 
-| Target rate (req/s) | Achieved req/s | Output tok/s | TTFT p50 (ms) | TTFT p95 (ms) | TPOT p50 (ms) | E2E p95 (ms) | Avg in-flight \(L=\lambda W\) |
+| Target rate (req/s) | Achieved req/s | Output tok/s | TTFT p50 (ms) | TTFT p95 (ms) | TPOT p50 (ms) | E2E p95 (ms) | Avg in-flight \\(L=\lambda W\\) |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 5   | 5.0  | 1000 | 42   | 70   | 15 | 3200  | 16 |
 | 10  | 10.0 | 2000 | 55   | 95   | 17 | 3600  | 36 |
@@ -355,7 +355,7 @@ Run the client at increasing rates against one A100 serving an 8B model, fixed i
 
 - **5 → 20 req/s:** achieved rate tracks target, output tok/s scales ~linearly (1000→4000), TTFT p95 stays modest. Underloaded region — GPU has headroom.
 - **~30 req/s is the knee.** Output tok/s (5900) is close to the ceiling; achieved rate still ≈ target but TTFT p95 has jumped to 620 ms. This is the **operating point** you'd target for a latency-sensitive service, maybe backing off to ~25 for headroom.
-- **40 → 50 req/s: overload.** Achieved rate **flatlines at ~33 req/s** even as you offer more — that ~33 req/s (≈6600 tok/s) is the true saturation throughput. Meanwhile latency explodes (TTFT p95 2.4 s → 9 s; E2E p95 41 s) and Little's-Law in-flight \( L \) blows past any sane `max-num-seqs`. Offering 50 doesn't get you 50; it just grows the queue.
+- **40 → 50 req/s: overload.** Achieved rate **flatlines at ~33 req/s** even as you offer more — that ~33 req/s (≈6600 tok/s) is the true saturation throughput. Meanwhile latency explodes (TTFT p95 2.4 s → 9 s; E2E p95 41 s) and Little's-Law in-flight \\( L \\) blows past any sane `max-num-seqs`. Offering 50 doesn't get you 50; it just grows the queue.
 
 The signature of the knee: **throughput stops rising while latency starts rising superlinearly.** Peak throughput and acceptable latency are *different* points — publish both, and state which you're operating at.
 
@@ -521,7 +521,7 @@ One caveat applies to every row of that table: this space is moving fast enough 
 
 **Measuring only averages.** The mean hides the tail and can be dominated by a few slow requests. Always report p50/p95/p99 (and max) for TTFT, TPOT, and E2E separately. And never average latency *across different output lengths* without normalizing — longer outputs inflate E2E and masquerade as a regression.
 
-**Client-side bottleneck.** The most insidious: your load generator, not the server, is the limit. Symptoms: achieved rate plateaus well below the server's known capacity, client CPU pegged at 100%, or latency that scales with *client* concurrency. Causes: single-threaded Python parsing SSE, aiohttp/`requests` connection-pool caps, GIL contention, running the client on the same box as the server, or a network link between client and server that's the actual bottleneck. Fixes: pin and monitor client CPU, remove connection caps (`TCPConnector(limit=0)`), use async or distributed workers (k6/Locust workers, multiple client hosts), and **sanity-check with Little's Law** — if measured \( L = \lambda W \) can't reach the server's `max-num-seqs`, your client is starving it.
+**Client-side bottleneck.** The most insidious: your load generator, not the server, is the limit. Symptoms: achieved rate plateaus well below the server's known capacity, client CPU pegged at 100%, or latency that scales with *client* concurrency. Causes: single-threaded Python parsing SSE, aiohttp/`requests` connection-pool caps, GIL contention, running the client on the same box as the server, or a network link between client and server that's the actual bottleneck. Fixes: pin and monitor client CPU, remove connection caps (`TCPConnector(limit=0)`), use async or distributed workers (k6/Locust workers, multiple client hosts), and **sanity-check with Little's Law** — if measured \\( L = \lambda W \\) can't reach the server's `max-num-seqs`, your client is starving it.
 
 **Reusing identical prompts / prefix caching artifacts.** If every request sends the same prompt, prefix caching makes prefill nearly free and TTFT looks unrealistically good. Vary prompts (or explicitly test both with- and without-cache) so you measure the case you'll actually run.
 
@@ -851,7 +851,7 @@ The `matplotlib`-missing fallback matters more than it looks: this pipeline is m
 
 **What was actually happening.** `nvidia-smi` showed GPU utilization at roughly 40% throughout the test — not a saturated GPU at all. The load generator was a single Python process using `aiohttp` with its **default connection-pool limit of 100** and synchronous JSON parsing of each SSE chunk on the event loop; at 32 concurrent streaming connections doing that parsing, one CPU core was pegged at 100%. The client, not the server, had run out of capacity.
 
-**How it was confirmed.** Cross-checking with Little's Law settled it without more guessing: the achieved request rate and measured mean E2E latency implied an average in-flight concurrency \( L = \lambda W \) far below the server's configured `--max-num-seqs`. If the server had genuinely been the bottleneck at 32 concurrent requests, \( L \) should have tracked close to 32; instead it sat well under that, meaning the server had spare scheduling slots the client simply wasn't filling.
+**How it was confirmed.** Cross-checking with Little's Law settled it without more guessing: the achieved request rate and measured mean E2E latency implied an average in-flight concurrency \\( L = \lambda W \\) far below the server's configured `--max-num-seqs`. If the server had genuinely been the bottleneck at 32 concurrent requests, \\( L \\) should have tracked close to 32; instead it sat well under that, meaning the server had spare scheduling slots the client simply wasn't filling.
 
 **Fix.** Removing the `aiohttp` connector limit (`TCPConnector(limit=0)`) and splitting the load across four client processes (one per CPU core) with `k6`'s distributed workers eliminated the client bottleneck. Rerun under the *same* engine configuration reached roughly 6,100 output tok/s — in line with the vendor reference, and confirming the scheduler-flag change the engineer had been about to revert was fine all along.
 
@@ -881,9 +881,9 @@ The unifying habit in both incidents: never trust a single graph in isolation. C
 1. **"What do you measure, and why not just average latency?"** — Name TTFT, TPOT/ITL, E2E, request- and output-token throughput; report **p50/p95/p99**, not means, because latency is heavy-tailed and the tail is what users feel. Mean is only for throughput accounting.
 2. **"Open-loop or closed-loop, and what's coordinated omission?"** — Open-loop (arrival-rate) for SLA validation; closed-loop (fixed concurrency) only to find the throughput ceiling. Coordinated omission = closed-loop stops sending when the server stalls, so it hides the tail. Bonus: measure latency from the *intended* send time.
 3. **"How do you find the right operating point?"** — Sweep concurrency/rate, plot throughput and p95 latency vs load, find the **knee** where throughput flattens and latency turns up; operate just below it with headroom.
-4. **"Apply Little's Law here."** — \( L = \lambda W \). Given a rate and E2E latency, compute in-flight concurrency and compare to `max-num-seqs` to detect oversubscription; convert closed-loop concurrency to sustainable req/s.
+4. **"Apply Little's Law here."** — \\( L = \lambda W \\). Given a rate and E2E latency, compute in-flight concurrency and compare to `max-num-seqs` to detect oversubscription; convert closed-loop concurrency to sustainable req/s.
 5. **"How do you make the workload realistic?"** — Match production input/output length distributions (ShareGPT / replayed logs), vary prompts to avoid prefix-cache flattery, and report the distribution used.
-6. **"How do you know the client isn't the bottleneck?"** — Monitor client CPU, remove connection caps, use async/distributed generators, separate client and server hosts, and cross-check achieved \( L \) against server capacity.
+6. **"How do you know the client isn't the bottleneck?"** — Monitor client CPU, remove connection caps, use async/distributed generators, separate client and server hosts, and cross-check achieved \\( L \\) against server capacity.
 7. **"Warmup and steady state?"** — Discard cold-start requests (CUDA graphs/compile/cache allocation); run long enough (≥~1000 post-warmup samples, metrics stable) for trustworthy p99.
 8. **"How do you gate regressions in CI?"** — A reproducible benchmark (pinned tool/model/dataset/lengths) run at a fixed rate, asserting on p95 TTFT and output tok/s thresholds, so a config regression fails the build.
 
@@ -960,16 +960,16 @@ The parts an interviewer is listening for: naming the knee-finding phase as *clo
 
 1. **What is TTFT dominated by, and why is it the most load-sensitive metric?** Prefill cost plus queueing wait for a scheduler slot; queueing wait is paid entirely before the first token, so TTFT reacts to load faster and harder than TPOT does.
 2. **Why report output-token throughput separately from request throughput?** They answer different questions — req/s is the right top-line number when the unit of work is "a request" (e.g. classification); output tok/s is the money metric for generative workloads and is what improves when batching gets better, even if req/s stays flat because outputs got longer.
-3. **State Little's Law and use it to sanity-check a benchmark.** \( L = \lambda W \). If a test offers 20 req/s and measures 4 s mean E2E, in-flight concurrency is 80; if `max-num-seqs` is 64, the system is oversubscribed and not in steady state, which the latency graph alone won't tell you until it's already climbing.
+3. **State Little's Law and use it to sanity-check a benchmark.** \\( L = \lambda W \\). If a test offers 20 req/s and measures 4 s mean E2E, in-flight concurrency is 80; if `max-num-seqs` is 64, the system is oversubscribed and not in steady state, which the latency graph alone won't tell you until it's already climbing.
 4. **What, concretely, is coordinated omission, and name one tool feature that fixes it.** A closed-loop load generator stops sending when the server slows down, because each virtual user is blocked waiting on its own response, so the tail latency a real, indifferent arrival stream would have produced never gets sampled. Fix: an open-loop arrival-rate executor (k6's `constant-arrival-rate`) that measures latency from the *scheduled* send time rather than the actual send time.
 5. **Walk through how you'd automatically find the concurrency knee without eyeballing a chart.** Double concurrency each step; stop when a doubling buys less than ~10% more output tok/s *or* p95 latency more than triples versus the previous level (either condition alone is the overload signature); then binary-search between the last two doubling points to tighten the estimate.
 6. **Your pre-launch load test showed a healthy p99, but production had multi-second stalls. What's your hypothesis, and how do you confirm it?** Hypothesis: the pre-launch test was closed-loop and coordinated omission hid a queueing-debt scenario (e.g. an autoscaler lag). Confirm by rerunning the same nominal load open-loop while chaos-injecting the suspected failure (a delayed/slow pod) in staging, and showing the closed-loop tool fails to reproduce the same spike side-by-side.
-7. **You suspect your load generator, not the server, is the bottleneck. What do you check, in order?** Client CPU utilization; connection-pool/connector limits (e.g. aiohttp's default 100); whether the client is single-threaded/GIL-bound doing synchronous parsing on the event loop; then cross-check achieved in-flight concurrency via Little's Law against the server's configured capacity (`max-num-seqs`) — if the implied \( L \) is well under server capacity, the client is starving it.
+7. **You suspect your load generator, not the server, is the bottleneck. What do you check, in order?** Client CPU utilization; connection-pool/connector limits (e.g. aiohttp's default 100); whether the client is single-threaded/GIL-bound doing synchronous parsing on the event loop; then cross-check achieved in-flight concurrency via Little's Law against the server's configured capacity (`max-num-seqs`) — if the implied \\( L \\) is well under server capacity, the client is starving it.
 8. **How do you make a synthetic benchmark's workload realistic?** Sample input/output lengths from real data (production logs, or a public conversational dataset like ShareGPT) rather than a fixed pair; vary prompt content so prefix caching doesn't flatter TTFT unless you're deliberately testing the cached case; and match the arrival process (Poisson vs bursty vs session-shaped) to how traffic actually behaves.
 9. **How does a reasoning model change what and how you benchmark?** Output length becomes correlated with problem difficulty rather than a fixed ceiling, KV-cache utilization swings far more than in standard LLM serving (documented ranges of roughly 3-70% within a batch), and a single hard request in a batch can become a straggler that drags down every other request's completion time. Practical fix: sample output length from a distribution (ideally bimodal/heavy-tailed) instead of a flat `max_tokens`, and track KV-cache occupancy as a time series rather than a single number.
 10. **How would you load-test an agentic, multi-turn system differently from a single-turn chatbot?** Replay session-shaped traffic — realistic turn counts, think-time between turns, growing per-session context — rather than independent single-turn requests, using a tool with native multi-turn support (vLLM's multi-turn benchmark, GenAI-Perf/AIPerf's session/conversation modes, or a timestamped trace replay); and report prefix/KV-cache hit rate as a first-class metric, because agentic sessions are typically decode-dominated with very high input-token reuse across turns, and an independent-request benchmark never creates that reuse condition.
 11. **Compare vLLM's `benchmark_serving`/`vllm bench serve`, NVIDIA GenAI-Perf/AIPerf, and LLMPerf — when do you reach for each?** `vllm bench serve` for fast, LLM-native metrics and datasets against a vLLM-family or OpenAI-compatible endpoint, including built-in ramp-up sweeps; AIPerf (formerly GenAI-Perf) when you're deep in the NVIDIA/Triton stack and want first-class session/conversation modeling; LLMPerf when you need the same client hitting multiple *different* providers for an apples-to-apples comparison, remembering its concurrency mode measures a ceiling, not an SLA, and its fixed-`max_tokens` model under-represents reasoning workloads.
-12. **Why does a "regression" in mean E2E latency sometimes not be a regression at all?** E2E scales with output length (\( \text{E2E} = \text{TTFT} + (N-1)\cdot\text{TPOT} \)); if the new run's requests happened to generate longer outputs (different random seed, different sampled dataset order, a longer reasoning trace), E2E goes up with no change in per-token cost. Always compare either matched length distributions or normalized (per-token) latency.
+12. **Why does a "regression" in mean E2E latency sometimes not be a regression at all?** E2E scales with output length (\\( \text{E2E} = \text{TTFT} + (N-1)\cdot\text{TPOT} \\)); if the new run's requests happened to generate longer outputs (different random seed, different sampled dataset order, a longer reasoning trace), E2E goes up with no change in per-token cost. Always compare either matched length distributions or normalized (per-token) latency.
 13. **What's the minimum sample size you'd want before trusting a reported p99?** On the order of 1,000+ post-warmup samples per metric per level; fewer than that and a single unlucky/lucky request can move the reported p99 by a large margin, and the run may not have reached queueing steady-state for Little's Law to hold.
 14. **How do you turn a one-off load test into something that gates CI?** Pin the tool version, model, dataset, and length distribution so the run is reproducible; run it (or a cheaper proxy of the full sweep) automatically on every serving-config change; assert on concrete thresholds (e.g. p95 TTFT and output tok/s) so a regression fails the build rather than waiting to be noticed in production.
 15. **What is prefix/KV-cache hit rate, and why does it belong in an agentic load-testing report?** The fraction of a request's prompt tokens served from a cached prior computation instead of recomputed; agentic sessions can be 80-99%+ prefix-reuse, so a benchmark that never creates that reuse (independent single-turn requests instead of session replay) will report a TTFT far worse than production actually sees, and a concurrency ceiling far lower than what's actually achievable once caching is engineered for.

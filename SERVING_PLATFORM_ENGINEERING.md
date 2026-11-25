@@ -317,9 +317,9 @@ Quantization is already decided for us in the useful sense: gpt-oss-20b ships wi
 
 | GPU | VRAM | Fits gpt-oss-20b (~16 GB weights + KV cache)? | Relative on-demand cost (2026, wide provider range) |
 |---|---|---|---|
-| A100 80GB | 80 GB | Yes, comfortably — room for large KV cache and big batches | ~\(\$1.99\)/hr baseline, varies by provider |
+| A100 80GB | 80 GB | Yes, comfortably — room for large KV cache and big batches | ~\\(\\$1.99\\)/hr baseline, varies by provider |
 | L40S 48GB | 48 GB | Yes — less KV-cache headroom than the A100 at very large batch sizes, but adequate for this SLO | Typically priced below A100 on most clouds |
-| H100 80GB | 80 GB | Yes, with the most headroom and the fastest per-token decode | roughly \(\$1.49\)-\(\$6.98\)/hr across 15+ providers; \(\$2\)-\(\$3.29\)/hr is a common on-demand baseline |
+| H100 80GB | 80 GB | Yes, with the most headroom and the fastest per-token decode | roughly \\(\\$1.49\\)-\\(\\$6.98\\)/hr across 15+ providers; \\(\\$2\\)-\\(\\$3.29\\)/hr is a common on-demand baseline |
 
 For a 2-second TTFT SLO at 500-700 req/s, the honest move is to **start on A100 80GB** (cheaper than H100, and the model doesn't need H100's extra compute headroom at this scale), measure the real ceiling with a load test, and only move to H100 if the load test shows you can't hit the SLO at a GPU count your budget tolerates. This is the "choose cheap, then measure, then upgrade only if the numbers force it" pattern — the opposite of defaulting to the newest GPU because it's fastest.
 
@@ -573,11 +573,11 @@ concurrency=130  p50=1.90s  p95=4.40s  p99=6.10s
 
 Read that curve as: **one A100 replica sustains roughly 70-75 concurrent in-flight requests before P95 TTFT breaches 2 seconds.** Continuous batching means concurrency and req/s aren't the same axis, so the next step is converting that concurrency ceiling into a req/s ceiling by measuring completions/sec at that same concurrency — in this worked example that comes out to roughly **90 req/s per replica** at the SLO boundary. For the 500 req/s target with headroom for the 700 req/s burst, that's:
 
-\[
+\\[
 \text{replicas needed} = \lceil \frac{700}{90} \rceil = 8 \text{ replicas at burst}
-\]
+\\]
 
-with a steady-state floor around \(\lceil 500 / 90 \rceil = 6\) replicas. Those two numbers — 6 and 8 — become the KEDA `minReplicaCount` and `maxReplicaCount` in the next section.
+with a steady-state floor around \\(\lceil 500 / 90 \rceil = 6\\) replicas. Those two numbers — 6 and 8 — become the KEDA `minReplicaCount` and `maxReplicaCount` in the next section.
 
 > **Saying it out loud.** This is the step teams skip and regret, because
 > every downstream number depends on it: how many requests per second can one
@@ -783,13 +783,13 @@ This section builds a real cost model on top of the walkthrough in Section 3, ty
 
 ### 4.1 The baseline: cost per replica-hour
 
-Take the A100 80GB choice from 3.2, at an illustrative on-demand rate of \(\$1.99\)/hour (2026 baseline; real quotes range roughly \(\$1.49\)-\(\$6.98\)/hour across providers depending on region, commitment, and spot vs on-demand — always get a current quote before committing to a number in a budget review).
+Take the A100 80GB choice from 3.2, at an illustrative on-demand rate of \\(\\$1.99\\)/hour (2026 baseline; real quotes range roughly \\(\\$1.49\\)-\\(\\$6.98\\)/hour across providers depending on region, commitment, and spot vs on-demand — always get a current quote before committing to a number in a budget review).
 
 From the load test in 3.5, one replica sustains about 90 req/s at the SLO boundary. That gives a **cost per 1,000 requests at the SLO ceiling**:
 
-\[
-\text{cost per 1k req} = \frac{\$1.99/\text{hr}}{90 \text{ req/s} \times 3600 \text{ s/hr}} \times 1000 = \frac{\$1.99}{324{,}000} \times 1000 \approx \$0.0061
-\]
+\\[
+\text{cost per 1k req} = \frac{\\$1.99/\text{hr}}{90 \text{ req/s} \times 3600 \text{ s/hr}} \times 1000 = \frac{\\$1.99}{324{,}000} \times 1000 \approx \\$0.0061
+\\]
 
 That's the cost floor — the number you get if every replica runs pinned at exactly the SLO boundary, all day, every day. No real system runs there, which is exactly what the next section quantifies.
 
@@ -808,13 +808,13 @@ That's the cost floor — the number you get if every replica runs pinned at exa
 
 Section 3.6 set `minReplicaCount: 6` and `maxReplicaCount: 10`, with the 90 req/s-per-replica ceiling from the load test. At the 500 req/s steady-state target:
 
-\[
+\\[
 \text{replicas at steady state} = \frac{500}{90} \approx 5.6 \rightarrow 6 \text{ replicas (rounds up to the floor)}
-\]
+\\]
 
-\[
-\text{effective utilization} = \frac{500}{6 \times 90} = \frac{500}{540} \approx 92.6\%
-\]
+\\[
+\text{effective utilization} = \frac{500}{6 \times 90} = \frac{500}{540} \approx 92.6\\%
+\\]
 
 That's a good utilization number — the 6-replica floor was sized close to the actual steady-state need. But steady state isn't the whole day: real traffic has a diurnal curve, and the honest cost model has to integrate over it, not just price the peak or the trough.
 
@@ -825,7 +825,7 @@ That's a good utilization number — the 6-replica floor was sized close to the 
 | Evening peak | 650 | 8 | 24 |
 | Burst spikes (rare, ~1h/day) | 700 | 8 (at max before hitting `maxReplicaCount: 10` ceiling) | 8 |
 
-Blended average replica count across a day here is roughly \((6 \times 16 + 8 \times 8)/24 \approx 6.67\) replica-hours per hour of wall clock, i.e. about **160 replica-hours/day**, versus a naive "always run 8 for the burst case" static allocation of 192 replica-hours/day. That's the autoscaling headroom paying for itself: **roughly 17% fewer GPU-hours** than statically provisioning for peak, purely from the `minReplicaCount`/`maxReplicaCount` band matching the real traffic curve instead of a fixed pool sized for the worst case.
+Blended average replica count across a day here is roughly \\((6 \times 16 + 8 \times 8)/24 \approx 6.67\\) replica-hours per hour of wall clock, i.e. about **160 replica-hours/day**, versus a naive "always run 8 for the burst case" static allocation of 192 replica-hours/day. That's the autoscaling headroom paying for itself: **roughly 17% fewer GPU-hours** than statically provisioning for peak, purely from the `minReplicaCount`/`maxReplicaCount` band matching the real traffic curve instead of a fixed pool sized for the worst case.
 
 The `minReplicaCount: 6` floor is itself a cost decision, not just a latency one: it exists because GPU pods are slow to cold-start (model load + CUDA graph capture), so scaling below 6 to chase overnight-trough savings would mean the autoscaler can't react fast enough to the next demand ramp without a TTFT SLO breach during the scale-up window. That tradeoff — floor higher than the strict minimum traffic requires, in exchange for avoiding cold-start latency spikes — is a cost-vs-reliability decision every autoscaling config makes implicitly; make it explicitly and write down why.
 
@@ -845,9 +845,9 @@ The `minReplicaCount: 6` floor is itself a cost decision, not just a latency one
 
 gpt-oss-20b's native MXFP4 format is close to a free lunch here — it's how the model ships, not an extra step you're choosing to take on. The more general tradeoff, worth understanding for models that *don't* ship pre-quantized, is: quantizing further (e.g., additional INT4/AWQ on top of an already-BF16 checkpoint) trades a small, usually-recoverable quality loss for a real memory reduction, and that memory reduction converts directly into either (a) fitting on a cheaper/smaller GPU, or (b) fitting more KV cache on the same GPU, which raises the concurrency ceiling found in the load test and therefore lowers cost-per-request. Concretely:
 
-\[
-\text{cost per request} \propto \frac{\text{GPU \$/hr}}{\text{req/s ceiling at that quantization level}}
-\]
+\\[
+\text{cost per request} \propto \frac{\text{GPU \\$/hr}}{\text{req/s ceiling at that quantization level}}
+\\]
 
 Both terms move when you quantize further — the numerator can drop (cheaper GPU fits) and the denominator can rise (more concurrent requests fit in the freed-up memory) — which is why quantization is usually the single highest-leverage cost lever available, ahead of autoscaling tuning or GPU shopping. It's also the one with the least reversible risk if pushed too far: below a certain bit-width, quality regressions stop being subtle and start being visible to users, which is exactly the kind of thing the drift/quality monitor (Ch. 10) and the eval gate in CI need to catch before a more-quantized version ever becomes a canary.
 
@@ -867,17 +867,17 @@ Both terms move when you quantize further — the numerator can drop (cheaper GP
 
 The full monthly cost estimate for this scenario, combining 4.1-4.3:
 
-\[
-\text{monthly GPU cost} \approx 160 \text{ replica-hours/day} \times 30 \text{ days} \times \$1.99/\text{hr} \approx \$9{,}552/\text{month}
-\]
+\\[
+\text{monthly GPU cost} \approx 160 \text{ replica-hours/day} \times 30 \text{ days} \times \\$1.99/\text{hr} \approx \\$9{,}552/\text{month}
+\\]
 
 against a naive fixed-8-replica baseline of:
 
-\[
-8 \times 24 \times 30 \times \$1.99 \approx \$11{,}462/\text{month}
-\]
+\\[
+8 \times 24 \times 30 \times \\$1.99 \approx \\$11{,}462/\text{month}
+\\]
 
-— roughly \(\$1{,}900\)/month saved purely from autoscaling headroom matching the traffic curve, on top of whatever the GPU-choice decision in 3.2 (A100 vs H100) already saved versus defaulting to the most expensive card. Neither number includes the model server's own overhead (registry storage, CI/eval compute, observability stack) — those are real but typically small (single-digit percentage) relative to the GPU line, and should be budgeted separately rather than folded into the per-request math, since they don't scale with request volume the same way.
+— roughly \\(\\$1{,}900\\)/month saved purely from autoscaling headroom matching the traffic curve, on top of whatever the GPU-choice decision in 3.2 (A100 vs H100) already saved versus defaulting to the most expensive card. Neither number includes the model server's own overhead (registry storage, CI/eval compute, observability stack) — those are real but typically small (single-digit percentage) relative to the GPU line, and should be budgeted separately rather than folded into the per-request math, since they don't scale with request volume the same way.
 
 > **Saying it out loud.** Putting the numbers together: about 160
 > replica-hours a day at roughly two dollars an hour is on the order of nine

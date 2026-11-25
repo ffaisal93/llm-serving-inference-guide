@@ -30,7 +30,7 @@ endpoint has **three** latencies, and users feel all of them differently.
    (10 tok/s) the stream feels fluid, at 300 ms it feels painful.
 
 3. **End-to-end latency** — total wall-clock for the whole response. This is
-   roughly \( \text{TTFT} + (N_{\text{output}} - 1) \times \text{TPOT} \), so a
+   roughly \\( \text{TTFT} + (N_{\text{output}} - 1) \times \text{TPOT} \\), so a
    long answer amplifies a small per-token regression into a large total.
 
 The second thing that's different: **the bottleneck is a fixed pool of GPU
@@ -592,9 +592,9 @@ avg by (gpu) (DCGM_FI_PROF_PIPE_TENSOR_ACTIVE) * 100
 **Cost per 1k tokens** — combine a static price with live throughput. With a
 recording rule holding the GPU hourly price, cost per 1k output tokens is:
 
-\[
-\text{cost}_{1k} = \frac{\text{price}_{\$/\text{hr}}}{\text{tokens/s} \times 3.6}
-\]
+\\[
+\text{cost}_{1k} = \frac{\text{price}_{\\$/\text{hr}}}{\text{tokens/s} \times 3.6}
+\\]
 
 ```promql
 # price_per_gpu_hour is a constant series you set (e.g. via a recording rule)
@@ -603,7 +603,7 @@ recording rule holding the GPU hourly price, cost per 1k output tokens is:
 ```
 
 (The `3.6` converts tokens/second into thousands-of-tokens/hour:
-\( \text{tok/s} \times 3600\,\text{s/hr} \div 1000 = \text{tok/s} \times 3.6 \).)
+\\( \text{tok/s} \times 3600\\,\text{s/hr} \div 1000 = \text{tok/s} \times 3.6 \\).)
 
 > **Saying it out loud.** The one piece of PromQL I'd want to be able to write
 > on a whiteboard is the percentile: histogram_quantile at 0.95 over a

@@ -35,11 +35,11 @@ This chapter is deliberately intuition-first: every method gets a plain-English 
 
 Hold one picture in your head for the whole chapter.
 
-At training/eval time you sampled a **reference distribution** \( P_{\text{ref}} \) — the prompts, embeddings, and outputs you validated against. In production you observe a stream that, windowed, gives you a **live distribution** \( P_{\text{live}} \). Drift is simply:
+At training/eval time you sampled a **reference distribution** \\( P_{\text{ref}} \\) — the prompts, embeddings, and outputs you validated against. In production you observe a stream that, windowed, gives you a **live distribution** \\( P_{\text{live}} \\). Drift is simply:
 
-\[
+\\[
 P_{\text{live}} \ne P_{\text{ref}}
-\]
+\\]
 
 Every technique in this chapter is a way to *measure a distance* between these two distributions from finite samples, and then decide whether that distance is large enough to act on. That is the whole game:
 
@@ -72,17 +72,17 @@ Four kinds of drift, in the order you typically detect them:
 
 | Type | What shifts | LLM example | Typically detected via |
 |---|---|---|---|
-| **Input / prompt drift** | The distribution of raw inputs \( P(x) \) | Prompts get longer; a new language appears; topic mix changes | PSI / KS on scalar features (length, token count, language ID); topic classifiers |
-| **Embedding / semantic drift** | The distribution of inputs (or outputs) in vector space \( P(\phi(x)) \) | Users start asking about a product feature that did not exist at launch | MMD, domain classifier, centroid / cosine distance on embeddings |
-| **Output / quality drift** | The distribution of outputs \( P(y) \) or a quality proxy | Answers get shorter, refusals rise, latency creeps up, tone changes | PSI/KS on output length, refusal rate, latency; LLM-judge scores |
-| **Concept drift** | The conditional \( P(y \mid x) \) — the correct mapping | "Best model" now points to a newer model; a policy changed so the *right* answer flipped | Requires labels or re-eval; input/output drift can be flat while this moves |
+| **Input / prompt drift** | The distribution of raw inputs \\( P(x) \\) | Prompts get longer; a new language appears; topic mix changes | PSI / KS on scalar features (length, token count, language ID); topic classifiers |
+| **Embedding / semantic drift** | The distribution of inputs (or outputs) in vector space \\( P(\phi(x)) \\) | Users start asking about a product feature that did not exist at launch | MMD, domain classifier, centroid / cosine distance on embeddings |
+| **Output / quality drift** | The distribution of outputs \\( P(y) \\) or a quality proxy | Answers get shorter, refusals rise, latency creeps up, tone changes | PSI/KS on output length, refusal rate, latency; LLM-judge scores |
+| **Concept drift** | The conditional \\( P(y \mid x) \\) — the correct mapping | "Best model" now points to a newer model; a policy changed so the *right* answer flipped | Requires labels or re-eval; input/output drift can be flat while this moves |
 
 Two things worth internalizing:
 
 - **Input drift and output drift can move independently.** Inputs can look identical while outputs decay (e.g., a silent upstream change to your system prompt, or a provider swapping the model behind an alias). Outputs can look identical while inputs shift (the model gracefully handles new topics — good!). Monitor both, and monitor them separately so you can tell which one moved.
-- **Concept drift is the dangerous one and the hardest to see.** \( P(x) \) can be perfectly stable while \( P(y \mid x) \) rots underneath you. Detecting it genuinely requires ground truth or periodic re-evaluation — no unsupervised distance on inputs will find it. Say this out loud in an interview; it separates people who have run monitoring from people who have read about it.
+- **Concept drift is the dangerous one and the hardest to see.** \\( P(x) \\) can be perfectly stable while \\( P(y \mid x) \\) rots underneath you. Detecting it genuinely requires ground truth or periodic re-evaluation — no unsupervised distance on inputs will find it. Say this out loud in an interview; it separates people who have run monitoring from people who have read about it.
 
-A useful mental decomposition: the joint \( P(x,y) = P(x)\,P(y\mid x) \). Input/embedding drift is a change in \( P(x) \); concept drift is a change in \( P(y\mid x) \). Output drift is a change in the marginal \( P(y) \), which can be caused by *either* — which is exactly why an output-drift alarm alone cannot tell you whether users changed or the model rotted. You have to look at inputs and outputs together.
+A useful mental decomposition: the joint \\( P(x,y) = P(x)\\,P(y\mid x) \\). Input/embedding drift is a change in \\( P(x) \\); concept drift is a change in \\( P(y\mid x) \\). Output drift is a change in the marginal \\( P(y) \\), which can be caused by *either* — which is exactly why an output-drift alarm alone cannot tell you whether users changed or the model rotted. You have to look at inputs and outputs together.
 
 > **Saying it out loud.** There are four kinds and I'd name them in the order
 > you detect them. Input drift is the distribution of prompts changing.
@@ -105,34 +105,34 @@ For each method: the intuition, the precise formula, and a small worked example 
 
 **Intuition.** Bin a feature. Compare the *share* of traffic in each bin now vs. at reference time. If mass sloshed from one bin to another, PSI grows. It is a symmetric, binned relative-entropy-flavored score, and it is the workhorse of tabular drift monitoring because it produces a single interpretable number with battle-tested thresholds.
 
-**Formula.** With \( B \) bins, reference proportion \( r_b \) and live proportion \( l_b \) in bin \( b \):
+**Formula.** With \\( B \\) bins, reference proportion \\( r_b \\) and live proportion \\( l_b \\) in bin \\( b \\):
 
-\[
-\text{PSI} = \sum_{b=1}^{B} \left( l_b - r_b \right)\, \ln\!\frac{l_b}{r_b}
-\]
+\\[
+\text{PSI} = \sum_{b=1}^{B} \left( l_b - r_b \right)\\, \ln\\!\frac{l_b}{r_b}
+\\]
 
-Each term is \( \ge 0 \) (a bin that moves in either direction adds positively), so PSI is a non-negative divergence. It is the symmetrized KL contribution per bin: \( (l_b - r_b)\ln(l_b/r_b) = \text{KL term}_{l\|r} + \text{KL term}_{r\|l} \) collapsed into one expression. Because it sums per-bin contributions, PSI also *localizes* drift — you can read off which bin is driving the score, which KS cannot do. Empty bins blow up the log, so clamp proportions to a small \( \epsilon \) (e.g. \( 10^{-6} \)) or add a pseudo-count.
+Each term is \\( \ge 0 \\) (a bin that moves in either direction adds positively), so PSI is a non-negative divergence. It is the symmetrized KL contribution per bin: \\( (l_b - r_b)\ln(l_b/r_b) = \text{KL term}_{l\\|r} + \text{KL term}_{r\\|l} \\) collapsed into one expression. Because it sums per-bin contributions, PSI also *localizes* drift — you can read off which bin is driving the score, which KS cannot do. Empty bins blow up the log, so clamp proportions to a small \\( \epsilon \\) (e.g. \\( 10^{-6} \\)) or add a pseudo-count.
 
 **Standard thresholds** (from credit-risk practice, widely reused):
 
-- \( \text{PSI} < 0.1 \): no meaningful shift.
-- \( 0.1 \le \text{PSI} < 0.2 \): moderate shift — investigate.
-- \( \text{PSI} \ge 0.2 \): significant shift — act. (Some shops use 0.25 as the "major" line.)
+- \\( \text{PSI} < 0.1 \\): no meaningful shift.
+- \\( 0.1 \le \text{PSI} < 0.2 \\): moderate shift — investigate.
+- \\( \text{PSI} \ge 0.2 \\): significant shift — act. (Some shops use 0.25 as the "major" line.)
 
-**Worked micro-example.** Four equal reference bins, so \( r_b = 0.25 \) each. Live proportions drift toward the top bin: \( l = (0.10,\, 0.20,\, 0.30,\, 0.40) \).
+**Worked micro-example.** Four equal reference bins, so \\( r_b = 0.25 \\) each. Live proportions drift toward the top bin: \\( l = (0.10,\\, 0.20,\\, 0.30,\\, 0.40) \\).
 
-| Bin | \( r_b \) | \( l_b \) | \( l_b - r_b \) | \( \ln(l_b/r_b) \) | term |
+| Bin | \\( r_b \\) | \\( l_b \\) | \\( l_b - r_b \\) | \\( \ln(l_b/r_b) \\) | term |
 |---|---|---|---|---|---|
-| 1 | 0.25 | 0.10 | \(-0.15\) | \(-0.916\) | 0.1375 |
-| 2 | 0.25 | 0.20 | \(-0.05\) | \(-0.223\) | 0.0112 |
-| 3 | 0.25 | 0.30 | \(+0.05\) | \(+0.182\) | 0.0091 |
-| 4 | 0.25 | 0.40 | \(+0.15\) | \(+0.470\) | 0.0705 |
+| 1 | 0.25 | 0.10 | \\(-0.15\\) | \\(-0.916\\) | 0.1375 |
+| 2 | 0.25 | 0.20 | \\(-0.05\\) | \\(-0.223\\) | 0.0112 |
+| 3 | 0.25 | 0.30 | \\(+0.05\\) | \\(+0.182\\) | 0.0091 |
+| 4 | 0.25 | 0.40 | \\(+0.15\\) | \\(+0.470\\) | 0.0705 |
 
-\[
+\\[
 \text{PSI} = 0.1375 + 0.0112 + 0.0091 + 0.0705 = 0.2282
-\]
+\\]
 
-Above 0.2 — a significant shift. Notice the top bin dominates the score: PSI is most sensitive where a large *relative* change lands, which is exactly why quantile bins (equal mass at reference) behave better than equal-width bins for skewed features like token counts. With equal-width bins on a heavy-tailed feature, the tail bins are nearly empty at reference, so a handful of new samples there produce a huge \( \ln(l_b/r_b) \) and a jumpy, unreliable score.
+Above 0.2 — a significant shift. Notice the top bin dominates the score: PSI is most sensitive where a large *relative* change lands, which is exactly why quantile bins (equal mass at reference) behave better than equal-width bins for skewed features like token counts. With equal-width bins on a heavy-tailed feature, the tail bins are nearly empty at reference, so a handful of new samples there produce a huge \\( \ln(l_b/r_b) \\) and a jumpy, unreliable score.
 
 **Data type:** scalar / categorical features. **Not** for raw high-dimensional embeddings — you would have to bin per-dimension and lose all cross-dimensional structure.
 
@@ -154,21 +154,21 @@ Above 0.2 — a significant shift. Notice the top bin dominates the score: PSI i
 
 **Intuition.** Forget bins. Compare the two *empirical cumulative distribution functions* directly, and take the single point of maximum vertical gap between them. Big gap ⇒ the distributions differ. KS is non-parametric (assumes nothing about shape) and needs no binning choice, which makes it a clean default for continuous features.
 
-**Formula.** For empirical CDFs \( F_{\text{ref}} \) and \( F_{\text{live}} \):
+**Formula.** For empirical CDFs \\( F_{\text{ref}} \\) and \\( F_{\text{live}} \\):
 
-\[
+\\[
 D = \sup_{x} \bigl| F_{\text{live}}(x) - F_{\text{ref}}(x) \bigr|
-\]
+\\]
 
-\( D \in [0,1] \). The p-value comes from the Kolmogorov distribution; for sample sizes \( n, m \) you reject "same distribution" at level \( \alpha \) when
+\\( D \in [0,1] \\). The p-value comes from the Kolmogorov distribution; for sample sizes \\( n, m \\) you reject "same distribution" at level \\( \alpha \\) when
 
-\[
-D > c(\alpha)\,\sqrt{\frac{n+m}{n\,m}}, \qquad c(0.05) \approx 1.36 .
-\]
+\\[
+D > c(\alpha)\\,\sqrt{\frac{n+m}{n\\,m}}, \qquad c(0.05) \approx 1.36 .
+\\]
 
-**Worked micro-example.** Reference sample \( \{1,2,3,4\} \), live sample \( \{2,3,4,5\} \) (each shifted up by 1). Step through the pooled sorted values and read both CDFs:
+**Worked micro-example.** Reference sample \\( \\{1,2,3,4\\} \\), live sample \\( \\{2,3,4,5\\} \\) (each shifted up by 1). Step through the pooled sorted values and read both CDFs:
 
-| \( x \) | \( F_{\text{ref}} \) | \( F_{\text{live}} \) | gap |
+| \\( x \\) | \\( F_{\text{ref}} \\) | \\( F_{\text{live}} \\) | gap |
 |---|---|---|---|
 | 1 | 0.25 | 0.00 | 0.25 |
 | 2 | 0.50 | 0.25 | 0.25 |
@@ -176,9 +176,9 @@ D > c(\alpha)\,\sqrt{\frac{n+m}{n\,m}}, \qquad c(0.05) \approx 1.36 .
 | 4 | 1.00 | 0.75 | 0.25 |
 | 5 | 1.00 | 1.00 | 0.00 |
 
-\( D = 0.25 \). With \( n=m=4 \) that is nowhere near significant (the critical value is enormous for four points) — a reminder that KS on tiny windows is uninformative, and that the **statistic** and its **significance** are different things. On the realistic 5000-vs-1500 example below, \( D = 0.26 \) with a p-value around \( 10^{-67} \): same statistic magnitude, wildly different verdict, because sample size collapses the noise band.
+\\( D = 0.25 \\). With \\( n=m=4 \\) that is nowhere near significant (the critical value is enormous for four points) — a reminder that KS on tiny windows is uninformative, and that the **statistic** and its **significance** are different things. On the realistic 5000-vs-1500 example below, \\( D = 0.26 \\) with a p-value around \\( 10^{-67} \\): same statistic magnitude, wildly different verdict, because sample size collapses the noise band.
 
-**Caveats.** KS is most sensitive near the center of the distribution and comparatively blind in the tails. With very large windows it becomes *hypersensitive* — trivial, operationally irrelevant differences produce \( p < 0.001 \). That is why you pair the p-value with an **effect-size** threshold on \( D \) itself (say, alert only if \( D > 0.1 \) *and* \( p < 0.01 \)). For categorical features KS does not apply — use a chi-square test of the count table instead.
+**Caveats.** KS is most sensitive near the center of the distribution and comparatively blind in the tails. With very large windows it becomes *hypersensitive* — trivial, operationally irrelevant differences produce \\( p < 0.001 \\). That is why you pair the p-value with an **effect-size** threshold on \\( D \\) itself (say, alert only if \\( D > 0.1 \\) *and* \\( p < 0.01 \\)). For categorical features KS does not apply — use a chi-square test of the count table instead.
 
 **Seen in the wild:** SciPy's `ks_2samp` (used throughout this chapter's worked examples) is the reference implementation; Evidently and NannyML both call it internally for their per-column drift tests on numeric features, wrapping it with the same effect-size-plus-significance framing recommended above.
 
@@ -199,25 +199,25 @@ D > c(\alpha)\,\sqrt{\frac{n+m}{n\,m}}, \qquad c(0.05) \approx 1.36 .
 
 **Intuition.** The right tool when your feature is a **vector** (an embedding), not a scalar. Map every sample through a kernel into a high-dimensional space, take the mean of each set there, and measure the distance between those means. If the distributions are identical, the mean embeddings coincide and MMD is zero. Unlike PSI/KS it is inherently multivariate — no binning, no per-dimension decomposition — which is why it shows up in embedding-drift toolkits.
 
-**Formula.** With kernel \( k \) (commonly RBF, \( k(a,b)=\exp(-\gamma\lVert a-b\rVert^2) \)), the (biased) empirical squared MMD between reference \( X=\{x_i\}_{i=1}^m \) and live \( Y=\{y_j\}_{j=1}^n \):
+**Formula.** With kernel \\( k \\) (commonly RBF, \\( k(a,b)=\exp(-\gamma\lVert a-b\rVert^2) \\)), the (biased) empirical squared MMD between reference \\( X=\\{x_i\\}_{i=1}^m \\) and live \\( Y=\\{y_j\\}_{j=1}^n \\):
 
-\[
+\\[
 \widehat{\text{MMD}}^2 = \frac{1}{m^2}\sum_{i,i'} k(x_i,x_{i'}) + \frac{1}{n^2}\sum_{j,j'} k(y_j,y_{j'}) - \frac{2}{mn}\sum_{i,j} k(x_i,y_j)
-\]
+\\]
 
 Read it as **(within-reference similarity) + (within-live similarity) − 2·(cross similarity)**. When the two clouds overlap, the cross term matches the within terms and everything cancels toward zero. Significance comes from a **permutation test**: shuffle the pooled labels many times, recompute MMD each time to build the null distribution, and see where your observed value falls in that null.
 
-**Worked micro-example.** 1-D, RBF with \( \gamma = 0.5 \). Reference \( X=\{0,1,2\} \), live \( Y=\{3,4,5\} \). Computing the three kernel-matrix means:
+**Worked micro-example.** 1-D, RBF with \\( \gamma = 0.5 \\). Reference \\( X=\\{0,1,2\\} \\), live \\( Y=\\{3,4,5\\} \\). Computing the three kernel-matrix means:
 
-- within-reference mean \( = 0.633 \)
-- within-live mean \( = 0.633 \) (same spacing, so same self-similarity)
-- cross mean \( = 0.101 \) (clouds are far apart, so kernel values are small)
+- within-reference mean \\( = 0.633 \\)
+- within-live mean \\( = 0.633 \\) (same spacing, so same self-similarity)
+- cross mean \\( = 0.101 \\) (clouds are far apart, so kernel values are small)
 
-\[
+\\[
 \widehat{\text{MMD}}^2 = 0.633 + 0.633 - 2(0.101) = 1.0635, \qquad \widehat{\text{MMD}} = 1.031
-\]
+\\]
 
-The large value reflects two clearly separated clouds. **Pitfall:** MMD's scale is meaningless in the abstract — a value of 1.03 is only "large" relative to the permutation null for *your* data and *your* \( \gamma \). The kernel bandwidth \( \gamma \) matters a lot; a common heuristic sets it from the **median pairwise distance** of the pooled sample. Always calibrate the threshold empirically; never hard-code an MMD number. Cost is \( O((m+n)^2) \) per window, so subsample for large windows.
+The large value reflects two clearly separated clouds. **Pitfall:** MMD's scale is meaningless in the abstract — a value of 1.03 is only "large" relative to the permutation null for *your* data and *your* \\( \gamma \\). The kernel bandwidth \\( \gamma \\) matters a lot; a common heuristic sets it from the **median pairwise distance** of the pooled sample. Always calibrate the threshold empirically; never hard-code an MMD number. Cost is \\( O((m+n)^2) \\) per window, so subsample for large windows.
 
 **Seen in the wild:** Evidently AI lists MMD as one of its five embedding-drift methods (see the 2025–2026 landscape section below), and it is the test underlying most "kernel two-sample test" drift-detection literature, including the original Gretton et al. formulation cited in Further reading.
 
@@ -236,19 +236,19 @@ The large value reflects two clearly separated clouds. **Pitfall:** MMD's scale 
 
 **Intuition.** The cheapest embedding-drift signals. Summarize each set of embeddings by its **centroid** (mean vector) and measure how far the centroids moved, either by Euclidean distance or by cosine of the angle. Fast, streaming-friendly, and interpretable — but coarse.
 
-**Formulas.** Centroids \( \bar\phi_{\text{ref}} = \frac1m\sum_i \phi(x_i) \) and \( \bar\phi_{\text{live}} \):
+**Formulas.** Centroids \\( \bar\phi_{\text{ref}} = \frac1m\sum_i \phi(x_i) \\) and \\( \bar\phi_{\text{live}} \\):
 
-\[
+\\[
 d_{\text{euclid}} = \lVert \bar\phi_{\text{ref}} - \bar\phi_{\text{live}} \rVert_2,
 \qquad
-d_{\cos} = 1 - \frac{\bar\phi_{\text{ref}} \cdot \bar\phi_{\text{live}}}{\lVert \bar\phi_{\text{ref}}\rVert\,\lVert \bar\phi_{\text{live}}\rVert}
-\]
+d_{\cos} = 1 - \frac{\bar\phi_{\text{ref}} \cdot \bar\phi_{\text{live}}}{\lVert \bar\phi_{\text{ref}}\rVert\\,\lVert \bar\phi_{\text{live}}\rVert}
+\\]
 
-**Worked micro-example.** Two 2-D centroids, normalized: \( \bar\phi_{\text{ref}} = (0.8,0.6) \) and \( \bar\phi_{\text{live}} = (0.6,0.8) \) (both already unit-norm).
+**Worked micro-example.** Two 2-D centroids, normalized: \\( \bar\phi_{\text{ref}} = (0.8,0.6) \\) and \\( \bar\phi_{\text{live}} = (0.6,0.8) \\) (both already unit-norm).
 
-\[
+\\[
 \cos = 0.8(0.6) + 0.6(0.8) = 0.96 \Rightarrow d_{\cos} = 0.04, \qquad d_{\text{euclid}} = \lVert(0.2,-0.2)\rVert = 0.2828
-\]
+\\]
 
 **The failure mode you must know:** centroid distance is **blind to variance and multimodal shifts**. If half your traffic moves far left and half moves far right, the centroid can sit *exactly where it started* while the distribution has torn in two. This is why serious embedding-drift setups prefer a **domain classifier** (train a binary model to tell reference from live; if it achieves ROC-AUC meaningfully above 0.5, the sets are distinguishable ⇒ drift, and the classifier's important features tell you *why*) or MMD, both of which see distributional shape, not just the mean. Centroid distance is a good *first* alarm, never the *only* one.
 
@@ -269,8 +269,8 @@ d_{\cos} = 1 - \frac{\bar\phi_{\text{ref}} \cdot \bar\phi_{\text{live}}}{\lVert 
 
 Two more you should be able to name:
 
-- **Wasserstein (earth-mover's) distance** on a scalar feature: the minimum "work" to reshape one distribution into the other, \( W_1 = \int |F_{\text{ref}}(x) - F_{\text{live}}(x)|\,dx \). Unlike KS (a single sup gap) it integrates the *whole* difference and is reported in the feature's real units (tokens, milliseconds), which makes thresholds interpretable. Evidently uses it per-dimension in one of its embedding-drift methods.
-- **Chi-square test** for categorical features (topic labels, language, refusal/no-refusal): compares observed vs. expected counts, \( \chi^2 = \sum_b (O_b - E_b)^2 / E_b \). This is the categorical analogue of KS — reach for it whenever the feature is a label rather than a number.
+- **Wasserstein (earth-mover's) distance** on a scalar feature: the minimum "work" to reshape one distribution into the other, \\( W_1 = \int |F_{\text{ref}}(x) - F_{\text{live}}(x)|\\,dx \\). Unlike KS (a single sup gap) it integrates the *whole* difference and is reported in the feature's real units (tokens, milliseconds), which makes thresholds interpretable. Evidently uses it per-dimension in one of its embedding-drift methods.
+- **Chi-square test** for categorical features (topic labels, language, refusal/no-refusal): compares observed vs. expected counts, \\( \chi^2 = \sum_b (O_b - E_b)^2 / E_b \\). This is the categorical analogue of KS — reach for it whenever the feature is a label rather than a number.
 
 **Seen in the wild:** Evidently's embedding-drift guide uses per-dimension Wasserstein distance as one of its five methods (alongside the domain classifier and MMD covered above), aggregating the per-dimension distances into a single "share of drifted components" score — a good middle ground between a single opaque MMD number and a full per-dimension report.
 
@@ -278,7 +278,7 @@ Two more you should be able to name:
 
 ## A fully worked example: PSI + KS on a live window
 
-A drop-in monitor over one scalar feature — here **prompt length in tokens**. The reference is captured at deploy time; the live window is the last \( N \) requests. The numbers in the comments are the actual output of this code (seed fixed), so you can run it and reproduce them exactly.
+A drop-in monitor over one scalar feature — here **prompt length in tokens**. The reference is captured at deploy time; the live window is the last \\( N \\) requests. The numbers in the comments are the actual output of this code (seed fixed), so you can run it and reproduce them exactly.
 
 ```python
 import numpy as np
@@ -349,7 +349,7 @@ KS p-value     = 2.51e-67
 ALERT: prompt-length drift (PSI + KS agree). ...
 ```
 
-Both signals agree — PSI 0.43 is well past the 0.2 line, and KS gives \( D=0.26 \) with an astronomically small p-value. The **AND** of an effect-size gate and a significance gate is the pattern that keeps this from crying wolf: on a huge window KS alone would flag a 2-token difference; requiring \( D \ge 0.10 \) suppresses that. PSI alone, on a tiny window, would be jumpy; requiring both cross-checks it. Two cheap, independent tests on the same feature is a good default posture.
+Both signals agree — PSI 0.43 is well past the 0.2 line, and KS gives \\( D=0.26 \\) with an astronomically small p-value. The **AND** of an effect-size gate and a significance gate is the pattern that keeps this from crying wolf: on a huge window KS alone would flag a 2-token difference; requiring \\( D \ge 0.10 \\) suppresses that. PSI alone, on a tiny window, would be jumpy; requiring both cross-checks it. Two cheap, independent tests on the same feature is a good default posture.
 
 Note the two design choices that make this production-safe: (1) bin **edges are frozen from the reference** — if you re-derive quantile edges from the live window each time, both histograms are uniform by construction and PSI collapses to zero, hiding the drift; (2) the alert message is *actionable* — it names the likely causes and next checks, not just "drift detected."
 
@@ -766,7 +766,7 @@ week 3 (judge version bump only): {'judge_drift_z': -40.8, 'system_quality': 0.7
 week 4 (judge bump + real decay): {'judge_drift_z': -42.57, 'system_quality': 0.527, 'verdict': 'system+judge'}
 ```
 
-Read the four rows as the whole point: week 2's real decay is caught (`system_quality` drops to 0.523, well past the 0.10 alert margin) while the anchor-derived `judge_drift_z` stays near zero — nothing about the judge moved, so the verdict is cleanly `system`. Week 3 is the case naive monitors get wrong: the *live* traffic's true quality never changed, but a judge-shift of \(-0.18\) still shows up as a *massive* `judge_drift_z` because the anchors — which have fixed, known-correct human scores — expose the judge's new bias immediately; the monitor correctly reports `judge`, not a phantom product regression, and critically the bias-corrected `system_quality` (0.764) still reads as healthy because the attribution logic subtracted out the measured judge bias before judging the system. Week 4 shows both moving at once and reports `system+judge` — the one case where you should page a human for *two* separate reasons rather than one, and go fix the judge and the product independently rather than assuming a single root cause. This is the concrete mechanism behind the abstract claim in the landscape section above: **the anchor set is what lets the number "quality dropped" actually mean "the product got worse," instead of silently meaning "our ruler moved."**
+Read the four rows as the whole point: week 2's real decay is caught (`system_quality` drops to 0.523, well past the 0.10 alert margin) while the anchor-derived `judge_drift_z` stays near zero — nothing about the judge moved, so the verdict is cleanly `system`. Week 3 is the case naive monitors get wrong: the *live* traffic's true quality never changed, but a judge-shift of \\(-0.18\\) still shows up as a *massive* `judge_drift_z` because the anchors — which have fixed, known-correct human scores — expose the judge's new bias immediately; the monitor correctly reports `judge`, not a phantom product regression, and critically the bias-corrected `system_quality` (0.764) still reads as healthy because the attribution logic subtracted out the measured judge bias before judging the system. Week 4 shows both moving at once and reports `system+judge` — the one case where you should page a human for *two* separate reasons rather than one, and go fix the judge and the product independently rather than assuming a single root cause. This is the concrete mechanism behind the abstract claim in the landscape section above: **the anchor set is what lets the number "quality dropped" actually mean "the product got worse," instead of silently meaning "our ruler moved."**
 
 > **Saying it out loud.** The trap with LLM-as-judge monitoring is that your
 > ruler is itself a versioned model. Bump the judge's version or edit its
@@ -789,12 +789,12 @@ Read the four rows as the whole point: week 2's real decay is caught (`system_qu
 | Method | Data type | Output | Sensitivity | Pros | Cons |
 |---|---|---|---|---|---|
 | **PSI** | Scalar / categorical | Unbounded score, standard thresholds (0.1 / 0.2) | Sensitive where relative mass changes; binning-dependent | One interpretable number; no p-value plumbing; localizes to bins; industry-standard cutoffs | Needs binning choice; unstable with sparse bins; not for raw vectors |
-| **KS test** | Continuous scalar | \( D\in[0,1] \) + p-value | Strong at distribution center, weak in tails | Non-parametric, no binning, principled p-value | Hypersensitive on huge windows; univariate only; tail-blind; not for categoricals |
-| **MMD** | Vectors / embeddings | \( \ge 0 \), null via permutation | Detects general distributional shape shifts | Truly multivariate; kernel-flexible; theoretically grounded | \( O(n^2) \) cost; threshold not intuitive; bandwidth \( \gamma \) tuning matters |
-| **Domain classifier** | Vectors / embeddings | ROC-AUC \( \in [0.5,1] \) | Sees any separable shift, incl. multimodal | Interpretable (AUC + feature importance), robust across embedding types, a strong default | Needs training per window; can overfit small windows |
-| **Centroid / cosine dist** | Vectors / embeddings | Distance \( \ge 0 \) | Only mean shift | Cheap, streaming, interpretable | Blind to variance & multimodal splits; threshold hand-tuned |
-| **Wasserstein (per-dim)** | Scalar / per-embedding-dim | \( \ge 0 \), in feature units | Sensitive to any shift incl. tails | Metric with real units; tail-aware | Univariate per dim; needs aggregation across dims |
-| **Chi-square** | Categorical | \( \chi^2 \) + p-value | Any count-table change | Right tool for labels; simple | Needs adequate expected counts per cell |
+| **KS test** | Continuous scalar | \\( D\in[0,1] \\) + p-value | Strong at distribution center, weak in tails | Non-parametric, no binning, principled p-value | Hypersensitive on huge windows; univariate only; tail-blind; not for categoricals |
+| **MMD** | Vectors / embeddings | \\( \ge 0 \\), null via permutation | Detects general distributional shape shifts | Truly multivariate; kernel-flexible; theoretically grounded | \\( O(n^2) \\) cost; threshold not intuitive; bandwidth \\( \gamma \\) tuning matters |
+| **Domain classifier** | Vectors / embeddings | ROC-AUC \\( \in [0.5,1] \\) | Sees any separable shift, incl. multimodal | Interpretable (AUC + feature importance), robust across embedding types, a strong default | Needs training per window; can overfit small windows |
+| **Centroid / cosine dist** | Vectors / embeddings | Distance \\( \ge 0 \\) | Only mean shift | Cheap, streaming, interpretable | Blind to variance & multimodal splits; threshold hand-tuned |
+| **Wasserstein (per-dim)** | Scalar / per-embedding-dim | \\( \ge 0 \\), in feature units | Sensitive to any shift incl. tails | Metric with real units; tail-aware | Univariate per dim; needs aggregation across dims |
+| **Chi-square** | Categorical | \\( \chi^2 \\) + p-value | Any count-table change | Right tool for labels; simple | Needs adequate expected counts per cell |
 
 Rule of thumb: **scalars ⇒ PSI or KS; categoricals ⇒ chi-square or PSI; embeddings ⇒ domain classifier (default) or MMD; want a cheap tripwire ⇒ centroid distance.**
 
@@ -858,7 +858,7 @@ As of 2026, drift monitoring for LLM systems splits into two camps that are grad
 **The debate is being resolved, in practice, as "both, layered, weighted":**
 
 - A representative synthesis (dev.to, aiwithmohit, *Your LLM Is Lying to You Silently: 4 Statistical Signals That Catch Drift Before Users Do*, March 29, 2026 — https://dev.to/aiwithmohit/your-llm-is-lying-to-you-silently-4-statistical-signals-that-catch-drift-before-users-do-4cg2) proposes four signals used together rather than competing:
-  - KL divergence on token-length distributions, alert at \( \ge 0.15 \);
+  - KL divergence on token-length distributions, alert at \\( \ge 0.15 \\);
   - embedding cosine drift on the centroid, alert when similarity drops below 0.82;
   - LLM-as-judge scoring — slower (5–8 days to flag decay) but semantically aware;
   - refusal-rate fingerprinting — fastest (3–5 days), catches safety-filter recalibration.
@@ -898,8 +898,8 @@ The math is easy; the windowing is where judgment lives.
 
 - **Reference window.** Prefer a **fixed, curated** reference (your eval-time distribution or a known-good production period), not a rolling one — a rolling reference lets slow drift redefine "normal" and hides exactly the gradual decay you care about. Refresh it deliberately, versioned, when you re-eval or retrain, and keep the old one around so you can diff.
 - **Live window.** Big enough to be stable, small enough to be timely. Two common shapes: a **tumbling** window (disjoint hourly/daily batches — clean, but bursty) and a **sliding** window (smoother, but overlapping samples correlate, so consecutive readings are not independent). Size it to your traffic: a KS test wants hundreds-to-thousands of points to be meaningful; below ~50 the statistic is mostly noise.
-- **Thresholds.** Start from priors (PSI 0.2, KS \( D>0.1 \) with \( p<0.01 \)), then **calibrate against your own history**: replay past known-good weeks, look at the natural spread of each metric, and set thresholds a few standard deviations above that baseline. For embedding methods with no intrinsic scale (MMD, centroid distance), thresholds *must* be empirical (permutation null or historical quantiles) — a literature number is meaningless for your data.
-- **Require agreement / persistence.** Two independent signals agreeing, or one signal tripping for \( k \) consecutive windows, cuts false alarms dramatically versus a single-window single-metric trigger. This is the cheapest reliability lever you have.
+- **Thresholds.** Start from priors (PSI 0.2, KS \\( D>0.1 \\) with \\( p<0.01 \\)), then **calibrate against your own history**: replay past known-good weeks, look at the natural spread of each metric, and set thresholds a few standard deviations above that baseline. For embedding methods with no intrinsic scale (MMD, centroid distance), thresholds *must* be empirical (permutation null or historical quantiles) — a literature number is meaningless for your data.
+- **Require agreement / persistence.** Two independent signals agreeing, or one signal tripping for \\( k \\) consecutive windows, cuts false alarms dramatically versus a single-window single-metric trigger. This is the cheapest reliability lever you have.
 - **Segment before you aggregate.** A global metric averages away a severe shift confined to one client, region, or topic. Compute drift per meaningful segment; alert on the worst segment, not the mean.
 
 > **Saying it out loud.** The math is easy; the windowing is where the
@@ -1033,8 +1033,8 @@ Two composite incidents, each assembled from patterns that recur across postmort
 - **High-dimensional embedding drift is subtle.** Centroid distance can read zero while the distribution splits in two; per-dimension tests miss cross-dimensional structure; and in high dimensions everything is far from everything (distance concentration), so raw Euclidean thresholds are treacherous. Prefer domain-classifier or MMD, and reduce dimensionality thoughtfully — drift can hide in the components you discarded, so don't PCA blindly.
 - **No ground-truth labels.** You can prove the inputs moved; you cannot prove quality dropped without evaluation. Unsupervised drift is a *smoke alarm*, not a *diagnosis* — never auto-remediate off it alone.
 - **Alerting on everything.** One metric per feature per window with a tight threshold = a muted channel within a week. Aggregate, require persistence/agreement, and route by severity.
-- **Multiple comparisons.** Running KS on 200 features guarantees ~10 "significant" hits at \( \alpha=0.05 \) by pure chance. Correct for it (Bonferroni / Benjamini–Hochberg FDR) or you will chase ghosts daily.
-- **Confusing statistic with significance.** A tiny p-value on a \( D=0.02 \) shift is real but irrelevant; a large \( D \) on 8 samples is irrelevant noise. Report and gate on both the effect size and the p-value.
+- **Multiple comparisons.** Running KS on 200 features guarantees ~10 "significant" hits at \\( \alpha=0.05 \\) by pure chance. Correct for it (Bonferroni / Benjamini–Hochberg FDR) or you will chase ghosts daily.
+- **Confusing statistic with significance.** A tiny p-value on a \\( D=0.02 \\) shift is real but irrelevant; a large \\( D \\) on 8 samples is irrelevant noise. Report and gate on both the effect size and the p-value.
 - **Reference/live binning mismatch.** Re-deriving quantile bin edges from each window makes every histogram uniform and PSI identically zero. Freeze edges from the reference — a subtle bug that silently disables the whole monitor.
 - **Silently swapping the embedding model.** Upgrading from one sentence-embedding model to another (even a same-vendor version bump) changes the vector space itself — a reference centroid computed under the old model is meaningless compared against live embeddings from the new one. Any embedding-model change requires re-snapshotting the reference, exactly like a model deploy does for the scalar reference.
 - **Assuming retrieval coverage is fixed forever, in a RAG system.** A stable generator sitting behind a corpus or index that has silently gone stale (new documents never ingested, old ones expired) will show flat generator-side metrics while answer quality quietly degrades. Monitor retrieval coverage (e.g., the fraction of live queries with an adequate similarity match against a held-out test-query set) as its own signal, not folded into overall input drift.
@@ -1085,7 +1085,7 @@ Two composite incidents, each assembled from patterns that recur across postmort
 
 ### Explain PSI vs. KS in 60 seconds
 
-If you only get one minute, say this: "Both compare a reference sample to a live sample and give you one number. **PSI** bins the feature, computes what fraction of traffic falls in each bin at reference time versus now, and sums \( (l_b - r_b)\ln(l_b/r_b) \) across bins — it's a symmetrized divergence, gives you an unbounded score with industry-standard cutoffs at 0.1 and 0.2, and its big advantage is that it *localizes*: you can read off exactly which bin moved. **KS** skips binning entirely and compares the two empirical CDFs directly, taking the single largest vertical gap between them, \( D = \sup_x |F_{\text{live}}(x)-F_{\text{ref}}(x)| \) — it comes with a principled p-value, but it's most sensitive near the center of the distribution and comparatively blind in the tails, and on very large windows it gets hypersensitive, flagging trivial differences as significant. In practice: PSI for a quick, interpretable, binning-tolerant read, especially on skewed features like token counts with quantile bins; KS when you want a formal significance test and don't want to pick bin edges. Run both — they're cheap, and requiring both to agree before alerting is the single best false-positive-reduction trick available." That's the whole answer; if pressed further, add that neither applies to embeddings — for those you need MMD or a domain classifier instead.
+If you only get one minute, say this: "Both compare a reference sample to a live sample and give you one number. **PSI** bins the feature, computes what fraction of traffic falls in each bin at reference time versus now, and sums \\( (l_b - r_b)\ln(l_b/r_b) \\) across bins — it's a symmetrized divergence, gives you an unbounded score with industry-standard cutoffs at 0.1 and 0.2, and its big advantage is that it *localizes*: you can read off exactly which bin moved. **KS** skips binning entirely and compares the two empirical CDFs directly, taking the single largest vertical gap between them, \\( D = \sup_x |F_{\text{live}}(x)-F_{\text{ref}}(x)| \\) — it comes with a principled p-value, but it's most sensitive near the center of the distribution and comparatively blind in the tails, and on very large windows it gets hypersensitive, flagging trivial differences as significant. In practice: PSI for a quick, interpretable, binning-tolerant read, especially on skewed features like token counts with quantile bins; KS when you want a formal significance test and don't want to pick bin edges. Run both — they're cheap, and requiring both to agree before alerting is the single best false-positive-reduction trick available." That's the whole answer; if pressed further, add that neither applies to embeddings — for those you need MMD or a domain classifier instead.
 
 ### Extended Q&A bank (continued)
 
@@ -1094,7 +1094,7 @@ If you only get one minute, say this: "Both compare a reference sample to a live
 11. **"How would you detect that your LLM-judge itself has drifted, not your product?"** — Keep a small, fixed, human-labeled anchor set that never changes and re-score it with whatever judge is currently in use at every check. Since the anchors are frozen by construction, any movement in their scores can only be judge drift (a version bump, a prompt edit), letting you attribute an alert to `{none, system, judge}` instead of shrugging at "something moved." This is the core idea behind the 2026 "Who Drifted: the System or the Judge?" line of work — naive judge-score monitors reportedly false-alarm on the large majority of judge-only changes if this check is skipped.
 12. **"Design drift monitoring for a RAG system specifically — what's different from a plain chat endpoint?"** — Add a retrieval-coverage check: embed live queries and measure what fraction achieve an adequate similarity match against a held-out set of test/known-good queries (a documented approach uses an 85% coverage floor); a drop means the corpus or the query distribution has moved out from under the retriever, which is a distinct failure mode from the generator drifting. Monitor retrieval-hit-rate and citation/grounding rate as their own time series, not folded into a single "quality" number, since retrieval failures and generation failures need different fixes.
 13. **"Design drift monitoring for a multi-agent or long-running agent — what's different?"** — Single-turn signals (prompt length, refusal rate) under-cover an agent because the failure mode is often *behavioral*, accumulating over a trajectory rather than a single turn: repetitive tool use, abandoning the assigned role, claiming actions it didn't take, or looping. Add deterministic, cheap-to-compute trajectory signals first (tool-call diversity, state-transition legality, loop counts) and reserve an LLM-judge call for the ambiguous cases those checks can't resolve — running the judge on every turn of every trajectory is usually not affordable, and it's also the component most likely to need its own drift watch per the anchor-set point above.
-14. **"How do you keep a multi-signal monitor from crying wolf, concretely?"** — Require agreement (at least two of three independent signals firing) rather than any-single-signal alerting; gate each signal on both effect size and significance, not p-value alone; compare like-for-like calendar windows so routine seasonality doesn't trip every metric at once; and correct for multiple comparisons if you're running many tests per window, since 200 independent KS tests at \( \alpha=0.05 \) will produce roughly 10 "significant" hits by chance alone.
+14. **"How do you keep a multi-signal monitor from crying wolf, concretely?"** — Require agreement (at least two of three independent signals firing) rather than any-single-signal alerting; gate each signal on both effect size and significance, not p-value alone; compare like-for-like calendar windows so routine seasonality doesn't trip every metric at once; and correct for multiple comparisons if you're running many tests per window, since 200 independent KS tests at \\( \alpha=0.05 \\) will produce roughly 10 "significant" hits by chance alone.
 15. **"What's the actual cost profile of running all this in production, and how do you keep it cheap?"** — Scalar tests (PSI, KS, chi-square) are near-free — histograms and a CDF walk. Embedding-based tests scale with window size: centroid/cosine distance is O(n); MMD is O(n²), so subsample before computing it; a domain classifier needs retraining per window but on modest data is fast. Judge-based scoring is the expensive tier — per-call LLM cost — so sample a slice rather than scoring every request, and only escalate to the judge when the cheap deterministic/statistical layer has already flagged something ambiguous, mirroring the "deterministic gate before judge call" pattern used in production agent-monitoring writeups.
 16. **"A stakeholder asks why the drift dashboard didn't catch a known quality regression last quarter. How do you answer without being defensive?"** — Walk the taxonomy: was it input drift (should have shown on PSI/KS/embedding metrics — if it didn't, the reference or thresholds need recalibration), output drift (should show on length/refusal/latency — same fix), or concept drift (inputs and outputs both looked normal, but the mapping changed — this is the one unsupervised monitoring cannot catch by design, and the fix is a faster periodic re-eval cadence or labeled-sample tracking, not a better drift statistic).
 17. **"When would you *not* build a statistical drift monitor and just rely on periodic re-evaluation instead?"** — When request volume is too low for any test to be meaningful (KS and PSI both need hundreds-to-thousands of points per window to avoid pure noise), or when the traffic is highly non-repetitive by nature (e.g., a coding agent handling bespoke one-off tasks) such that "the distribution" is not a stable, well-defined object to test against week over week. In both cases, scheduled re-evaluation against a curated eval set, plus close tracking of a handful of scalar proxies (latency, error rate, refusal rate), is more honest than a drift score that's mostly measuring noise.
@@ -1172,9 +1172,9 @@ Talking points to narrate while drawing this: (1) the hot path is untouched — 
 | Signal in a candidate's answer | Red flag | Green flag |
 |---|---|---|
 | Reference window | "We just compare to last week's traffic" | "Fixed, curated reference from deploy/eval time, versioned, refreshed deliberately" |
-| Alerting policy | "Any metric over threshold pages on-call" | "Requires \( \ge 2 \) independent signals to agree, or persistence across windows" |
+| Alerting policy | "Any metric over threshold pages on-call" | "Requires \\( \ge 2 \\) independent signals to agree, or persistence across windows" |
 | Embeddings | "We use cosine distance on the centroid" and stops there | Names cosine/centroid as the *cheap first* signal, then names its blind spot (multimodal shifts) and reaches for a domain classifier or MMD |
-| Statistical rigor | Reports a bare KS \( D \) or MMD value with no p-value or threshold context | Distinguishes effect size from significance; calibrates embedding thresholds empirically, never from a textbook number |
+| Statistical rigor | Reports a bare KS \\( D \\) or MMD value with no p-value or threshold context | Distinguishes effect size from significance; calibrates embedding thresholds empirically, never from a textbook number |
 | Labels | Claims a drift score "proves" quality dropped | States plainly that unsupervised drift is a smoke alarm, not a diagnosis, and describes a concrete re-eval / labeling step |
 | Judge-based monitoring | Treats an LLM judge's score as ground truth | Flags that the judge itself is a versioned component and describes a frozen-anchor check to attribute drift to system vs. judge |
 | Seasonality | Never mentions it, or "we just watch for spikes" | Explicitly compares like-for-like calendar windows and can describe a false-alarm incident it caused |
@@ -1191,15 +1191,15 @@ Defaults used throughout this chapter, worth being able to recite from memory �
 | Signal | Default starting threshold | Notes |
 |---|---|---|
 | PSI | 0.1 moderate / 0.2 significant | Industry-standard, from credit-risk practice |
-| KS | \( D \ge 0.10 \) **and** \( p < 0.01 \) | Effect size and significance together, never either alone |
-| Chi-square | \( p < 0.01 \) on the count table | Categorical analogue of KS |
-| MMD | permutation \( p < 0.01 \) | The raw MMD value is meaningless without this |
-| Domain classifier | ROC-AUC \( \ge 0.65 \) | 0.5 = indistinguishable; recalibrate per embedding model |
+| KS | \\( D \ge 0.10 \\) **and** \\( p < 0.01 \\) | Effect size and significance together, never either alone |
+| Chi-square | \\( p < 0.01 \\) on the count table | Categorical analogue of KS |
+| MMD | permutation \\( p < 0.01 \\) | The raw MMD value is meaningless without this |
+| Domain classifier | ROC-AUC \\( \ge 0.65 \\) | 0.5 = indistinguishable; recalibrate per embedding model |
 | Centroid / cosine distance | calibrate empirically (e.g. P99 of known-good history) | No intrinsic scale — this chapter's illustrative demo used 0.02; a real calibration on the same data gave 0.0021 |
-| Combined alert (fusion rule) | \( \ge 2 \) of 3 independent signals agree | The single biggest false-positive-reduction lever in this chapter |
-| Judge anchor-drift | \( \|z\| \ge 2.5 \) on anchor bias | Attributes an alert to `{none, system, judge}` |
+| Combined alert (fusion rule) | \\( \ge 2 \\) of 3 independent signals agree | The single biggest false-positive-reduction lever in this chapter |
+| Judge anchor-drift | \\( \lVert z \rVert \ge 2.5 \\) on anchor bias | Attributes an alert to `{none, system, judge}` |
 | RAG retrieval coverage | below 85% of live queries matched | Per the RAGOps coverage-check approach cited above |
-| Agent tool-entropy collapse | distinct-tool-call ratio \( < 0.4 \) | Deterministic and cheap; run before any judge call |
+| Agent tool-entropy collapse | distinct-tool-call ratio \\( < 0.4 \\) | Deterministic and cheap; run before any judge call |
 
 
 ## Where this sits in the serving stack
@@ -1268,9 +1268,9 @@ Tying the tiers used throughout this chapter (and in the system-design sketch ab
 | Tier | Example checks | Per-window cost | Latency to detect | What it catches | What it misses |
 |---|---|---|---|---|---|
 | 0 — logging | request/response metadata, cheap scalars | near-zero (already logged) | n/a (raw data, not a check) | nothing by itself | — |
-| 1 — statistical | PSI, KS, chi-square on scalars | \( O(n) \) per feature, negligible | minutes to hours (batch schedule) | length/latency/topic-label shifts | semantic shifts with stable scalars |
-| 1 — embedding (cheap) | rolling centroid / cosine drift | \( O(n) \) per window | minutes to hours | topic/semantic shifts even with stable scalars | multimodal splits (centroid-only is blind to these; pair with a classifier or MMD) |
-| 1b — embedding (heavier) | MMD, domain classifier | \( O(n^2) \) (subsample) / \( O(n) \) to train | minutes to hours | any separable distributional shape shift | still no ground truth on quality |
+| 1 — statistical | PSI, KS, chi-square on scalars | \\( O(n) \\) per feature, negligible | minutes to hours (batch schedule) | length/latency/topic-label shifts | semantic shifts with stable scalars |
+| 1 — embedding (cheap) | rolling centroid / cosine drift | \\( O(n) \\) per window | minutes to hours | topic/semantic shifts even with stable scalars | multimodal splits (centroid-only is blind to these; pair with a classifier or MMD) |
+| 1b — embedding (heavier) | MMD, domain classifier | \\( O(n^2) \\) (subsample) / \\( O(n) \\) to train | minutes to hours | any separable distributional shape shift | still no ground truth on quality |
 | 2 — judge (sampled) | LLM-as-judge score on a slice | one LLM call per sampled item | hours to days (sampling cadence + judge latency) | quality/semantic-correctness proxies | the judge's own drift (needs the anchor-set check) |
 | 2b — judge (anchor-corrected) | frozen human-labeled anchors re-scored every check | one LLM call per anchor item, a small fixed set | same as above | attributes an alarm to `{none, system, judge}` | still a proxy, not ground truth |
 | 3 — human / ground truth | labeled current-traffic sample, full re-eval suite | most expensive, largely manual | days to weeks | actual quality, concept drift | too slow to be a first-detection early-warning system on its own |

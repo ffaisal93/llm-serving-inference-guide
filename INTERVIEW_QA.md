@@ -42,7 +42,7 @@ The split that matters: **prefill** processes the whole prompt at once and is co
 
 ### Q2: What is KV caching and why is it important?
 
-Prefill computes full Q, K, V for every prompt token. Decode computes Q only for the new token and reuses cached K and V. That turns an \( O(n^2) \) per-step cost into \( O(n) \): generating 100 tokens without a cache means 100 passes each reprocessing up to 100 tokens; with it, each pass processes 1 new token against the cached prefix.
+Prefill computes full Q, K, V for every prompt token. Decode computes Q only for the new token and reuses cached K and V. That turns an \\( O(n^2) \\) per-step cost into \\( O(n) \\): generating 100 tokens without a cache means 100 passes each reprocessing up to 100 tokens; with it, each pass processes 1 new token against the cached prefix.
 
 KV cache size per token ≈ `2 (K and V) × num_layers × num_kv_heads × head_dim × dtype_bytes`. For a 70B-class dense model with grouped-query attention that is still megabytes per token at long context, which is why the KV cache — not the weights — is usually the binding memory constraint at high concurrency.
 
@@ -72,7 +72,7 @@ Q is what the current token is looking for, K describes what each past token off
 Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) x V
 ```
 
-Naive attention is \( O(n^2) \) in sequence length \( n \) for both compute and the attention matrix's memory, which is why long context is expensive. Production stacks never materialize the full \( n \times n \) matrix (FlashAttention-style fused kernels) and do not waste memory on it (PagedAttention-style block KV cache).
+Naive attention is \\( O(n^2) \\) in sequence length \\( n \\) for both compute and the attention matrix's memory, which is why long context is expensive. Production stacks never materialize the full \\( n \times n \\) matrix (FlashAttention-style fused kernels) and do not waste memory on it (PagedAttention-style block KV cache).
 
 The variant ladder is MHA → MQA (one KV head) → GQA (a few KV heads shared across query heads; Llama 2/3, Mistral, most current models) → MLA (DeepSeek-V2/V3, compresses KV into a low-rank latent). GQA and MLA exist to shrink the KV cache — the real inference bottleneck — not to save training compute.
 

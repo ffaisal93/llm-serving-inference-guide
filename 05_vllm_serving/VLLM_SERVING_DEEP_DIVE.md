@@ -30,16 +30,16 @@ So the game is: *fit as many sequences' KV caches into the leftover HBM as possi
 
 Per token, the KV cache size is:
 
-\[
-\text{bytes/token} = 2 \times n_\text{layers} \times n_\text{kv\_heads} \times d_\text{head} \times \text{dtype\_bytes}
-\]
+\\[
+\text{bytes/token} = 2 \times n_\text{layers} \times n_\text{kv\\_heads} \times d_\text{head} \times \text{dtype\\_bytes}
+\\]
 
-The leading \(2\) is for K and V. Note \(n_\text{kv\_heads}\), not the number of query heads — models with **grouped-query attention (GQA)** share KV heads across query heads, which shrinks the cache dramatically.
+The leading \\(2\\) is for K and V. Note \\(n_\text{kv\\_heads}\\), not the number of query heads — models with **grouped-query attention (GQA)** share KV heads across query heads, which shrinks the cache dramatically.
 
 **Worked numbers (fp16, 2 bytes):**
 
-- **OPT-13B** (40 layers, hidden 5120, full MHA): \(2 \times 40 \times 5120 \times 2 = 819{,}200\) bytes ≈ **800 KB per token**. A single 2048-token sequence needs ~1.6 GB of KV cache — this is the number from the vLLM paper.
-- **Llama-3-8B** (32 layers, 8 KV heads, \(d_\text{head}=128\), GQA): \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes = **128 KB per token**. GQA makes it ~6× cheaper than a same-size MHA model.
+- **OPT-13B** (40 layers, hidden 5120, full MHA): \\(2 \times 40 \times 5120 \times 2 = 819{,}200\\) bytes ≈ **800 KB per token**. A single 2048-token sequence needs ~1.6 GB of KV cache — this is the number from the vLLM paper.
+- **Llama-3-8B** (32 layers, 8 KV heads, \\(d_\text{head}=128\\), GQA): \\(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\\) bytes = **128 KB per token**. GQA makes it ~6× cheaper than a same-size MHA model.
 
 **Why this matters more every year:** newer model families push KV-per-token even lower via more aggressive GQA/MQA ratios and, in some cases (DeepSeek-V2/V3's Multi-head Latent Attention) a compressed latent KV representation instead of full per-head K/V — because the whole industry has converged on the same conclusion this chapter opened with: KV cache, not weights, is what limits your batch, so every model architecture decision since ~2023 has been under pressure to shrink it. A rough sense of scale, fp16, per token:
 
@@ -106,7 +106,7 @@ A block is allocated **only when the sequence's current block fills up**. A sequ
 
 Because blocks are indirected through a block table, **two sequences can point their block tables at the same physical block**. This is where paging pays a second dividend:
 
-- **Shared prompts.** In parallel sampling or beam search, \(n\) outputs share the same prompt. Instead of \(n\) copies of the prompt's KV cache, all \(n\) block tables point at one shared set of prompt blocks. The paper reports up to **55% memory savings** on parallel sampling / beam search.
+- **Shared prompts.** In parallel sampling or beam search, \\(n\\) outputs share the same prompt. Instead of \\(n\\) copies of the prompt's KV cache, all \\(n\\) block tables point at one shared set of prompt blocks. The paper reports up to **55% memory savings** on parallel sampling / beam search.
 - **Copy-on-write (CoW).** When one sharer needs to diverge (e.g., append a different token into a shared block), vLLM copies just that one block, updates that sequence's block table, and leaves the others untouched — the same trick `fork()` uses. Reference counts on each block track sharing.
 
 This block-level sharing is the foundation that **automatic prefix caching** (below) builds on.
@@ -117,14 +117,14 @@ This block-level sharing is the foundation that **automatic prefix caching** (be
 
 Serve **Llama-3-8B in fp16 on one A100-80GB**.
 
-1. **Weights:** \(8\text{B} \times 2\ \text{bytes} = 16\ \text{GB}\).
-2. **Budget:** `--gpu-memory-utilization 0.9` → vLLM may use \(0.9 \times 80 = 72\ \text{GB}\).
+1. **Weights:** \\(8\text{B} \times 2\ \text{bytes} = 16\ \text{GB}\\).
+2. **Budget:** `--gpu-memory-utilization 0.9` → vLLM may use \\(0.9 \times 80 = 72\ \text{GB}\\).
 3. **Non-KV overhead:** CUDA context, activations, CUDA graphs — call it ~2 GB.
-4. **KV cache pool:** \(72 - 16 - 2 = 54\ \text{GB}\).
-5. **Per token:** 128 KB (from above). **Per block (16 tokens):** \(16 \times 128\ \text{KB} = 2\ \text{MB}\).
-6. **Total blocks:** \(54\ \text{GB} / 2\ \text{MB} \approx 27{,}600\) blocks = **~442,000 tokens** of KV capacity.
+4. **KV cache pool:** \\(72 - 16 - 2 = 54\ \text{GB}\\).
+5. **Per token:** 128 KB (from above). **Per block (16 tokens):** \\(16 \times 128\ \text{KB} = 2\ \text{MB}\\).
+6. **Total blocks:** \\(54\ \text{GB} / 2\ \text{MB} \approx 27{,}600\\) blocks = **~442,000 tokens** of KV capacity.
 
-That single number, ~442k tokens, is your batch budget. It can be **54 sequences at the full 8192-context** (\(442000/8192\)), or **~880 concurrent chatbot turns** averaging 500 tokens each, or anything in between. vLLM logs this at startup as `# GPU blocks: 27600` and reports "Maximum concurrency for 8192 tokens per request." Watch that log line — it tells you exactly how much headroom you bought.
+That single number, ~442k tokens, is your batch budget. It can be **54 sequences at the full 8192-context** (\\(442000/8192\\)), or **~880 concurrent chatbot turns** averaging 500 tokens each, or anything in between. vLLM logs this at startup as `# GPU blocks: 27600` and reports "Maximum concurrency for 8192 tokens per request." Watch that log line — it tells you exactly how much headroom you bought.
 
 > **Saying it out loud.** Walk the arithmetic for Llama-3-8B in fp16 on one 80-gigabyte A100. Weights are 16 gigabytes. At `--gpu-memory-utilization 0.9` vLLM may use 72. Subtract about two for CUDA context, activations, and graph capture, and you're left with 54 gigabytes of KV pool. At 128 kilobytes per token, a sixteen-token block is 2 megabytes, so 54 gigabytes is about 27,600 blocks, or roughly 442,000 tokens of KV capacity. That one number is your entire batch budget — it can be 54 sequences at full 8K context, or about 880 concurrent chat turns averaging 500 tokens, or anything between. vLLM prints it at startup as `# GPU blocks`, and watching that log line is the fastest way to know whether your config bought you the headroom you thought it did.
 
@@ -136,7 +136,7 @@ PagedAttention gives you the memory to run a big batch. Continuous batching keep
 
 ### Static batching (the naive baseline)
 
-Collect \(N\) requests, run them together, wait for **all** to finish, return, repeat. The problem: generations have wildly different lengths. If request A emits 20 tokens and request B emits 500, A's slot sits **idle for 480 steps** while B finishes, because the batch can't return or refill until the whole batch is done. GPU utilization craters, and latency for A is dictated by the slowest sibling.
+Collect \\(N\\) requests, run them together, wait for **all** to finish, return, repeat. The problem: generations have wildly different lengths. If request A emits 20 tokens and request B emits 500, A's slot sits **idle for 480 steps** while B finishes, because the batch can't return or refill until the whole batch is done. GPU utilization craters, and latency for A is dictated by the slowest sibling.
 
 ### Dynamic batching (a partial fix)
 
@@ -490,7 +490,7 @@ The single-GPU 8B walkthrough above teaches the knobs. Real "flagship" deploymen
 
 ### B.1 Sizing the problem: Llama-3.1-70B, fp16, across 2 nodes
 
-Weights: \(70\text{B} \times 2\ \text{bytes} = 140\ \text{GB}\) — bigger than any single 80 GB GPU, and even TP-8 on one 8×80GB node leaves only \(80 - 140/8 = 62.5\ \text{GB}\) per GPU before KV, activations, and overhead — workable, but tight if you also want a large `--max-model-len` and high concurrency. We'll instead spread the model across **two 8-GPU nodes (16 GPUs total)**: `-tp 8` inside each node (over NVLink) and `-pp 2` across the two nodes (over the slower inter-node fabric), per the TP-first-then-PP rule from the Parallelism section above.
+Weights: \\(70\text{B} \times 2\ \text{bytes} = 140\ \text{GB}\\) — bigger than any single 80 GB GPU, and even TP-8 on one 8×80GB node leaves only \\(80 - 140/8 = 62.5\ \text{GB}\\) per GPU before KV, activations, and overhead — workable, but tight if you also want a large `--max-model-len` and high concurrency. We'll instead spread the model across **two 8-GPU nodes (16 GPUs total)**: `-tp 8` inside each node (over NVLink) and `-pp 2` across the two nodes (over the slower inter-node fabric), per the TP-first-then-PP rule from the Parallelism section above.
 
 > **Saying it out loud.** Start from the weight math. 70 billion parameters in fp16 is 140 gigabytes, which is bigger than any single 80-gig card. TP=8 on one 8-GPU node would put 17.5 gigabytes of weights on each card, leaving around 62 for KV and overhead — workable, but tight if you also want long context and high concurrency. So you spread across two 8-GPU nodes: TP=8 inside each node over NVLink, and PP=2 across the two nodes over the slower fabric. That's the tensor-parallel-first-then-pipeline rule applied concretely. And note what drove the decision — not "it doesn't fit," because it technically does, but the KV headroom left over after it fits, which is the number that determines your actual concurrency.
 
@@ -529,7 +529,7 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --enable-prefix-caching
 ```
 
-vLLM's launcher detects the existing Ray cluster and places the 16 model-parallel workers across both nodes automatically (8 TP ranks per PP stage, one PP stage per node). Watch the startup log for **per-GPU** `# GPU blocks` — with TP-8, each GPU holds \(1/8\) of the weights and KV heads, so KV capacity is aggregated across all 8 GPUs of a TP group, not duplicated.
+vLLM's launcher detects the existing Ray cluster and places the 16 model-parallel workers across both nodes automatically (8 TP ranks per PP stage, one PP stage per node). Watch the startup log for **per-GPU** `# GPU blocks` — with TP-8, each GPU holds \\(1/8\\) of the weights and KV heads, so KV capacity is aggregated across all 8 GPUs of a TP group, not duplicated.
 
 **Topology, in words:**
 
@@ -684,7 +684,7 @@ Tie the tuning knobs back to a dollar figure, since that's what a "lowest cost p
 | AWQ 4-bit, TP2 (B.2 Option B) | 2 | $4/hr | ~1,400 tok/s (single replica, smaller batch ceiling) | $4 / (1400×3600/1e6) ≈ **$0.79** |
 | FP8, TP4, one node | 4 | $8/hr | ~1,800 tok/s | $8 / (1800×3600/1e6) ≈ **$1.23** |
 
-The arithmetic is simply \(\text{cost per 1M tokens} = \dfrac{\text{fleet \$/hr}}{\text{tokens/s} \times 3600 / 10^6}\). The point isn't that any one row is "correct" — real throughput numbers must come from your own `vllm bench serve` sweep against real traffic (section B.3), and real GPU pricing depends on your contract — it's that **this is the calculation an interviewer wants to see you reach for**, and that quantization plus right-sizing GPU count can move cost per token by 3–5× for the same model, which is usually a bigger lever than any single scheduler flag.
+The arithmetic is simply \\(\text{cost per 1M tokens} = \dfrac{\text{fleet \\$/hr}}{\text{tokens/s} \times 3600 / 10^6}\\). The point isn't that any one row is "correct" — real throughput numbers must come from your own `vllm bench serve` sweep against real traffic (section B.3), and real GPU pricing depends on your contract — it's that **this is the calculation an interviewer wants to see you reach for**, and that quantization plus right-sizing GPU count can move cost per token by 3–5× for the same model, which is usually a bigger lever than any single scheduler flag.
 
 > **Saying it out loud.** Tie the knobs to dollars, because that's what a "lowest cost per token" answer needs to produce. The arithmetic is just fleet dollars per hour divided by tokens per second times 3,600, over a million. Using roughly $2 per H100-hour as of this writing — use your own contracted rate, it moves a lot — a 16-GPU fp16 fleet at 2,000 tokens per second is about $4.44 per million output tokens, a 4-GPU FP8 setup at 1,800 tokens per second is about $1.23, and a 2-GPU AWQ 4-bit replica at 1,400 is about $0.79. The point isn't that any row is right — real throughput has to come from your own sweep. It's that quantization plus right-sizing GPU count moves cost per token by three to five times, which dwarfs any single scheduler flag.
 
@@ -832,7 +832,7 @@ It's worth being precise about *why* PagedAttention needs a custom kernel, becau
 The PagedAttention kernel therefore takes the **block table** as an input. For a query at the current position it:
 
 1. Reads the sequence's block table (logical block → physical block number).
-2. For each logical block, computes attention scores \( q \cdot k \) against the K vectors *in that physical block*, iterating block by block.
+2. For each logical block, computes attention scores \\( q \cdot k \\) against the K vectors *in that physical block*, iterating block by block.
 3. Accumulates the softmax-weighted sum of V vectors from the same blocks.
 
 Because the block is the unit of gather, the kernel does a small indirection per block (once per 16 tokens), not per token — cheap relative to the matmul. The block table lives in GPU memory alongside the cache. Modern vLLM builds this on FlashAttention/FlashInfer backends that natively accept paged KV, so you keep FlashAttention's IO-awareness *and* paging. This is the crux: paging costs almost nothing at kernel time, yet returns most of the wasted memory as usable batch.
@@ -897,7 +897,7 @@ Two architectural notes worth knowing at a glance (see section (A) for full dept
 
 ## Second worked example: Llama-3-70B across GPUs (single-node summary)
 
-An 8B model fits one card; a 70B does not. In fp16, weights alone are \( 70\text{B} \times 2 = 140\ \text{GB} \) — larger than a single 80 GB GPU. Options, in the order you should consider them (see section B for the full multi-node walkthrough):
+An 8B model fits one card; a 70B does not. In fp16, weights alone are \\( 70\text{B} \times 2 = 140\ \text{GB} \\) — larger than a single 80 GB GPU. Options, in the order you should consider them (see section B for the full multi-node walkthrough):
 
 **Option A — tensor-parallel across 4 GPUs (one node, NVLink):**
 
@@ -909,7 +909,7 @@ vllm serve meta-llama/Meta-Llama-3-70B-Instruct \
   --gpu-memory-utilization 0.92
 ```
 
-Weights shard to \( 140/4 = 35\ \text{GB} \) per GPU, leaving each card ~\( 0.92 \times 80 - 35 \approx 38\ \text{GB} \) (minus overhead) for its KV shard. KV is also split by heads across the 4 GPUs, so aggregate KV capacity is roughly 4× a single card's leftover — that is what makes big batches on 70B feasible.
+Weights shard to \\( 140/4 = 35\ \text{GB} \\) per GPU, leaving each card ~\\( 0.92 \times 80 - 35 \approx 38\ \text{GB} \\) (minus overhead) for its KV shard. KV is also split by heads across the 4 GPUs, so aggregate KV capacity is roughly 4× a single card's leftover — that is what makes big batches on 70B feasible.
 
 **Option B — quantize to AWQ 4-bit, fit on fewer GPUs:**
 
@@ -920,7 +920,7 @@ vllm serve casperhansen/llama-3-70b-instruct-awq \
   --max-model-len 8192
 ```
 
-4-bit weights are ~\( 70\text{B} \times 0.5 = 35\ \text{GB} \), fitting two 80 GB cards with room for KV. Fewer GPUs, lower cost, at some quality cost — validate on your eval set (section C.2 is a cautionary tale about skipping this step).
+4-bit weights are ~\\( 70\text{B} \times 0.5 = 35\ \text{GB} \\), fitting two 80 GB cards with room for KV. Fewer GPUs, lower cost, at some quality cost — validate on your eval set (section C.2 is a cautionary tale about skipping this step).
 
 **Option C — two nodes, TP×PP:** `--tensor-parallel-size 8 --pipeline-parallel-size 2` spreads a large model across 16 GPUs, TP within each node over NVLink and PP across the two nodes over the slower inter-node link. Section (B.2) above walks through the full Ray-based multi-node launch for exactly this configuration.
 

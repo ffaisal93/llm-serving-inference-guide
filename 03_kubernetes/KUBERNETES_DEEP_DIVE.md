@@ -626,9 +626,9 @@ A concrete sequence, the way it actually unfolds on-call — this is the "20 fre
 
 Cold-start time for a scaled-up or rescheduled pod is roughly:
 
-\[ T_{cold} = T_{provision} + T_{pull} + T_{weights} + T_{load} + T_{warmup} \]
+\\[ T_{cold} = T_{provision} + T_{pull} + T_{weights} + T_{load} + T_{warmup} \\]
 
-where \( T_{provision} \) is node acquisition (0 if a node is warm, minutes if the cluster-autoscaler must boot a GPU VM), \( T_{pull} \) is image pull, \( T_{weights} \) is fetching weights to the node, \( T_{load} \) is loading them into VRAM, and \( T_{warmup} \) is CUDA-graph capture / first-token warmup. Your **startup probe** budget must exceed \( T_{weights} + T_{load} + T_{warmup} \) (the init container covers \( T_{weights} \) separately if you split it out), and your autoscaling responsiveness is gated by the whole sum — which is why node-local caches and pre-pulled images matter so much.
+where \\( T_{provision} \\) is node acquisition (0 if a node is warm, minutes if the cluster-autoscaler must boot a GPU VM), \\( T_{pull} \\) is image pull, \\( T_{weights} \\) is fetching weights to the node, \\( T_{load} \\) is loading them into VRAM, and \\( T_{warmup} \\) is CUDA-graph capture / first-token warmup. Your **startup probe** budget must exceed \\( T_{weights} + T_{load} + T_{warmup} \\) (the init container covers \\( T_{weights} \\) separately if you split it out), and your autoscaling responsiveness is gated by the whole sum — which is why node-local caches and pre-pulled images matter so much.
 
 > **Saying it out loud.** Cold start for a GPU pod is a sum of five terms, and it's worth naming all of them: node provisioning if the autoscaler has to boot a VM, image pull, fetching the weights onto the node, loading them into VRAM, and warmup like CUDA graph capture. Two things fall out of that. Your startup probe budget has to exceed the load-plus-warmup portion, or you crash-loop a perfectly healthy pod. And your autoscaling responsiveness is gated by the entire sum — which is why a scale-up decision made in ten seconds can still take eight minutes to deliver capacity. That's the number that makes node-local weight caches and pre-pulled images worth the operational complexity: they're the only terms you can actually attack.
 

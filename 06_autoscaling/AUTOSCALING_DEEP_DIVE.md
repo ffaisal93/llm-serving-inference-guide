@@ -138,17 +138,17 @@ If that returns `no metrics returned from custom metrics API`, the problem is th
 
 HPA computes desired replicas with a simple ratio:
 
-\[
+\\[
 \text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right\rceil
-\]
+\\]
 
 With multiple metrics, HPA computes a target for each and **takes the maximum** — the metric demanding the most replicas wins. That is exactly why a fast demand signal plus a latency guardrail composes well: whichever is more stressed drives the decision.
 
 **Plugging in numbers.** Suppose a deployment currently runs 3 replicas, and the queue-depth metric averages 15 waiting requests per pod against a target of 5:
 
-\[
+\\[
 \text{desiredReplicas} = \left\lceil 3 \times \frac{15}{5} \right\rceil = \left\lceil 9 \right\rceil = 9
-\]
+\\]
 
 If, in the same cycle, the GPU-utilization metric only computes a desired count of 6, HPA takes the max of the two — 9 replicas, driven by queue depth — and that's the number that actually gets applied. This is the concrete mechanism behind "whichever signal is more stressed wins": it isn't a qualitative preference, it's this arithmetic, evaluated per metric, every sync.
 
@@ -564,7 +564,7 @@ Minutes 8–10 model a real burst (a client retry storm, or a batch job landing)
 
 **Config 3 — overly conservative queue-based (`scaleUp: 120s`, `scaleDown: 600s`)**, mirroring the longer windows some queue-based guides recommend: with a 10-minute scale-down window, at minute 16 the trailing window (minutes 7–16) is `[6, 9, 12, 12, 8, 6, 5, 5, 5, 2]`, max = 12 — replicas stay **pinned at 12** for the full window even though real demand has been back at baseline (5) since minute 13. That's three extra minutes of paying for peak capacity nobody needs, on top of the five minutes Config 2 would have already smoothed.
 
-The lesson generalizes into a sizing rule: **pick the scale-down window long enough to absorb the noise you actually observe (a single-minute lull, in this trace), but short enough that you're not bankrolling peak capacity long after a burst has visibly ended.** A useful starting point is a scale-down window of roughly \( 3\text{–}5 \times T_{cold} \) — long enough that you won't immediately need to re-pay a cold start if the burst repeats, short enough that idle GPU-minutes don't pile up. With \( T_{cold} \approx 180\text{s} \), that lands squarely on the 300s (5-minute) window this chapter recommends by default — the trace above is the empirical argument for that number, not just a rule of thumb.
+The lesson generalizes into a sizing rule: **pick the scale-down window long enough to absorb the noise you actually observe (a single-minute lull, in this trace), but short enough that you're not bankrolling peak capacity long after a burst has visibly ended.** A useful starting point is a scale-down window of roughly \\( 3\text{–}5 \times T_{cold} \\) — long enough that you won't immediately need to re-pay a cold start if the burst repeats, short enough that idle GPU-minutes don't pile up. With \\( T_{cold} \approx 180\text{s} \\), that lands squarely on the 300s (5-minute) window this chapter recommends by default — the trace above is the empirical argument for that number, not just a rule of thumb.
 
 > **Saying it out loud.** Take a twenty-minute trace with a steady baseline of five replicas' worth of demand, a real burst to twelve at minutes eight through ten, and a one-minute false-alarm dip at minute sixteen. Now compare configs. Symmetric zero-and-zero tracks the raw recommendation exactly, so the one-minute lull causes a genuine scale-down to two replicas that reverses the very next minute — a wasted cold start for something that was never a trend. The recommended asymmetric config, zero up and 300 seconds down, hits twelve immediately on the real burst but takes the max over the trailing five minutes on the way down, so it holds at six through the dip and settles correctly after. And an overly conservative ten-minute down-window stays pinned at twelve for three extra minutes after demand is clearly back at baseline. The sizing rule that falls out: scale-down window of roughly three to five times your cold-start time.
 
@@ -572,15 +572,15 @@ The lesson generalizes into a sizing rule: **pick the scale-down window long eno
 
 The Cost section's headroom formula is:
 
-\[
+\\[
 \text{buffer replicas} = \left\lceil \frac{\Delta(\text{req/s over } T_{cold})}{\text{capacity per replica}} \right\rceil
-\]
+\\]
 
-Run it against the *actual* burst from the trace above instead of a hypothetical rate. From minute 7 to minute 9 the raw recommendation climbed from 6 replicas to 12 replicas — a demand growth of 6 replicas in 2 minutes, or 3 replicas/minute. Over a cold-start time \( T_{cold} = 180\text{s} = 3\text{ min} \), if you were starting from a cold floor rather than already having 6 replicas warm, you'd need:
+Run it against the *actual* burst from the trace above instead of a hypothetical rate. From minute 7 to minute 9 the raw recommendation climbed from 6 replicas to 12 replicas — a demand growth of 6 replicas in 2 minutes, or 3 replicas/minute. Over a cold-start time \\( T_{cold} = 180\text{s} = 3\text{ min} \\), if you were starting from a cold floor rather than already having 6 replicas warm, you'd need:
 
-\[
+\\[
 \text{buffer replicas} = 3 \text{ replicas/min} \times 3 \text{ min} = 9
-\]
+\\]
 
 Added to a steady-state floor of 5, that's a **warm floor of 14 replicas** to fully absorb this burst without any request ever waiting on a cold start — which exceeds the `maxReplicas: 12` ceiling used in every manifest earlier in this chapter. That's not a contrived result; it's the headroom math doing its job. It surfaces, *before* an incident, that the quota this chapter's example manifests assumed is actually undersized for the worst burst rate this traffic shape produces. The three honest responses, in order of preference:
 
@@ -594,19 +594,19 @@ Added to a steady-state floor of 5, that's a **warm floor of 14 replicas** to fu
 
 Every target value picked in this chapter — 5 waiting requests per pod, 8 concurrent requests per replica — is an application of queueing theory's most useful identity, **Little's Law**:
 
-\[
+\\[
 L = \lambda \times W
-\]
+\\]
 
-where \(L\) is the average number of requests in the system (waiting plus in flight), \(\lambda\) is the arrival rate the system is sustaining (throughput), and \(W\) is the average time each request spends in the system — for a streaming LLM response, roughly TTFT plus generation time.
+where \\(L\\) is the average number of requests in the system (waiting plus in flight), \\(\lambda\\) is the arrival rate the system is sustaining (throughput), and \\(W\\) is the average time each request spends in the system — for a streaming LLM response, roughly TTFT plus generation time.
 
-Rearranged, it tells you directly what a concurrency or queue-depth *target* should be once you've fixed a latency SLO. If a single replica can sustain throughput \(\lambda_{replica}\) at your target latency \(W_{SLO}\), the maximum in-flight population that replica can carry without breaching the SLO is
+Rearranged, it tells you directly what a concurrency or queue-depth *target* should be once you've fixed a latency SLO. If a single replica can sustain throughput \\(\lambda_{replica}\\) at your target latency \\(W_{SLO}\\), the maximum in-flight population that replica can carry without breaching the SLO is
 
-\[
+\\[
 L_{replica} = \lambda_{replica} \times W_{SLO}
-\]
+\\]
 
-That is precisely what the Knative example's `containerConcurrency`/`target` pair, and the HPA/KEDA `averageValue` targets, are estimating — a defensible target isn't a round number, it falls out of \(\lambda_{replica} \times W_{SLO}\) measured from a load test. Concretely: a replica sustaining 8 requests/second of throughput at roughly a 1-second average time-in-system is, by Little's Law, carrying an average population of about 8 requests at any instant — which is exactly why `target: 8` shows up as this chapter's Knative concurrency target earlier. The number was never arbitrary; it falls out of the throughput and latency actually measured for the model and hardware in question.
+That is precisely what the Knative example's `containerConcurrency`/`target` pair, and the HPA/KEDA `averageValue` targets, are estimating — a defensible target isn't a round number, it falls out of \\(\lambda_{replica} \times W_{SLO}\\) measured from a load test. Concretely: a replica sustaining 8 requests/second of throughput at roughly a 1-second average time-in-system is, by Little's Law, carrying an average population of about 8 requests at any instant — which is exactly why `target: 8` shows up as this chapter's Knative concurrency target earlier. The number was never arbitrary; it falls out of the throughput and latency actually measured for the model and hardware in question.
 
 > **Saying it out loud.** Every target in this chapter — five waiting requests per pod, eight concurrent per replica — is Little's Law applied. The law says the average population in the system equals arrival rate times average time in system, and rearranged it tells you directly what a concurrency target should be once you've fixed a latency SLO: max in-flight per replica equals that replica's sustainable throughput times your latency target. Concretely, a replica sustaining eight requests per second at roughly a one-second time-in-system is carrying about eight requests at any instant — which is exactly where the `target: 8` in the Knative example came from. The point to make in an interview: a defensible target isn't a round number you liked, it falls out of throughput times latency measured on your actual hardware.
 
@@ -618,7 +618,7 @@ Interviewers routinely ask "how did you pick that number?" — here is the deriv
 |---|---|---|---|---|---|---|---|---|
 | p95 TTFT (s) | 0.4 | 0.5 | 0.6 | 0.8 | 1.1 | 1.6 | 2.4 | 3.8 |
 
-Against an SLO of p95 TTFT \( \le 1.5 \) s, concurrency 12 already breaches it (1.6 s) while concurrency 10 is still safe (1.1 s) — the curve's knee sits between the two, as it typically does once KV-cache pressure and batching contention start to dominate. Pick the target *below* the knee, not at it, to leave slack for the seconds between "queue starts growing" and "new replica is ready": a target of 8–10 gives roughly 20–35% headroom under the last safe measured point. This is the same derivation this chapter used to justify `target: 8` in the Knative manifest, and per Little's Law above, an 8-request target at roughly 0.8s average time-in-system corresponds to a sustained per-replica throughput of \(\lambda_{replica} = L / W \approx 8 / 0.8 = 10\) requests/second — a number you can now cross-check independently against the load test's own throughput measurement at that concurrency level, and treat any large mismatch as a sign the load test or the target needs a second look.
+Against an SLO of p95 TTFT \\( \le 1.5 \\) s, concurrency 12 already breaches it (1.6 s) while concurrency 10 is still safe (1.1 s) — the curve's knee sits between the two, as it typically does once KV-cache pressure and batching contention start to dominate. Pick the target *below* the knee, not at it, to leave slack for the seconds between "queue starts growing" and "new replica is ready": a target of 8–10 gives roughly 20–35% headroom under the last safe measured point. This is the same derivation this chapter used to justify `target: 8` in the Knative manifest, and per Little's Law above, an 8-request target at roughly 0.8s average time-in-system corresponds to a sustained per-replica throughput of \\(\lambda_{replica} = L / W \approx 8 / 0.8 = 10\\) requests/second — a number you can now cross-check independently against the load test's own throughput measurement at that concurrency level, and treat any large mismatch as a sign the load test or the target needs a second look.
 
 > **Saying it out loud.** "How did you pick that number" is a routine interview question, and here's the derivation. Sweep concurrency per replica in a load test and record p95 TTFT at each level. Against a p95 TTFT SLO of 1.5 seconds, you'll typically find something like concurrency 10 still safe at 1.1 seconds and concurrency 12 already breaching at 1.6 — the knee sits between them, as it usually does once KV-cache pressure and batching contention take over. Then you pick your target *below* the knee, not at it: 8 to 10 gives roughly 20 to 35 percent headroom, which is the slack you need to cover the seconds between the queue growing and a new replica being ready. Setting the target at the knee means every scale-up starts from an already-breaching state.
 
@@ -693,27 +693,27 @@ Every autoscaling decision is a bet on this tradeoff. Warm replicas cost money e
 
 ### A worked calculation
 
-Suppose one H100 replica costs about \( \$3.50 \) per hour and serves a steady \( 20 \) requests/second at your latency SLO. Your traffic is \( 20 \) req/s for 8 business hours and near-zero the other 16.
+Suppose one H100 replica costs about \\( \\$3.50 \\) per hour and serves a steady \\( 20 \\) requests/second at your latency SLO. Your traffic is \\( 20 \\) req/s for 8 business hours and near-zero the other 16.
 
 **Option A — always-on flat fleet.** Provision for peak, run 24/7:
 
-\[
-\text{Cost}_A = 1 \text{ replica} \times \$3.50/\text{hr} \times 24 \text{ hr} = \$84 \text{ per day}
-\]
+\\[
+\text{Cost}_A = 1 \text{ replica} \times \\$3.50/\text{hr} \times 24 \text{ hr} = \\$84 \text{ per day}
+\\]
 
 **Option B — autoscale with a warm floor.** Keep `minReplicas = 1` only during the 8 busy hours, scale to zero otherwise. Assume the 16 idle hours truly cost nothing:
 
-\[
-\text{Cost}_B = 1 \times \$3.50 \times 8 = \$28 \text{ per day}
-\]
+\\[
+\text{Cost}_B = 1 \times \\$3.50 \times 8 = \\$28 \text{ per day}
+\\]
 
 That's a **67% saving** — but it buys a cold start on the *first* request each morning and after any midday lull. If the SLO forbids a multi-minute first response, you instead keep a warm floor 24/7 and land back near Option A, or you spend engineering effort on snapshot/fast-load so scale-to-zero becomes safe.
 
-**Headroom sizing.** To absorb bursts without waiting on a cold start, provision a buffer. If your scale-up (schedule + pull + load + warm) takes \( T_{cold} = 180 \) s and traffic can climb at \( 2 \) req/s², a replica in flight can't help for 3 minutes. Size the warm buffer to cover demand growth over \( T_{cold} \):
+**Headroom sizing.** To absorb bursts without waiting on a cold start, provision a buffer. If your scale-up (schedule + pull + load + warm) takes \\( T_{cold} = 180 \\) s and traffic can climb at \\( 2 \\) req/s², a replica in flight can't help for 3 minutes. Size the warm buffer to cover demand growth over \\( T_{cold} \\):
 
-\[
+\\[
 \text{buffer replicas} = \left\lceil \frac{\Delta(\text{req/s over } T_{cold})}{\text{capacity per replica}} \right\rceil
-\]
+\\]
 
 The general shape: **provisioned floor covers the baseline, headroom buffer covers what arrives during a cold start, and autoscaling handles the sustained ramp.** Tune the floor and buffer to the *cost of a missed SLO*, not to a generic utilization target. See the fully worked version of this calculation, against an actual traffic shape, in "Build It in Practice — Extended" above.
 
@@ -824,14 +824,14 @@ A condensed version of every number this chapter derived, for when you're sketch
 | Primary signal | Queue depth (`num_requests_waiting`) or concurrency | Leading indicator, not lagging |
 | Guardrail signal | p95/p99 TTFT or latency | Catches what the primary signal misses (see War Story 1) |
 | `scaleUp.stabilizationWindowSeconds` | 0 | Never hesitate on real demand — cold starts already make you slow |
-| `scaleDown.stabilizationWindowSeconds` | 300 (5 min) | ≈ \(3\text{–}5 \times T_{cold}\); absorbs noise without hoarding capacity (see trace walkthrough) |
+| `scaleDown.stabilizationWindowSeconds` | 300 (5 min) | ≈ \\(3\text{–}5 \times T_{cold}\\); absorbs noise without hoarding capacity (see trace walkthrough) |
 | `scaleUp` step cap | +4 pods / 60s (or similar) | Prevents a thundering herd on shared weight storage |
 | `scaleDown` step cap | 1 pod / 120s | GPUs are expensive to churn; err toward stickiness |
 | KEDA `activationThreshold` | 1 | One real request is enough to justify the first replica |
 | `minReplicas` / warm floor | steady-state baseline, sized from real traffic | Never cold-start the interactive hot path |
-| Warm-pool buffer | \(\lceil \Delta(\text{req/s over } T_{cold}) / \text{capacity per replica} \rceil\) | Covers demand growth during the unavoidable cold-start window |
+| Warm-pool buffer | \\(\lceil \Delta(\text{req/s over } T_{cold}) / \text{capacity per replica} \rceil\\) | Covers demand growth during the unavoidable cold-start window |
 | `maxReplicas` / node pool ceiling | actual GPU quota, alerted on `Pending` | A cap you can't hit is worse than no cap — it fails silently |
-| Concurrency/queue-depth target | \(\lambda_{replica} \times W_{SLO}\) from a load-test sweep, with ~20–35% margin below the SLO knee | Derived, not guessed (Little's Law) |
+| Concurrency/queue-depth target | \\(\lambda_{replica} \times W_{SLO}\\) from a load-test sweep, with ~20–35% margin below the SLO knee | Derived, not guessed (Little's Law) |
 | KEDA workload shape | `ScaledObject` for live-request pools, `ScaledJob` for run-to-completion batch units | Matches the scaling primitive to the actual unit of work |
 | Cost visibility | Pod-level GPU cost allocation (OpenCost/Kubecost) reviewed against actual utilization | Turns "the warm floor feels expensive" into a number, and a feedback loop for re-sizing it |
 
@@ -857,17 +857,17 @@ Use it as a checklist when reviewing someone else's config, too: for each row, a
 ### Deeper Q&A (9–18): mechanism internals and judgment calls
 
 9. **"Explain HPA's `AverageValue` vs `Value` metric types — why does the distinction matter for a growing fleet?"** — `AverageValue` divides the metric by current replica count before comparing to target, so the target stays meaningful as you scale (5 waiting requests *per pod*, regardless of fleet size). `Value` compares the raw number directly — use it only when the query already returns a per-pod figure, otherwise a `sum()` across a growing fleet will make HPA think demand is exploding (or never scale at all) purely because the denominator changed.
-10. **"Walk me through HPA's desired-replicas formula."** — \( \text{desiredReplicas} = \lceil \text{currentReplicas} \times \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \rceil \), computed per metric, then HPA takes the **max** across all configured metrics — whichever metric wants the most replicas wins that cycle.
+10. **"Walk me through HPA's desired-replicas formula."** — \\( \text{desiredReplicas} = \lceil \text{currentReplicas} \times \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \rceil \\), computed per metric, then HPA takes the **max** across all configured metrics — whichever metric wants the most replicas wins that cycle.
 11. **"What is KEDA's `activationThreshold` and how does it differ from `threshold`?"** — `activationThreshold` gates the 0→1 transition (waking a scaled-to-zero deployment); `threshold` governs the 1→N scaling once at least one replica is running. Setting `activationThreshold` low (e.g. "1") means a single stray request can wake a cold GPU — intentional if you want zero missed requests, costly if bots or health-checks are the "stray" traffic.
 12. **"How would you scale to zero safely for an interactive LLM endpoint?"** — Generally: don't, unless a snapshot/checkpoint-restore path gets you to low-single-digit-second restores (per the serverless-GPU comparison in the Landscape section). Otherwise keep `minReplicaCount ≥ 1` on the interactive path and reserve true scale-to-zero for batch/internal/dev traffic.
 13. **"Explain Knative's panic mode and `target-burst-capacity`."** — Panic mode is a short window where KPA evaluates demand over a much shorter horizon than its normal window, so it reacts to sharp spikes faster than its steady-state smoothing would allow. `target-burst-capacity` sets how much traffic the activator is willing to buffer (holding requests, not dropping them) while new replicas spin up — higher values trade a little steady-state latency for burst safety.
 14. **"How do you avoid a thundering herd when many replicas cold-start at once?"** — Cap the scale-up step size (`policies: [{type: Pods, value: N, periodSeconds: 60}]`) so replicas come up in waves rather than all at once, pre-pull/cache images and weights on nodes, and adopt weight streaming so each replica's load phase is short even under shared-storage contention. Reference the concrete before/after numbers (294s → 82s) from the cold-start war story.
-15. **"How would you size a warm pool / min-replica floor mathematically, not by gut feel?"** — Take the observed worst-case demand growth rate (replicas or req/s per minute) from real traffic data, multiply by your cold-start time \( T_{cold} \) to get the buffer needed to fully absorb a burst with zero cold starts, and add it to your steady-state floor. Then sanity-check the result against your actual `maxReplicas`/GPU quota — the worked calculation above shows this can reveal the quota itself is undersized.
+15. **"How would you size a warm pool / min-replica floor mathematically, not by gut feel?"** — Take the observed worst-case demand growth rate (replicas or req/s per minute) from real traffic data, multiply by your cold-start time \\( T_{cold} \\) to get the buffer needed to fully absorb a burst with zero cold starts, and add it to your steady-state floor. Then sanity-check the result against your actual `maxReplicas`/GPU quota — the worked calculation above shows this can reveal the quota itself is undersized.
 16. **"What's wrong with scaling on GPU utilization alone?"** — It's lagging and coarse: 100% utilization can mean "efficiently batched and totally healthy" or "drowning," and it doesn't distinguish the two. It's a good hardware-truth cross-check, a poor sole trigger.
 17. **"If a `ScaledObject` has both a Cron trigger and a Prometheus trigger, which one wins?"** — Neither "wins" outright — KEDA scales to satisfy whichever trigger currently demands more replicas, same principle as HPA's multi-metric max. The Cron trigger guarantees a floor during its window; the Prometheus trigger can still scale above that floor if real demand exceeds the scheduled baseline.
 18. **"What would you monitor to know your autoscaling configuration itself is broken — not just the app?"** — Alert on: HPA/KEDA unable to fetch the custom/external metric (stale or missing readings), GPU pods stuck `Pending` against `maxReplicas`, replica-count churn rate (a proxy for flapping), and time-to-ready per new replica (a proxy for whether your cold-start mitigations are actually working in production, not just in a benchmark).
 19. **"How does continuous batching change what a 'per-replica capacity' number even means?"** — It means capacity isn't a fixed request count; it's shaped by the mix of prompt/generation lengths currently in the batch and, if multiple models or LoRA adapters share a replica, by which are currently loaded. A threshold derived from one workload mix can silently overstate capacity under a different mix — re-validate thresholds against your actual production traffic composition, not a single synthetic benchmark.
-20. **"Give me Little's Law and tell me why it matters here."** — \( L = \lambda \times W \): average in-system population equals arrival rate times average time in system. It matters because it turns "what concurrency/queue-depth target should I set?" from a guess into a calculation — measure your per-replica throughput and target latency from a load test, multiply them, and that product is a defensible target, not a round number.
+20. **"Give me Little's Law and tell me why it matters here."** — \\( L = \lambda \times W \\): average in-system population equals arrival rate times average time in system. It matters because it turns "what concurrency/queue-depth target should I set?" from a guess into a calculation — measure your per-replica throughput and target latency from a load test, multiply them, and that product is a defensible target, not a round number.
 
 ### System design prompt
 
@@ -899,7 +899,7 @@ A strong answer sketches a **tiered** system rather than a single mechanism:
 
 Talking points an interviewer wants to hear, in rough priority order:
 
-- **Warm floor sized off real data**, not a round number — derived from the steady-state baseline plus a headroom buffer covering \(T_{cold}\) of demand growth (the worked calculation above).
+- **Warm floor sized off real data**, not a round number — derived from the steady-state baseline plus a headroom buffer covering \\(T_{cold}\\) of demand growth (the worked calculation above).
 - **Cron-scheduled pre-warming** ahead of the known daily ramp, layered under a **reactive Prometheus trigger** for anything the schedule doesn't predict — including the viral spike case.
 - **Composite scaling signals**: queue depth as the leading trigger, KV-cache usage as an earlier-than-queue warning for memory pressure, p95 latency as the final guardrail — not any single metric alone (see war story 1).
 - **A capped, staggered scale-up** so a viral spike doesn't create a thundering herd on the weight store (see war story 2), paired with weight streaming to shrink whatever cold start still has to happen.
@@ -944,7 +944,7 @@ The point of asking this as a follow-up is to check whether a candidate memorize
 | Red flag | Green flag |
 |---|---|
 | Scales on CPU utilization | Scales on queue depth / concurrency, with a latency guardrail |
-| Symmetric scale-up/scale-down windows | Aggressive scale-up (near-0s), conservative scale-down (300s+), justified against \(T_{cold}\) |
+| Symmetric scale-up/scale-down windows | Aggressive scale-up (near-0s), conservative scale-down (300s+), justified against \\(T_{cold}\\) |
 | A single scaling signal | Composite signals covering different failure modes (queue depth *and* KV-cache/preemption *and* latency) |
 | `maxReplicas` picked arbitrarily ("seemed like enough") | `maxReplicas` tied to real GPU quota, with alerting on `Pending` GPU pods |
 | Cold-start time unknown or unmeasured | Cold-start phases measured and broken down (schedule/pull/load/warm), with a named mitigation for the dominant phase |
@@ -964,7 +964,7 @@ The point of asking this as a follow-up is to check whether a candidate memorize
 3. **Asymmetric behavior beats symmetric behavior.** Fast scale-up, slow scale-down — justified against your measured cold-start time, not a framework default — is the single highest-leverage tuning decision in this chapter.
 4. **Composite signals beat a single signal.** Queue depth alone missed the KV-cache-preemption incident in War Story 1; the fix was adding a second, faster-moving signal, not replacing the first.
 5. **`maxReplicas` needs a node-level counterpart.** Pod-level and node-level (Karpenter/cluster-autoscaler) scaling are two different control loops with two different response times — War Story 3 is what happens when only one is designed deliberately.
-6. **Targets should be derived, not guessed.** Little's Law (\(L = \lambda \times W\)) turns a load-test sweep into a defensible concurrency or queue-depth target.
+6. **Targets should be derived, not guessed.** Little's Law (\\(L = \lambda \times W\\)) turns a load-test sweep into a defensible concurrency or queue-depth target.
 7. **2025–2026 tooling is converging on these same lessons**, just expressed through new knobs: AIBrix's fluctuation-tolerance parameters, Dynamo's per-pool prefill/decode signals, and KEDA's Cron and predictive layers are all restatements of "lead with a demand signal, dampen oscillation, and plan for known patterns" rather than replacements for understanding why.
 8. **Validate the config before production traffic does it for you** — replay a trace-shaped load, kill the metrics pipeline on purpose, and force a real cold start from a real floor, rather than trusting the manifest alone.
 
@@ -987,7 +987,7 @@ The point of asking this as a follow-up is to check whether a candidate memorize
 | **Preemption** | vLLM evicting an in-flight request's KV-cache entries to free memory for others, effectively restarting that request |
 | **Continuous batching** | Iteration-level batching where new requests join a running batch between decode steps, rather than waiting for the batch to fully drain |
 | **Disaggregated serving** | Splitting prefill (compute-bound) and decode (memory-bandwidth-bound) onto separate GPU pools, scaled independently |
-| **Little's Law** | \( L = \lambda \times W \) — ties average in-system population, throughput, and time-in-system together; the theoretical basis for concurrency/queue-depth targets |
+| **Little's Law** | \\( L = \lambda \times W \\) — ties average in-system population, throughput, and time-in-system together; the theoretical basis for concurrency/queue-depth targets |
 | **Snapshot/checkpoint-restore** | Capturing an already-warmed process (CUDA context, weights resident in VRAM) and restoring it directly, skipping the load and warm-up phases on subsequent starts |
 | **DCGM** | NVIDIA's Data Center GPU Manager — the source of `dcgm-exporter`'s Prometheus GPU metrics (utilization, memory) |
 | **MIG** | NVIDIA Multi-Instance GPU — hardware partitioning of one physical GPU into several isolated instances, each schedulable as a separate `nvidia.com/gpu` unit |

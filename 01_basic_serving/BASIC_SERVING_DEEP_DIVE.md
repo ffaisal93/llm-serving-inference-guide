@@ -130,7 +130,7 @@ The decode phase being memory-bound and low-utilization is *exactly* why one-req
 
 ### Why the KV cache exists
 
-Without a cache, generating token *N* would re-run attention over all *N* prior tokens from scratch — an \(O(N^2)\) blowup over a full sequence. The KV cache trades memory for compute: store each token's K and V once, reuse them for every future step. It turns per-step attention cost from "re-read and recompute everything" into "read the cache." The price is GPU memory that grows linearly with every token in every active request — which becomes the binding constraint on how many requests you can serve at once.
+Without a cache, generating token *N* would re-run attention over all *N* prior tokens from scratch — an \\(O(N^2)\\) blowup over a full sequence. The KV cache trades memory for compute: store each token's K and V once, reuse them for every future step. It turns per-step attention cost from "re-read and recompute everything" into "read the cache." The price is GPU memory that grows linearly with every token in every active request — which becomes the binding constraint on how many requests you can serve at once.
 
 > **Saying it out loud.** The KV cache is a straight memory-for-compute trade. Without it, generating token N means re-running attention over all N previous tokens from scratch, which is quadratic over a full sequence and completely wasteful, since those keys and values never change once computed. So you compute each token's key and value once and keep them around. The catch is that the cache grows linearly with every token in every active request and it only ever grows during a request — so on a typical 7B model it's about half a megabyte per token, meaning one 4K-context request is roughly 2 GB. That's why concurrency in LLM serving is almost always capped by memory, not by FLOPs.
 
@@ -618,7 +618,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Run the server, then in another shell `python loadtest.py`. With `MAX_CONCURRENT_GENERATIONS = 3` and `CONCURRENCY = 10`, expect to *see* the serialization directly: p50 will be close to a single request's latency, but p95/p99 will be roughly \(3\times\) to \(4\times\) higher, because the 4th-through-10th concurrent caller queue behind the semaphore for one or more full generation cycles before their own request even starts. If you push `N_REQUESTS`/`CONCURRENCY` high enough to exceed `MAX_QUEUE_DEPTH`, you will start seeing `shed_503 > 0` — the bounded queue doing exactly its job instead of the process quietly ballooning. That gap between p50 and p99 **is** the naive server's serial bottleneck, measured instead of asserted — and it is the number continuous batching (Chapter 5) exists to close.
+Run the server, then in another shell `python loadtest.py`. With `MAX_CONCURRENT_GENERATIONS = 3` and `CONCURRENCY = 10`, expect to *see* the serialization directly: p50 will be close to a single request's latency, but p95/p99 will be roughly \\(3\times\\) to \\(4\times\\) higher, because the 4th-through-10th concurrent caller queue behind the semaphore for one or more full generation cycles before their own request even starts. If you push `N_REQUESTS`/`CONCURRENCY` high enough to exceed `MAX_QUEUE_DEPTH`, you will start seeing `shed_503 > 0` — the bounded queue doing exactly its job instead of the process quietly ballooning. That gap between p50 and p99 **is** the naive server's serial bottleneck, measured instead of asserted — and it is the number continuous batching (Chapter 5) exists to close.
 
 > **Saying it out loud.** "This server serializes under load" should be a measurement, not folklore — and it takes about thirty lines to prove. You fire N requests through a fixed number of concurrent clients and report p50, p95, and p99, never the average, because the average is exactly the statistic that hides a starved tail. What you'll see with a concurrency gate of three and ten simultaneous callers is a p50 near a single request's latency and a p99 roughly three to four times higher, because callers four through ten are waiting through entire generation cycles before theirs even starts. That gap between p50 and p99 *is* the serial bottleneck, and closing it is precisely what continuous batching exists to do.
 
@@ -660,15 +660,15 @@ You cannot reason about serving without the memory math. The GPU must simultaneo
 
 ### Weights
 
-\[
+\\[
 \text{weight bytes} = (\text{number of parameters}) \times (\text{bytes per parameter})
-\]
+\\]
 
 For a 7-billion-parameter model in BF16:
 
-\[
+\\[
 7 \times 10^{9} \ \text{params} \times 2 \ \text{bytes} = 14 \times 10^{9} \ \text{bytes} \approx 14 \ \text{GB}
-\]
+\\]
 
 The rule of thumb "~2 GB per billion params in FP16/BF16" (and ~1 GB/B in INT8, ~0.5 GB/B in INT4) falls straight out of this.
 
@@ -676,23 +676,23 @@ The rule of thumb "~2 GB per billion params in FP16/BF16" (and ~1 GB/B in INT8, 
 
 The KV cache stores a key and a value vector for every token, every layer, every KV head:
 
-\[
+\\[
 \text{bytes per token} = 2 \times L \times H_{kv} \times D_{h} \times b
-\]
+\\]
 
-where the leading \(2\) covers **K and V**, \(L\) is the number of transformer layers, \(H_{kv}\) the number of key/value heads, \(D_{h}\) the head dimension, and \(b\) the bytes per element. For a LLaMA-style 7B model with \(L = 32\), \(H_{kv} = 32\), \(D_{h} = 128\), BF16 (\(b = 2\)):
+where the leading \\(2\\) covers **K and V**, \\(L\\) is the number of transformer layers, \\(H_{kv}\\) the number of key/value heads, \\(D_{h}\\) the head dimension, and \\(b\\) the bytes per element. For a LLaMA-style 7B model with \\(L = 32\\), \\(H_{kv} = 32\\), \\(D_{h} = 128\\), BF16 (\\(b = 2\\)):
 
-\[
+\\[
 2 \times 32 \times 32 \times 128 \times 2 = 524{,}288 \ \text{bytes} \approx 0.5 \ \text{MB per token}
-\]
+\\]
 
 For a request with a full context of 4,096 tokens:
 
-\[
+\\[
 4096 \times 524{,}288 \ \text{bytes} = 2{,}147{,}483{,}648 \ \text{bytes} = 2 \ \text{GB}
-\]
+\\]
 
-So a single 4K-context request costs **~2 GB of KV cache on top of the 14 GB of weights**. Note that models using grouped-query attention (GQA) have far fewer KV heads \(H_{kv}\) than query heads, which is *specifically* a trick to shrink this number — one reason modern models are cheaper to serve. As a concrete comparison: if the same architecture used full multi-head attention with \(H_{kv}\) equal to 32 query heads unchanged, doubling \(H_{kv}\) doubles KV-cache bytes per token linearly — GQA with, say, 8 KV heads instead of 32 shrinks the same request's KV cache fourfold, from 2 GB to 0.5 GB, which is the difference between fitting 4 concurrent long requests and fitting 16.
+So a single 4K-context request costs **~2 GB of KV cache on top of the 14 GB of weights**. Note that models using grouped-query attention (GQA) have far fewer KV heads \\(H_{kv}\\) than query heads, which is *specifically* a trick to shrink this number — one reason modern models are cheaper to serve. As a concrete comparison: if the same architecture used full multi-head attention with \\(H_{kv}\\) equal to 32 query heads unchanged, doubling \\(H_{kv}\\) doubles KV-cache bytes per token linearly — GQA with, say, 8 KV heads instead of 32 shrinks the same request's KV cache fourfold, from 2 GB to 0.5 GB, which is the difference between fitting 4 concurrent long requests and fitting 16.
 
 > **Saying it out loud.** The KV cache formula is two — for keys and values — times layers, times KV heads, times head dimension, times bytes per element, and that gives you bytes per token. For a classic 7B model with 32 layers, 32 KV heads, head dim 128, in BF16, that works out to about half a megabyte per token, so a 4,096-token request is roughly 2 GB. The interesting term is the KV head count, because grouped-query attention deliberately shrinks it — dropping from 32 KV heads to 8 cuts that request's cache fourfold, from 2 GB down to 0.5 GB. That's the difference between fitting four concurrent long requests and fitting sixteen on the same card, which is why GQA is a serving-cost decision, not a model-card footnote.
 
@@ -702,9 +702,9 @@ Beyond weights and KV cache, each forward pass allocates transient **activation*
 
 ### Putting it together on a 24 GB GPU
 
-\[
+\\[
 \text{free for KV + activations} \approx 24 \ \text{GB} - 14 \ \text{GB (weights)} - \sim 1\text{–}2 \ \text{GB (activations, CUDA ctx)} \approx 8 \ \text{GB}
-\]
+\\]
 
 At ~2 GB per 4K-token request, that GPU holds on the order of **4 concurrent full-length requests** before OOM — and fewer if prompts are longer. This is precisely where `MAX_CONCURRENT_GENERATIONS = 3` in Section B's server came from — a deliberately conservative choice below the theoretical ceiling of ~4, to leave headroom for activation spikes and fragmentation rather than run at the edge. This single calculation is why KV-cache efficiency (PagedAttention, Chapter 5) is the highest-leverage optimization in LLM serving: memory, not compute, usually caps your concurrency.
 
@@ -716,10 +716,10 @@ At ~2 GB per 4K-token request, that GPU holds on the order of **4 concurrent ful
 
 The same 24 GB-GPU calculation above assumed BF16 weights. Quantization is the other big lever, and it is worth running the numbers once so the tradeoff is concrete rather than a slogan ("quantize to fit more"). Take the same 7B model, same 24 GB GPU, same ~2 GB-per-4K-token-request KV cache (quantizing weights does not by itself shrink KV-cache dtype unless you separately quantize the cache):
 
-\[
+\\[
 \text{INT8 weights} = 7 \times 10^{9} \times 1 \ \text{byte} = 7 \ \text{GB}, \qquad
 \text{free for KV} \approx 24 - 7 - 1.5 \approx 15.5 \ \text{GB}
-\]
+\\]
 
 At ~2 GB per request, that is room for roughly **7–8 concurrent full-length requests**, up from ~4 in BF16 — nearly double the concurrency on identical hardware, at the cost of some generation quality (INT8 post-training quantization is usually a small, workload-dependent quality hit; validate it against your own eval set rather than assuming it is free). Push to INT4 and weights drop to ~3.5 GB, freeing room for on the order of 15+ concurrent requests on the same GPU. This is the concrete version of the "quantization vs. smaller model" interview question below: quantizing a 7B model to INT8 and running a smaller, unquantized 3B model in BF16 can land at similar total memory, but they are not equivalent — quantization keeps the larger model's capability at a precision cost, while a smaller model changes the capability itself. Which one wins depends on whether your bottleneck is quality or throughput per request, and the only way to know is to measure both against your task.
 
@@ -734,9 +734,9 @@ You cannot improve what you do not measure. Four numbers define an LLM endpoint.
 | Metric | Definition | Formula |
 |--------|------------|---------|
 | **TTFT** (time to first token) | Prompt submitted -> first output token received. Dominated by queueing + prefill. | measured directly |
-| **TPOT / ITL** (time per output token / inter-token latency) | Average gap between successive output tokens in the "steady stream." | \(\text{TPOT} = \dfrac{\text{E2E} - \text{TTFT}}{N_{out} - 1}\) |
-| **E2E latency** | Request in -> full response out. | \(\text{E2E} = \text{TTFT} + \text{generation time}\) |
-| **Throughput** | Tokens or requests completed per second, across all concurrent users. | \(\text{TPS} = \dfrac{N_{out}}{T_{last} - T_{first}}\), \(\ \text{RPS} = \dfrac{\text{completed requests}}{\text{time}}\) |
+| **TPOT / ITL** (time per output token / inter-token latency) | Average gap between successive output tokens in the "steady stream." | \\(\text{TPOT} = \dfrac{\text{E2E} - \text{TTFT}}{N_{out} - 1}\\) |
+| **E2E latency** | Request in -> full response out. | \\(\text{E2E} = \text{TTFT} + \text{generation time}\\) |
+| **Throughput** | Tokens or requests completed per second, across all concurrent users. | \\(\text{TPS} = \dfrac{N_{out}}{T_{last} - T_{first}}\\), \\(\ \text{RPS} = \dfrac{\text{completed requests}}{\text{time}}\\) |
 
 Definitions and formulas follow the Anyscale benchmarking guide (see Further Reading). Report **percentiles** (p50/p95/p99), never just the mean — tail latency is what users feel and what SLOs are written against. This is exactly what the `loadtest.py` script in Section B reports, and exactly why it reports percentiles rather than an average: an average latency can look fine while p99 callers are being starved behind the semaphore.
 
@@ -747,7 +747,7 @@ Definitions and formulas follow the Anyscale benchmarking guide (see Further Rea
 Here is the crux, and it is why "just add batching" is not free:
 
 - **A single request in isolation** gets the lowest possible latency: the whole GPU is devoted to it. But decode is memory-bound, so the GPU's compute units are ~idle — **terrible throughput per dollar.**
-- **Batching many requests together** amortizes each weight/KV read across all of them: one memory pass serves \(B\) requests. Throughput (tokens/s, req/s) rises sharply — you use the idle compute. But any individual request may wait to be batched and shares GPU cycles, so **its TTFT and TPOT rise.**
+- **Batching many requests together** amortizes each weight/KV read across all of them: one memory pass serves \\(B\\) requests. Throughput (tokens/s, req/s) rises sharply — you use the idle compute. But any individual request may wait to be batched and shares GPU cycles, so **its TTFT and TPOT rise.**
 
 So batch size is a dial between **latency** (small batch, low utilization, expensive per token) and **throughput** (large batch, high utilization, cheap per token, worse tail latency). There is no single right setting — it depends on your SLO. Real serving engines make this dial dynamic (continuous batching), which we introduce next and detail in Chapter 5.
 
@@ -764,16 +764,16 @@ Numbers make the asymmetry concrete. Suppose a request has a 500-token prompt an
 
 Then:
 
-\[
+\\[
 \text{TTFT} = 120 \ \text{ms}, \qquad
 \text{generation} = 199 \times 15 \ \text{ms} \approx 2985 \ \text{ms}
-\]
+\\]
 
-\[
+\\[
 \text{E2E} = 120 + 2985 \approx 3.1 \ \text{s}, \qquad
 \text{TPOT} = \frac{3105 - 120}{200 - 1} \approx 15 \ \text{ms}, \qquad
 \text{user TPS} = \frac{200}{2.985} \approx 67 \ \text{tok/s}
-\]
+\\]
 
 Two lessons. First, **decode dominates E2E** here (~3 s vs ~120 ms) — output length is your biggest latency lever, which is why capping `max_new_tokens` matters so much. Second, if you *stream*, the user sees a token at 120 ms instead of waiting 3.1 s: identical work, far better perceived latency. Streaming trades nothing in throughput; it only reshapes when the user first sees output.
 
@@ -789,7 +789,7 @@ There are three flavors, in increasing sophistication (full treatment in Chapter
 
 | Batching strategy | How it works | Weakness |
 |-------------------|--------------|----------|
-| **Static batching** | Collect \(N\) requests, pad to the same length, run them together to completion. | Head-of-line blocking: the whole batch waits for the slowest/longest sequence; padding wastes compute; new requests wait for the batch to finish. |
+| **Static batching** | Collect \\(N\\) requests, pad to the same length, run them together to completion. | Head-of-line blocking: the whole batch waits for the slowest/longest sequence; padding wastes compute; new requests wait for the batch to finish. |
 | **Dynamic batching** | Server briefly buffers incoming requests (a few ms) to form a batch, then runs it. Common in Triton. | Still runs the batch to completion; a short request is stuck behind a long one. |
 | **Continuous batching** (a.k.a. in-flight / iteration-level) | The scheduler works at the granularity of a *single decode step*: finished sequences leave the batch and new ones join every iteration. | More complex; needs paged KV memory to do well. This is what vLLM and TGI do, and it is the big throughput unlock. |
 
@@ -874,7 +874,7 @@ By 2025–2026, `safetensors` (<https://github.com/huggingface/safetensors>) is 
 
 ### Native structured outputs are now a first-class API feature, not a prompting trick
 
-As of 2024–2026, "ask nicely for JSON" has been replaced by API-level guarantees. OpenAI's Structured Outputs (announced 2024, current docs at <https://developers.openai.com/api/docs/guides/structured-outputs>, original post at <https://openai.com/index/introducing-structured-outputs-in-the-api/>) let you pass a JSON Schema and get a response *guaranteed* to satisfy it — no missing keys, no hallucinated enum values, no manual retry-on-invalid-JSON loop. Anthropic and Google expose comparable schema-constrained/tool-argument guarantees on their current APIs. Mechanically, this is not a smarter prompt — it is **constrained (grammar-guided) decoding**: the schema is compiled into a finite-state or pushdown automaton over the tokenizer's vocabulary, and at every decode step the set of grammatically-valid next tokens is computed and every other token's logit is masked to \(-\infty\) before sampling. The open-source engines implement this directly — vLLM's structured-outputs backends (<https://docs.vllm.ai/en/latest/features/structured_outputs/>) support both the `outlines` library and XGrammar, a purpose-built constrained-decoding engine (paper: <https://arxiv.org/pdf/2411.15100>) chosen for compiling grammars fast enough to mask logits every single decode step without becoming the bottleneck. The practical implication for this chapter's naive server: adding structured outputs to `model.generate()` directly means wiring a `LogitsProcessor` that does this masking yourself (Transformers exposes the hook, but you own the FSM); a dedicated engine gives you `response_format={"type": "json_schema", ...}` for free. This is a concrete, common reason teams move off the raw server well before they need continuous batching.
+As of 2024–2026, "ask nicely for JSON" has been replaced by API-level guarantees. OpenAI's Structured Outputs (announced 2024, current docs at <https://developers.openai.com/api/docs/guides/structured-outputs>, original post at <https://openai.com/index/introducing-structured-outputs-in-the-api/>) let you pass a JSON Schema and get a response *guaranteed* to satisfy it — no missing keys, no hallucinated enum values, no manual retry-on-invalid-JSON loop. Anthropic and Google expose comparable schema-constrained/tool-argument guarantees on their current APIs. Mechanically, this is not a smarter prompt — it is **constrained (grammar-guided) decoding**: the schema is compiled into a finite-state or pushdown automaton over the tokenizer's vocabulary, and at every decode step the set of grammatically-valid next tokens is computed and every other token's logit is masked to \\(-\infty\\) before sampling. The open-source engines implement this directly — vLLM's structured-outputs backends (<https://docs.vllm.ai/en/latest/features/structured_outputs/>) support both the `outlines` library and XGrammar, a purpose-built constrained-decoding engine (paper: <https://arxiv.org/pdf/2411.15100>) chosen for compiling grammars fast enough to mask logits every single decode step without becoming the bottleneck. The practical implication for this chapter's naive server: adding structured outputs to `model.generate()` directly means wiring a `LogitsProcessor` that does this masking yourself (Transformers exposes the hook, but you own the FSM); a dedicated engine gives you `response_format={"type": "json_schema", ...}` for free. This is a concrete, common reason teams move off the raw server well before they need continuous batching.
 
 > **Saying it out loud.** "Please respond in JSON" is dead as an engineering technique — every major API now takes a JSON Schema and guarantees the response satisfies it. Under the hood it's constrained decoding: the schema compiles into an automaton over the tokenizer's vocabulary, and at each decode step every token that would violate the grammar gets its logit masked to negative infinity before sampling. So you get no missing keys, no invented enum values, and no retry-until-it-parses loop. The catch is that this cost lands on *every* decode step, which is why engines use purpose-built compilers like XGrammar rather than re-validating from scratch — and it's a very common reason teams leave the raw server long before they ever need continuous batching.
 
@@ -911,7 +911,7 @@ This section replaces and substantially expands the old "production checklist." 
 ### Q&A bank
 
 1. **"Walk me through a request."** Request -> tokenize (+ chat template) -> prefill (compute-bound, sets TTFT) -> decode loop reusing the KV cache (memory-bound, sets TPOT) -> detokenize -> response. Naming the prefill/decode split unprompted is the single strongest signal you understand serving; see the 60-second answer above for the full version.
-2. **"How much GPU memory does model X need?"** Weights = params × bytes/param (~2 GB/B in FP16/BF16); plus KV cache = \(2 \times L \times H_{kv} \times D_h \times b\) per token per request; plus activations/overhead. Know the order of magnitude — ~0.5 MB/token, ~2 GB per 4K-token request for a 7B model — and be able to say why GQA shrinks the KV term specifically.
+2. **"How much GPU memory does model X need?"** Weights = params × bytes/param (~2 GB/B in FP16/BF16); plus KV cache = \\(2 \times L \times H_{kv} \times D_h \times b\\) per token per request; plus activations/overhead. Know the order of magnitude — ~0.5 MB/token, ~2 GB per 4K-token request for a 7B model — and be able to say why GQA shrinks the KV term specifically.
 3. **"Your p99 latency is bad but the GPU is at 30% util — why?"** Decode is memory-bandwidth-bound and you are serving serially or with tiny batches; the compute units sit idle waiting on memory traffic. Add continuous batching to convert that idle compute into throughput; a semaphore-gated raw server (Section B) prevents overload but does not fix this — it still runs one request's decode loop at a time per slot.
 4. **"How do you trade latency for throughput?"** Batch size is the dial: larger batches amortize weight reads across more requests (higher throughput) at the cost of per-request TTFT/TPOT, because a given request now waits on or shares cycles with others. Pick the setting from your SLO; continuous batching gets most of the throughput without static batching's head-of-line blocking.
 5. **"What's your OOM story?"** Memory math up front (Worked Example 2), server-side caps on `max_new_tokens`/context (never trust client values alone), concurrency gated to a number derived from that math (not intuition), quantization as a lever, paged KV in a real engine. Monitor KV-cache/GPU-memory utilization as a first-class metric — see war story 2 for what happens when nobody does.
@@ -919,10 +919,10 @@ This section replaces and substantially expands the old "production checklist." 
 7. **"Which metrics do you alert on?"** TTFT, TPOT/ITL, E2E — all at p50/p95/p99 — plus throughput (tok/s, req/s), queue depth, KV-cache/GPU-memory utilization, and error/OOM rate. Percentiles, not means; a healthy-looking average can hide starved tail requests.
 8. **"When do you reach for vLLM/TGI/Triton over your own server?"** As soon as you need real concurrency: continuous batching plus paged KV are hard to build well and are the whole point of those engines. Roll your own to learn, for genuinely custom logic, or for small enough traffic that batching's gains don't matter — and be able to say which of those applies to you.
 9. **"Static vs dynamic vs continuous batching — what's the actual difference?"** Static and dynamic batching both batch at the *request* level and run the batch to completion, so a short request can be stuck behind a long one (head-of-line blocking). Continuous batching operates at the *decode-step* level: a finished sequence leaves the batch and a new one joins on the very next iteration, so the GPU stays full even when request lengths vary wildly — which is the normal case in production.
-10. **"Explain GQA's effect on serving, not just training."** Grouped-query attention reduces the number of KV heads \(H_{kv}\) relative to query heads. Since KV-cache bytes per token scale linearly in \(H_{kv}\), this directly shrinks the KV cache per token — e.g., dropping from 32 to 8 KV heads cuts KV-cache memory 4×, which multiplies directly into how many concurrent requests fit on a given GPU. It is a serving-cost decision baked into the architecture, not just an efficiency footnote from the model card.
+10. **"Explain GQA's effect on serving, not just training."** Grouped-query attention reduces the number of KV heads \\(H_{kv}\\) relative to query heads. Since KV-cache bytes per token scale linearly in \\(H_{kv}\\), this directly shrinks the KV cache per token — e.g., dropping from 32 to 8 KV heads cuts KV-cache memory 4×, which multiplies directly into how many concurrent requests fit on a given GPU. It is a serving-cost decision baked into the architecture, not just an efficiency footnote from the model card.
 11. **"Does speculative decoding belong in 'basic serving'?"** It's an optimization layered on top of the decode loop: a small draft model proposes several tokens, the full model verifies them in one parallel forward pass, and correct guesses are accepted for free, cutting the number of full-model decode steps needed. It doesn't change the memory story (you still need the KV cache for both models) and it adds real scheduling complexity, so in practice it shows up in dedicated engines, not the raw server in this chapter — know what it is and why it doesn't fit here yet.
 12. **"How does prompt caching change things at the API-provider level, and does the raw server in this chapter get that benefit?"** No — a naive `model.generate()` loop re-runs prefill from scratch on every call, even for a byte-identical shared system prompt or tool schema. Hosted APIs (Anthropic, OpenAI, Gemini) and self-hosted engines both solve this via prefix reuse — either provider-side prompt caching or engine-side automatic prefix caching — by keeping a previously-computed KV-cache prefix resident and skipping its recomputation. It's a distinct optimization axis from batching, and workloads with long, repeated prefixes often benefit from it more.
-13. **"What is 'structured output' / JSON mode under the hood?"** Grammar-constrained (constrained) decoding: the JSON Schema or grammar is compiled into an automaton over the vocabulary, and at every decode step the logits for grammatically-invalid tokens are masked to \(-\infty\) before sampling, so every generated token is schema-valid by construction — not by asking nicely and retrying on failure. This is a decode-time cost (computing/re-checking the valid token set every step), which is why engines use purpose-built compilers (e.g., XGrammar) rather than naive per-step re-validation.
+13. **"What is 'structured output' / JSON mode under the hood?"** Grammar-constrained (constrained) decoding: the JSON Schema or grammar is compiled into an automaton over the vocabulary, and at every decode step the logits for grammatically-invalid tokens are masked to \\(-\infty\\) before sampling, so every generated token is schema-valid by construction — not by asking nicely and retrying on failure. This is a decode-time cost (computing/re-checking the valid token set every step), which is why engines use purpose-built compilers (e.g., XGrammar) rather than naive per-step re-validation.
 14. **"Why bound the request queue instead of letting it grow to absorb bursts?"** An unbounded queue doesn't remove overload, it hides it — it turns a capacity problem into unbounded process memory growth and lets client-side timeouts fire anyway once wait time exceeds them, except now invisibly. A bounded queue with a fast, explicit rejection (503) gives callers, load balancers, and autoscalers an honest signal to react to.
 15. **"What's the difference between your liveness and readiness checks, and why does it matter for a GPU pod specifically?"** Liveness asks "is the process alive enough to not be killed and restarted" and must stay cheap and independent of GPU load, or a temporarily saturated-but-healthy pod gets killed mid-request (war story 1). Readiness asks "should traffic be routed here right now" and should reflect real capacity — model loaded, not already at its concurrency cap — so a load balancer stops sending new work without killing in-flight work.
 
@@ -936,7 +936,7 @@ This is a common live prompt because it forces you to reconcile everything above
 
 **Step 1 — clarify the workload.** Ask: what's the model size, typical prompt/output length, and latency SLO? Assume, for concreteness: a 7B model in BF16 on a single 80 GB H100, average prompt 300 tokens, average output 150 tokens, target p95 E2E under ~2s.
 
-**Step 2 — do the memory math first, not last.** Weights: \(7\text{B} \times 2\text{ bytes} \approx 14\text{ GB}\). KV cache per token (from Worked Example 2's formula, LLaMA-style with GQA, roughly ~0.15–0.5 MB/token depending on \(H_{kv}\)) times a typical active sequence length of ~450 tokens (300 prompt + 150 output) gives on the order of 100–200 MB of KV cache per request. On an 80 GB GPU with ~60 GB free after weights and overhead, that is *theoretical* room for hundreds of concurrent sequences purely on memory — the real constraint at 50 req/s is compute and scheduling, not raw KV capacity, which is itself a useful thing to say out loud (it shows you check both constraints instead of assuming one).
+**Step 2 — do the memory math first, not last.** Weights: \\(7\text{B} \times 2\text{ bytes} \approx 14\text{ GB}\\). KV cache per token (from Worked Example 2's formula, LLaMA-style with GQA, roughly ~0.15–0.5 MB/token depending on \\(H_{kv}\\)) times a typical active sequence length of ~450 tokens (300 prompt + 150 output) gives on the order of 100–200 MB of KV cache per request. On an 80 GB GPU with ~60 GB free after weights and overhead, that is *theoretical* room for hundreds of concurrent sequences purely on memory — the real constraint at 50 req/s is compute and scheduling, not raw KV capacity, which is itself a useful thing to say out loud (it shows you check both constraints instead of assuming one).
 
 **Step 3 — pick the serving layer.** At 50 req/s sustained, this is squarely continuous-batching territory: reach for vLLM (or TGI/TensorRT-LLM) rather than a hand-rolled server — the naive per-request server from this chapter cannot get anywhere close to 50 req/s on one GPU because it never overlaps requests' decode steps. State this directly: "I would not build this on raw `transformers.generate()`; I'd deploy vLLM with continuous batching and PagedAttention on this GPU."
 
@@ -984,7 +984,7 @@ The throughline an interviewer is grading: did you reach for memory math before 
 | **Prefix caching** | Reusing a previously computed KV-cache prefix across requests sharing a prompt prefix. |
 | **Prompt / context caching** | The hosted-API equivalent of prefix caching: discounted, cached reuse of a repeated prompt prefix. |
 | **Structured outputs** | API/engine-guaranteed schema-conformant generation via constrained (grammar-guided) decoding. |
-| **Constrained decoding** | Masking invalid-per-grammar tokens' logits to \(-\infty\) at every decode step. |
+| **Constrained decoding** | Masking invalid-per-grammar tokens' logits to \\(-\infty\\) at every decode step. |
 | **safetensors** | Tensor-only serialization format; no arbitrary code execution on load, unlike `pickle`. |
 | **Quantization** | Storing weights (and sometimes activations/KV cache) in fewer bits per value to save memory. |
 | **Speculative decoding** | A small draft model proposes tokens; the full model verifies several in one pass to cut decode steps. |

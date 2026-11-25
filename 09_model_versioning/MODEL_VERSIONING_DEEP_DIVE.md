@@ -139,12 +139,12 @@ bytes. Two properties fall out for free:
 You can express a version identity as the hash over the *ordered set* of component
 digests:
 
-\[
-\text{version\_id} = H\big( H(\text{weights}) \,\|\, H(\text{tokenizer}) \,\|\, H(\text{config}) \,\|\, \text{engine\_ver} \,\|\, \text{code\_sha} \big)
-\]
+\\[
+\text{version\\_id} = H\big( H(\text{weights}) \\,\\|\\, H(\text{tokenizer}) \\,\\|\\, H(\text{config}) \\,\\|\\, \text{engine\\_ver} \\,\\|\\, \text{code\\_sha} \big)
+\\]
 
-where \( H \) is a strong hash (SHA-256) and \( \| \) is concatenation. If any input
-byte changes, \( \text{version\_id} \) changes. This is exactly how Docker image
+where \\( H \\) is a strong hash (SHA-256) and \\( \\| \\) is concatenation. If any input
+byte changes, \\( \text{version\\_id} \\) changes. This is exactly how Docker image
 digests, Git commit SHAs, and safetensors integrity checks work.
 
 **Semantic version vs content hash — use both, for different jobs.**
